@@ -1,0 +1,84 @@
+# Copyright (c) 2026 xingluosama121, MIT Licensed
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "norpagent"
+version = "2.2.2"
+# FarStars（远星）是 norpagent 自 v2.0.0 起的正式宣传名：调用方式与内核
+# 名称不变（import norpagent / PyPI 包名 norpagent 保持不变），远星 FarStars
+# 为对外品牌冠名。
+description = "FarStars（远星）· norpagent — pluggable component-based agent framework: modular architecture layers with address functions, np() single-call startup, 9 layers / 29 hooks, norpagent.safe() decoupled security, process-level plugin isolation, ready-to-use preset modes, Central Nervous Bus (CNB) multi-instance neural tree (cortex control / freeze quarantine / subpoena evidence / behavior baselines)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "xingluosama121" }]
+keywords = ["agent", "plugin", "llm", "framework", "multi-agent", "sandbox", "hooks", "security", "context", "farstars", "远星", "cnb", "neural-bus", "subpoena"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core has zero third-party dependencies: pip install norpagent runs in a plain
+# Python environment (Mock model + built-in tools suffice for benchmarking and
+# plugin development/debugging)
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/xingluosama121/farstars2"
+Documentation = "https://github.com/xingluosama121/farstars2/tree/main/docs"
+Issues = "https://github.com/xingluosama121/farstars2/issues"
+PyPI = "https://pypi.org/project/norpagent/"
+
+[project.optional-dependencies]
+# Model adapter for OpenAI-compatible services (DeepSeek / OpenAI / Qwen / vLLM / Ollama, etc.)
+openai = ["openai>=1.40"]
+# Model adapter for the Anthropic protocol
+anthropic = ["anthropic>=0.34"]
+# Web access (web_search / web_fetch / web_extract_links tools)
+web = ["requests>=2.31"]
+# Plugin signatures (Ed25519 verification; without it signatures are treated as "untrusted", security posture is not downgraded)
+security = ["cryptography>=41"]
+# ── 三态分区（R-018，2026-09-09 裁决：远星单包三态） ────────────────
+# 元框架 / 框架 / 成品发行版三态同包共存：代码本体始终全量随包分发；
+# 以下分区控制「第三方桥接依赖」的抓取粒度，可逗号组合安装：
+#   pip install norpagent[meta]                 元框架态：最小内核（零第三方依赖）
+#   pip install norpagent[frame]                框架态：造 Agent（模型 + 网络桥）
+#   pip install norpagent[user]                 成品态：开箱即用全功能（模型 + 网络 + 签名）
+#   pip install norpagent[user,meta,openai]     分区与单项混用（逗号分隔）
+# 说明：无后缀 `pip install norpagent` 即三态全量在场（零依赖核心可直接运行：
+# Mock 模型 + 内置工具；按需再加分区补第三方桥）。
+user = ["openai>=1.40", "anthropic>=0.34", "requests>=2.31", "cryptography>=41"]
+frame = ["openai>=1.40", "anthropic>=0.34", "requests>=2.31"]
+meta = []
+# All optional dependencies
+all = [
+    "openai>=1.40",
+    "anthropic>=0.34",
+    "requests>=2.31",
+    "cryptography>=41",
+]
+# Windows-specific components (vision operations, credential management, etc.)
+# will be provided as optional plugins in later releases:
+#   pip install norpagent[windows]
+windows = []
+
+[project.scripts]
+norpagent = "norpagent.cli:main"
+norpagent-rescue = "norpagent.rescue:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+norpagent = ["py.typed", "builtin/ui/assets/*.html"]

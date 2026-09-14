@@ -1,0 +1,23 @@
+# 源发行包（sdist）打包范围控制
+# 目的：发布包不携带开发用测试与草稿（用户/下游只需产品代码 src/）。
+# wheel 由 pyproject 的 packages.find where=["src"] 决定，天然不含 test/；
+# 本文件用于约束 sdist（.tar.gz），避免默认把仓库 test/ 目录整套收进去。
+
+# 排除开发测试目录（含其下全部子目录与归档）
+prune test
+
+# 排除仓库根目录的开发草稿与文档源稿（如不需要可去掉对应行）
+prune build
+prune dist
+prune "New folder"
+prune capture_worker
+prune front_src
+prune front_ui
+prune official_plugins
+prune plugin_system
+prune plugins
+
+# 排除根级草稿/说明文件
+exclude docs.zip
+exclude 演示文稿2.pptx
+exclude NORP_Agent_0.9.0_宣传PPT.pptx
