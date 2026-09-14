@@ -63,7 +63,21 @@ class ProjectStatusTool:
             )
         try:
             recent_n = max(1, min(int(args.get("recent_files") or 10), 50))
-            status = manager.status()
+            # resolve the effective workspace root the same way the file tools
+            # do (task params first): the report must describe the workspace the
+            # agent is actually working in, not the host process cwd (2026-09-12 fix).
+            override = ""
+            params = getattr(ctx, "params", None) or {}
+            if isinstance(params, dict):
+                override = str(params.get("workspace_root") or "").strip()
+            if override:
+                try:
+                    status = manager.status(workspace_root=override)
+                except TypeError:
+                    # custom managers may not accept the override keyword
+                    status = manager.status()
+            else:
+                status = manager.status()
         except Exception as exc:  # noqa: BLE001
             return ToolResult(output=f"failed to read project status: {exc}", success=False, error=str(exc))
 

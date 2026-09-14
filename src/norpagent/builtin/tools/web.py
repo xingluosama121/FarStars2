@@ -18,6 +18,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+import time
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -97,6 +98,28 @@ _TEXT_TYPES = (
     "application/xhtml", "application/javascript",
 )
 
+# ── search engine health cache (2026-09-12): on networks that block
+#    DuckDuckGo, every single search burned one full connection timeout per
+#    endpoint (up to ~16 s) before falling back to Bing. Recently failed
+#    engines are now remembered and skipped for a short cooldown window, so
+#    repeated searches stay responsive instead of re-probing a dead engine.
+_ENGINE_COOLDOWN: Dict[str, float] = {}
+_ENGINE_COOLDOWN_SECONDS = 180.0
+
+
+def _engine_on_cooldown(name: str) -> bool:
+    ts = _ENGINE_COOLDOWN.get(name)
+    return bool(ts) and (time.time() - ts) < _ENGINE_COOLDOWN_SECONDS
+
+
+def _mark_engine_down(name: str) -> None:
+    _ENGINE_COOLDOWN[name] = time.time()
+
+
+def _reset_engine_cooldown() -> None:
+    """Clear the engine health cache (tests / manual reset)."""
+    _ENGINE_COOLDOWN.clear()
+
 
 def _requests_available() -> bool:
     try:
@@ -130,6 +153,70 @@ def _check_content_type(content_type: str) -> Optional[str]:
     return None
 
 
+def _charset_from_content_type(content_type: str) -> str:
+    """Extract a charset from a Content-Type header value ("" when absent)."""
+    match = re.search(r"charset\s*=\s*[\"']?([\w.-]+)", content_type or "", re.I)
+    return (match.group(1) or "").strip().lower() if match else ""
+
+
+def _detect_charset_bytes(body: bytes) -> str:
+    """Best-effort charset detection over already-read bytes ("" when unknown).
+
+    Detection always runs on the bytes in hand; it never re-reads the HTTP
+    stream. The previous implementation touched ``resp.apparent_encoding``
+    after ``stream=True`` + ``iter_content`` had consumed the body, which made
+    requests raise ``RuntimeError("The content for this response was already
+    consumed")`` on every fetch (2026-09-12 fix).
+    """
+    if not body:
+        return ""
+    sample = body[: 512 * 1024]  # detection is reliable on the head of the body
+    try:
+        import charset_normalizer  # ships with requests >= 2.26
+
+        best = charset_normalizer.from_bytes(sample).best()
+        if best is not None and getattr(best, "encoding", None):
+            return str(best.encoding).strip().lower()
+    except Exception:  # noqa: BLE001 — fall through to chardet / utf-8
+        pass
+    try:
+        import chardet  # optional fallback
+
+        guess = chardet.detect(sample) or {}
+        enc = str(guess.get("encoding") or "").strip().lower()
+        if enc:
+            return enc
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _decode_body(body: bytes, content_type: str = "") -> str:
+    """Decode a fully-read response body: header charset > sniffed charset > utf-8 > gbk.
+
+    An explicitly declared header charset wins: charset sniffers are unreliable on
+    short/ambiguous samples (a GBK page can be mis-detected as Big5 etc.).
+    """
+    candidates: List[str] = []
+    header_charset = _charset_from_content_type(content_type)
+    if header_charset:
+        candidates.append(header_charset)
+    sniffed = _detect_charset_bytes(body)
+    if sniffed:
+        candidates.append(sniffed)
+    candidates += ["utf-8", "gbk"]
+    seen: set = set()
+    for enc in candidates:
+        if not enc or enc in seen:
+            continue
+        seen.add(enc)
+        try:
+            return body.decode(enc, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return body.decode("utf-8", errors="replace")
+
+
 def _fetch_with_requests(url: str, timeout: int) -> Tuple[int, str, Optional[str]]:
     import requests
 
@@ -159,11 +246,12 @@ def _fetch_with_requests(url: str, timeout: int) -> Tuple[int, str, Optional[str
                     break
                 chunks.append(chunk)
         body = b"".join(chunks)
-        resp.encoding = resp.apparent_encoding or "utf-8"
-        try:
-            text = body.decode(resp.encoding, errors="replace")
-        except (LookupError, UnicodeDecodeError):
-            text = body.decode("utf-8", errors="replace")
+        resp.close()
+        # decode from the bytes already read — never touch resp.content /
+        # resp.apparent_encoding again: with stream=True the body stream is
+        # consumed and requests raises RuntimeError("The content for this
+        # response was already consumed") (2026-09-12 fix).
+        text = _decode_body(body, resp.headers.get("Content-Type", ""))
         return resp.status_code, text, None
     except requests.exceptions.Timeout:
         return 0, "", f"request timed out ({timeout}s). Increase timeout or retry later."
@@ -513,6 +601,10 @@ class WebSearchTool:
 
     _ENDPOINT = "https://html.duckduckgo.com/html/"
     _FALLBACK = "https://lite.duckduckgo.com/lite/"
+    # 2026-09-12 round 9: DDG is the primary engine (free / no key), but it is
+    # unreachable on some networks; Bing is used as an automatic fallback so the
+    # web-search switch actually works wherever the user runs the agent.
+    _BING_ENDPOINTS = ("https://cn.bing.com/search", "https://www.bing.com/search")
 
     def schema(self) -> Dict[str, Any]:
         return {
@@ -520,8 +612,10 @@ class WebSearchTool:
             "function": {
                 "name": self.name,
                 "description": (
-                    "Searches the web for keywords and returns result titles, links and snippets (DuckDuckGo by default). "
-                    "Suitable for looking up the latest material, API docs, error messages, etc."
+                    "Searches the web for keywords and returns result titles, links and snippets. "
+                    "Uses DuckDuckGo by default (free, no API key); automatically falls back to Bing "
+                    "when DuckDuckGo is unreachable. Suitable for looking up the latest material, "
+                    "API docs, error messages, etc."
                 ),
                 "parameters": {
                     "type": "object",
@@ -543,21 +637,17 @@ class WebSearchTool:
         max_results = max(1, min(int(args.get("max_results") or 5), 10))
         timeout = max(5, min(int(args.get("timeout") or 15), 60))
 
-        blocked, reason = is_private_url(self._ENDPOINT)
-        if blocked:
-            return ToolResult(output=f"security restriction: {reason}", success=False, error=reason)
-
-        results = self._search(self._ENDPOINT, query, timeout)
-        if not results:
-            results = self._search(self._FALLBACK, query, timeout)
+        results, engine = self._search_chain(query, timeout)
         if not results:
             return ToolResult(
-                output="search failed: no results returned. Retry later or try different keywords.",
+                output=("search failed: no results returned (DuckDuckGo and Bing were both "
+                        "unreachable or empty). Retry later or try different keywords."),
                 success=False,
                 error="no_results",
             )
 
-        lines = ["[search results]", "", f"keywords: {query}", f"results: {len(results)}", ""]
+        lines = ["[search results]", "", f"keywords: {query}",
+                 f"engine: {engine}", f"results: {len(results)}", ""]
         for i, (title, href, snippet) in enumerate(results[:max_results], 1):
             lines.append(f"{i}. {title}")
             lines.append(f"   {href}")
@@ -565,6 +655,44 @@ class WebSearchTool:
                 lines.append(f"   {snippet}")
             lines.append("")
         return ToolResult(output="\n".join(lines).rstrip())
+
+    def _search_chain(self, query: str,
+                      timeout: int) -> Tuple[List[Tuple[str, str, str]], str]:
+        """Multi-engine chain: DuckDuckGo first (user preference, free/no key),
+        then Bing as the automatic fallback. Returns (results, engine-label).
+
+        Engines that recently failed every endpoint are skipped for a short
+        cooldown window: a blocked network would otherwise burn one full
+        connection timeout per endpoint on every single search."""
+        # 1) DuckDuckGo (primary). Probe attempts are capped so a blocked
+        #    network cannot stall the chain; failures enter the cooldown cache.
+        ddg_timeout = max(5, min(timeout, 6))
+        if not _engine_on_cooldown("DuckDuckGo"):
+            attempted = False
+            for endpoint in (self._ENDPOINT, self._FALLBACK):
+                blocked, _reason = is_private_url(endpoint)
+                if blocked:
+                    continue
+                attempted = True
+                results = self._search(endpoint, query, ddg_timeout)
+                if results:
+                    return results, "DuckDuckGo"
+            if attempted:
+                _mark_engine_down("DuckDuckGo")
+        # 2) Bing (fallback; free / no key)
+        if not _engine_on_cooldown("Bing"):
+            attempted_b = False
+            for endpoint in self._BING_ENDPOINTS:
+                blocked, _reason = is_private_url(endpoint)
+                if blocked:
+                    continue
+                attempted_b = True
+                results = self._search_bing(endpoint, query, timeout)
+                if results:
+                    return results, "Bing (fallback)"
+            if attempted_b:
+                _mark_engine_down("Bing")
+        return [], ""
 
     def _search(self, endpoint: str, query: str, timeout: int) -> List[Tuple[str, str, str]]:
         """Fetch the search page and parse results."""
@@ -628,6 +756,68 @@ class WebSearchTool:
             results.append((title or href, href, snippet[:300]))
         return results
 
+
+    # ── Bing fallback (2026-09-12 round 9) ─────────────────────
+
+    def _search_bing(self, endpoint: str, query: str,
+                     timeout: int) -> List[Tuple[str, str, str]]:
+        """Fetch a Bing result page and parse it (fallback engine)."""
+        try:
+            if _requests_available():
+                return self._search_bing_requests(endpoint, query, timeout)
+            return self._search_bing_urllib(endpoint, query, timeout)
+        except Exception:
+            return []
+
+    def _search_bing_requests(self, endpoint: str, query: str,
+                              timeout: int) -> List[Tuple[str, str, str]]:
+        import requests
+
+        resp = requests.get(
+            endpoint,
+            params={"q": query},
+            headers={"User-Agent": _USER_AGENT,
+                     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8"},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return []
+        return self._parse_bing(resp.text)
+
+    def _search_bing_urllib(self, endpoint: str, query: str,
+                            timeout: int) -> List[Tuple[str, str, str]]:
+        from urllib.parse import urlencode
+        from urllib.request import Request, urlopen
+
+        req = Request(
+            endpoint + "?" + urlencode({"q": query}),
+            headers={"User-Agent": _USER_AGENT,
+                     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8"},
+        )
+        resp = urlopen(req, timeout=timeout)
+        body = resp.read(3 * 1024 * 1024)
+        return self._parse_bing(body.decode("utf-8", errors="replace"))
+
+    def _parse_bing(self, html: str) -> List[Tuple[str, str, str]]:
+        results: List[Tuple[str, str, str]] = []
+        for block in re.findall(r'<li class="b_algo".*?</li>', html, re.S | re.I):
+            m = re.search(
+                r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                block, re.S | re.I,
+            )
+            if not m:
+                continue
+            href = unescape(m.group(1)).strip()
+            title = " ".join(unescape(re.sub(r"<[^>]+>", " ", m.group(2))).split())
+            if not href.startswith(("http://", "https://")):
+                continue
+            snippet = ""
+            sm = re.search(r'<p[^>]*>(.*?)</p>', block, re.S | re.I)
+            if sm:
+                snippet = " ".join(unescape(re.sub(r"<[^>]+>", " ", sm.group(1))).split())
+            results.append((title or href, href, snippet[:300]))
+        return results
 
 def _unwrap_ddg_redirect(href: str) -> str:
     """DuckDuckGo result links are redirect URLs; unwrap the real target."""

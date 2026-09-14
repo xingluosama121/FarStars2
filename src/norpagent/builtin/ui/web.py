@@ -177,7 +177,55 @@ def _decrypt_api_key(value: str) -> str:
 
 # Secret config keys persisted encrypted (DPAPI on Windows): the model API key
 # plus the v0.9.9 multimodal service keys (TTS / STT).
-_SECRET_KEYS = ("api_key", "tts_service_api_key", "stt_service_api_key")
+_SECRET_KEYS = (
+    "api_key", "tts_service_api_key", "stt_service_api_key",
+    "vision_service_api_key", "audio_service_api_key", "video_service_api_key",
+)
+
+
+def _safe_delete_plugin_path(path: str, plugin_dirs: List[str]) -> "tuple[bool, str]":
+    """Safely delete a plugin file / package directory (must live inside a plugin dir).
+
+    Returns (ok, path-or-error). Rules:
+    - the path must exist and resolve inside one of the configured plugin
+      directories (no path traversal, never the plugin directory itself);
+    - a single-file plugin is removed as a file; an entry inside a package
+      folder (a subdirectory carrying manifest.json) removes the whole folder.
+    """
+    import shutil
+
+    if not path or not os.path.exists(path):
+        return False, "plugin path does not exist"
+    real = os.path.realpath(path)
+    allowed_roots = [os.path.realpath(d) for d in (plugin_dirs or []) if d]
+    if not allowed_roots:
+        return False, "no plugin directory configured"
+    inside = False
+    for root in allowed_roots:
+        try:
+            if os.path.commonpath([real, root]) == root and real != root:
+                inside = True
+                break
+        except ValueError:
+            continue
+    if not inside:
+        return False, "refusing to delete outside the configured plugin directories"
+
+    target = real
+    if os.path.isfile(real):
+        parent = os.path.dirname(real)
+        root_set = set(allowed_roots)
+        if os.path.realpath(parent) not in root_set and \
+                os.path.isfile(os.path.join(parent, "manifest.json")):
+            target = parent  # package entry file -> remove the whole package folder
+    try:
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        else:
+            os.remove(target)
+    except OSError as exc:
+        return False, f"delete failed: {exc}"
+    return True, target
 
 
 class _RobustHTTPServer(ThreadingHTTPServer):
@@ -294,7 +342,35 @@ _THINK_LEVEL_MAP = {
     "low": "low",
     "medium": "medium",
     "high": "high",
+    "max": "max",
+    # legacy aliases kept for configs saved by older builds
+    "xhigh": "max",
+    # legacy Chinese values written by early FarStars console builds
+    # (the old "高" option carried the label "最大（深度推理）" → maps to max)
+    "关": "none",
+    "低": "low",
+    "中": "medium",
+    "高": "max",
 }
+
+
+def _think_to_effort(value: Any) -> str:
+    """Map an input-bar reasoning level to a reasoning_effort value ("" when unknown).
+
+    Accepts off / low / medium / high / max plus legacy aliases (xhigh, plus the
+    Chinese values written by older FarStars console builds). "off" maps to
+    "none" so the adapter can explicitly disable thinking on capable models.
+    """
+    return _THINK_LEVEL_MAP.get(str(value or "").strip().lower(), "")
+
+# 设置事实源分层标题（Web 面板展示「继承自 X」；与 evolution.store 保持一致）
+try:
+    from norpagent.evolution.store import SCOPE_TITLES as _SCOPE_TITLES_CACHE
+except Exception:  # noqa: BLE001 — 极端环境下退回英文键
+    _SCOPE_TITLES_CACHE = {
+        "global": "global", "profile": "profile",
+        "session": "session", "temp": "temp",
+    }
 
 # simple fallback page: used when assets/front.html is missing (keeping it runnable with zero dependencies)
 _HTML_PAGE = """<!DOCTYPE html>
@@ -417,26 +493,41 @@ es.onerror = () => addLine('ev-error', '[event stream interrupted, reconnecting.
 DEFAULT_CONFIG: Dict[str, Any] = {
     "language": "en",                     # UI language (np(language=...) overrides)
     "model": "",                          # model (default = the engine preset model)
+    "title_model": "",                    # optional model for auto session titles ("" = the session's current model; a separate one-off call)
+    "context_token_budget": 0,            # clamp the request to this estimated token budget by dropping the oldest whole turns (0 = unlimited)
+    "session_isolation": "per_session",   # concurrency isolation between sessions: per_session (default) | isolated_instance
     "api_base": "https://api.deepseek.com",
     "api_key": "",
     "remote_models": [],                  # remote model list from the last successful fetch (shown in the flow module dock)
     "project_root": default_project_root(),  # default workspace (per the operating system)
+    "snapshot_dir": "",                     # snapshot storage dir (empty = default ~/.norpagent/snapshots/)
+    # plugin management (2026-09-11): names disabled by the user / per-plugin log
+    # directory ("" = default ~/.norpagent/plugin_logs) / host-side capability
+    # restriction (None = unrestricted)
+    "plugin_disabled": [],
+    "plugin_log_dir": "",
+    "plugin_capabilities": None,
     "plugin_dirs": [],
     "norp_safe_enabled": True,
+    "security_enabled": True,
+    "security_level": "standard",         # norpagent.safe() level (basic/standard/high); the suite is always mounted
+    # native tool confirmation (settings panel): master OFF by default; the three
+    # per-class switches default ON and only apply while the master is on.
+    "native_confirm_enabled": False,
+    "native_confirm_write": True,
+    "native_confirm_delete": True,
+    "native_confirm_exec": True,
     "plugins_enabled": True,
-    "close_button_behavior": "minimize_to_tray",
     "use_responses_api": False,
     "queue_max_size": 200,
     "max_steps": 128,
     "task_timeout": 0,
     "api_request_timeout": 180,
     "enable_web_search": False,
-    "native_confirm_enabled": True,
-    "native_confirm_write": True,
-    "native_confirm_delete": True,
-    "native_confirm_exec": True,
     "think_level": "high",
     "temperature": 1.0,
+    "top_p": 1.0,
+    "call_timeout": 0,
     "max_tokens": 32767,
     "memory": True,
     "memory_mode": "full",
@@ -448,6 +539,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "jailbreak_guard_action": "block",
     "vision_enabled": False,
     "vision_service_url": "",
+    "vision_service_api_key": "",
+    # v2.x multimodal native passthrough (R-021): each modality routes either
+    # "direct" (the attachment itself is passed to the model as a native
+    # multimodal part) or "service" (an external service converts it to text).
+    "mm_image_route": "direct",
+    "mm_audio_route": "direct",
+    "mm_video_route": "direct",
+    # 文本附件（上传文件 / 粘贴内容）传给模型的字符上限；attachment_text_unlimited
+    # 为真时忽略上限、完整传入。默认上限 1034324，可在多模态设置里调 512~2147483647。
+    "attachment_text_max_chars": 1034324,
+    "attachment_text_unlimited": False,
+    "audio_service_url": "",
+    "audio_service_api_key": "",
+    "video_service_url": "",
+    "video_service_api_key": "",
     # v0.9.9 multimodal: sound (TTS / STT) backend settings.
     # Native TTS works out of the box on Windows (SAPI) / macOS (say) / Linux
     # (espeak-ng) with zero configuration; STT uses the Windows local recognizer
@@ -481,22 +587,49 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "_initialized": False,                # whether the first configuration has completed
 }
 
+# Signatures of a security / sandbox interception inside a tool result or a task
+# stop reason. Matched centrally in WebUI.on_event so EVERY interception (sandbox
+# AST precheck, jailbreak/injection guard, tool veto, approval denial, SSRF
+# network policy) raises a prominent top-right alert on the frontend, regardless
+# of which subsystem produced it.
+_SEC_BLOCK_SIGNATURES = (
+    "NORP安全系统拦截", "NORP 安全系统拦截", "安全系统拦截",
+    "[run_python security blocked]", "security blocked",
+    "security restriction:",
+    "blocked_by_hook", "tool call vetoed by a hook",
+    "tool call blocked by a plugin hook",
+    "approval_denied", "the user denied the approval request",
+    "input blocked by security protection",
+    "jailbreak/injection", "jailbreak_guard",
+)
+
 _MAX_JSON = 1_000_000
 _MAX_UPLOAD_JSON = 64_000_000
 _MAX_UPLOAD_FILE = 10 * 1024 * 1024
-
-# DeepSeek retired deepseek-chat / deepseek-reasoner on 2026-07-24: when legacy
-# fetch caches or third-party mirrors still return these two names, they are
-# filtered out of the remote model list.
-RETIRED_REMOTE_MODELS = {"deepseek-chat", "deepseek-reasoner"}
-
+_MAX_VIDEO_UPLOAD_FILE = 32 * 1024 * 1024
+# Fallback for the text-attachment length cap when the config key is absent.
+# Mirrors the settings default (mm.text_attachment_limit = 1034324); the panel
+# can raise it up to 2147483647 or switch on the no-limit option (0 = no cap).
+_DEFAULT_TEXT_ATTACHMENT_MAX = 1034324
 
 def filter_remote_models(models: Any) -> List[str]:
-    """Filter retired remote model names (deepseek-chat / deepseek-reasoner etc.)."""
+    """Filter out remote model names retired upstream.
+
+    The vendor-specific retired list lives in the model adapter; the generic UI
+    layer must not hardcode model names. When the adapter is unavailable no
+    filtering is applied (the list is shown as fetched).
+    """
     if not isinstance(models, (list, tuple, set)):
         return []
-    return [str(m) for m in models
-            if str(m).strip().lower() not in RETIRED_REMOTE_MODELS]
+    try:
+        from norpagent.builtin.models.openai_compat import (
+            filter_remote_models as _adapter_filter,
+        )
+    except Exception:  # noqa: BLE001 — adapter unavailable: no filtering
+        _adapter_filter = None
+    if _adapter_filter is not None:
+        return _adapter_filter(models)
+    return [str(m) for m in models]
 
 
 def json_safe(obj: Any, depth: int = 0) -> Any:
@@ -717,6 +850,8 @@ class WebUI:
         self._handler_fn: Optional[Callable] = None
         self._recovery_handler: Optional[Callable] = None
         self._agent: Any = None
+        # CNB hosted instances (FarStars console one-click launch; node_id -> entry)
+        self._cnb_hosted: Dict[str, Dict[str, Any]] = {}
         # snapshot of the preset's default tool set (captured at attach_runtime;
         # the fallback base of agent_tools)
         self._agent_base_tools: List[str] = []
@@ -732,7 +867,15 @@ class WebUI:
         self._task_session: Dict[str, str] = {}
         self._running_sessions: Dict[str, str] = {}
         self._stop_requests: set = set()
+        # per-session cancel events (2026-09-13): the Web "stop" button sets the
+        # event, and the kernel's model streaming loop polls it on every chunk, so
+        # a generation in flight stops immediately instead of only at the next
+        # step boundary.
+        self._stop_events: Dict[str, threading.Event] = {}
         self._session_meta: Dict[str, Dict[str, Any]] = {}
+        # sessions whose title has already been auto-summarized by the model
+        # (2026-09-13): the title is generated once, from the first round only.
+        self._auto_titled_sids: set = set()
         self._usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0,
                                        "tool_call_tokens": 0}
         self._flow_runs: Dict[str, Any] = {}
@@ -984,6 +1127,18 @@ class WebUI:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _attach(self, body: bytes, filename: str,
+                        mime: str = "application/octet-stream") -> None:
+                """下载响应（进化包 / 设置快照导出用，R-010）。"""
+                self.send_response(200)
+                self.send_header("Content-Type", mime + "; charset=utf-8")
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{filename}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):  # noqa: N802
                 parsed = urlparse(self.path)
                 path = parsed.path
@@ -1000,15 +1155,28 @@ class WebUI:
                     self.send_response(204)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
+                elif path == "/assets/i18n.js":
+                    # 三端共通多语言核心（2026-09-12）：帧内共享语言状态/存储/事件
+                    body = ui.asset_bytes("i18n.js")
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "application/javascript; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 elif path == "/events":
                     self._handle_sse()
                 elif path == "/api/status":
                     self._json(200, ui.stats())
                 elif path == "/api/cnb/health":
-                    # FarStars 星轨控制台：同源皮层总线代理（只允许本机回环
+                    # FarStars 星轨控制台：同源中枢总线代理（只允许本机回环
                     # 目标；浏览器侧无法跨源直连 CNB 总线，统一走本代理）。
                     base = str(query.get("base", [""])[0] or "").strip()
                     self._json(200, ui.cnb_proxy("GET", base))
+                elif path == "/api/cnb/instances":
+                    # 星轨控制台：本进程托管拉起的 CNB 实例清单
+                    self._json(200, ui.cnb_instances())
                 elif path == "/api/sessions":
                     self._json(200, {"sessions": ui.list_sessions()})
                 elif path.startswith("/api/sessions/"):
@@ -1041,6 +1209,43 @@ class WebUI:
                     self._json(200, {"balance": None, "error": None})
                 elif path == "/api/debug":
                     self._json(200, ui.debug_info())
+                elif path == "/api/evolution/points":
+                    self._json(200, ui.evolution_points())
+                elif path == "/api/evolution/proposals":
+                    status = str(query.get("status", [""])[0] or "") or None
+                    self._json(200, ui.evolution_proposals(status))
+                elif path == "/api/evolution/log":
+                    n = int(query.get("n", ["50"])[0] or 50)
+                    self._json(200, ui.evolution_log(n))
+                elif path == "/api/evolution/export":
+                    kind = str(query.get("kind", ["settings"])[0] or "settings")
+                    author = str(query.get("author", [""])[0] or "")
+                    try:
+                        body, fname, mime = ui.evolution_export(kind, author=author)
+                        self._attach(body, fname, mime)
+                    except Exception as exc:  # noqa: BLE001 — 导出失败如实报错
+                        self._json(500, {"ok": False,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+                elif path == "/api/settings/schema":
+                    # 设置事实源（§5 / §6.3）：注册表（支持 category / view 过滤）
+                    self._json(200, ui.settings_schema(
+                        category=str(query.get("category", [""])[0] or "") or None,
+                        view=str(query.get("view", [""])[0] or "") or None))
+                elif path == "/api/settings/values":
+                    self._json(200, ui.settings_values())
+                elif path == "/api/settings/audit":
+                    n = int(query.get("n", ["50"])[0] or 50)
+                    self._json(200, ui.settings_audit(n))
+                elif path == "/api/settings/export":
+                    try:
+                        body, fname, mime = ui.settings_export()
+                        self._attach(body, fname, mime)
+                    except Exception as exc:  # noqa: BLE001 — 导出失败如实报错
+                        self._json(500, {"ok": False,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+                elif path == "/api/whitebox/overview":
+                    # 白盒总览（§4）：环节树统一遍历（可看 / 可测 / 可改 / 可设）
+                    self._json(200, ui.whitebox_overview())
                 elif path == "/api/snapshots":
                     # work rollback: snapshot timeline (the rollback panel's data source)
                     self._json(200, ui.recovery_handle("list", {}))
@@ -1062,7 +1267,9 @@ class WebUI:
                         self.end_headers()
                         self.wfile.write(body)
                 elif path == "/api/memory":
-                    self._json(200, {"content": None})
+                    # 会话记忆读取（星轨控制台外部通道；?session_id= 省略 → 最近会话）
+                    self._json(200, ui.memory_read(
+                        str(query.get("session_id", [""])[0] or "")))
                 elif path == "/api/fs/list":
                     q = parse_qs(parsed.query)
                     self._json(200, ui.list_fs(
@@ -1079,13 +1286,24 @@ class WebUI:
                 parsed = urlparse(self.path)
                 path = parsed.path
                 if path == "/chat":
-                    data = self._read_json()
+                    data = self._read_json(limit=_MAX_UPLOAD_JSON)
                     prompt = str(data.get("prompt") or "").strip()
-                    if not prompt:
+                    attachments = data.get("attachments")
+                    if not prompt and not (isinstance(attachments, list) and attachments):
                         self._json(400, {"ok": False, "error": "prompt is empty"})
                         return
+                    task_params: Dict[str, Any] = {}
+                    if isinstance(attachments, list) and attachments:
+                        task_params["attachments"] = attachments
+                    # per-message reasoning strength from the input-bar control
+                    # (off / low / medium / high / max); an explicit value wins
+                    # over the settings default inside _compose_task_params.
+                    effort = _think_to_effort(data.get("think_level"))
+                    if effort:
+                        task_params["reasoning_effort"] = effort
                     task_id = ui.submit(
-                        prompt, str(data.get("session_id") or "") or None
+                        prompt, str(data.get("session_id") or "") or None,
+                        task_params or None,
                     )
                     self._json(200, {
                         "ok": True, "task_id": task_id,
@@ -1104,13 +1322,21 @@ class WebUI:
                     ui.stop_task(str(data.get("session_id") or "") or None)
                     self._json(200, {"ok": True})
                 elif path == "/api/cnb/ctrl":
-                    # FarStars 星轨控制台：同源皮层控制代理（base 仅回环）。
+                    # FarStars 星轨控制台：同源中枢控制代理（base 仅回环）。
                     # body 原样作为 /cnb/ctrl 请求转发（topo/reports/audit/
                     # behavior/exec/freeze/sweep/config...）。
                     _q = parse_qs(parsed.query)
                     base = str(_q.get("base", [""])[0] or "").strip()
                     body = self._read_json()
                     self._json(200, ui.cnb_proxy("POST", base, ctrl=body))
+                elif path == "/api/cnb/launch":
+                    # 星轨控制台：一键拉起 CNB（中枢 / 节点，托管在本进程）
+                    data = self._read_json()
+                    self._json(200, ui.cnb_launch(data))
+                elif path == "/api/cnb/stop":
+                    # 星轨控制台：停止托管中的 CNB 实例（node_id 省略 = 全部）
+                    data = self._read_json()
+                    self._json(200, ui.cnb_stop(data))
                 elif path == "/api/sessions":
                     data = self._read_json()
                     try:
@@ -1121,12 +1347,26 @@ class WebUI:
                         self._json(200, sess)
                     except Exception as exc:  # noqa: BLE001
                         self._json(500, {"error": str(exc)})
+                elif path == "/api/sessions/clear":
+                    # chat 批量清除 / 清空全部（2026-09-12）：ids 省略 = 全部
+                    data = self._read_json()
+                    ids = data.get("ids")
+                    if ids is not None and not isinstance(ids, list):
+                        self._json(400, {"error": "ids must be a list"})
+                        return
+                    self._json(200, ui.clear_sessions(ids))
                 elif path.startswith("/api/sessions/"):
                     self._handle_session_post(path, data=self._read_json())
                 elif path == "/api/config":
                     data = self._read_json()
                     self._json(200, {"ok": True, "config": ui.save_config(
                         data.get("config") or {})})
+                elif path == "/api/system_prompt/global":
+                    # editable global system prompt (from the "system prompt" dialog;
+                    # applies to every session immediately, existing ones included)
+                    data = self._read_json()
+                    self._json(200, ui.set_global_system_prompt(
+                        str(data.get("prompt") or "")))
                 elif path == "/api/models":
                     # "fetch model list": directly use the current Key/Base from
                     # the form (applied immediately; no save needed); on success
@@ -1178,6 +1418,24 @@ class WebUI:
                         str(data.get("path") or ""))})
                 elif path == "/api/plugins/reload":
                     self._json(200, {"ok": True, "plugins": ui.reload_plugins()})
+                elif path == "/api/plugins/toggle":
+                    # enable / disable a single plugin (persisted in plugin_disabled)
+                    data = self._read_json()
+                    self._json(200, {"ok": True, "plugins": ui.set_plugin_enabled(
+                        str(data.get("name") or ""),
+                        bool(data.get("enabled", True)))})
+                elif path == "/api/plugins/remove":
+                    # uninstall: delete the plugin's file (or package directory)
+                    data = self._read_json()
+                    self._json(200, ui.delete_plugin(str(data.get("name") or "")))
+                elif path == "/api/plugins/upload":
+                    # install: upload a single-file .py plugin into the first plugin dir
+                    data = self._read_json(limit=_MAX_UPLOAD_JSON)
+                    self._json(200, ui.install_plugin_file(
+                        str(data.get("filename") or ""),
+                        str(data.get("content") or ""),
+                        bool(data.get("base64", True)),
+                    ))
                 elif path == "/api/security":
                     data = self._read_json()
                     self._json(200, ui.set_security(data))
@@ -1190,12 +1448,35 @@ class WebUI:
                         payload = {}
                     self._json(200, ui.recovery_handle(action, payload))
                 elif path == "/api/memory/clear":
+                    # 会话记忆清除（真实删除；反馈轮 2 修复空实现假成功）
                     data = self._read_json()
-                    self._json(200, {"ok": True})
+                    self._json(200, ui.memory_clear(data))
+                elif path == "/api/evolution/points":
+                    data = self._read_json()
+                    self._json(200, ui.evolution_set_point(data))
+                elif path == "/api/evolution/import":
+                    data = self._read_json(limit=_MAX_UPLOAD_JSON)
+                    self._json(200, ui.evolution_import(data))
+                elif path == "/api/evolution/proposals":
+                    # 提案引擎 / 熔断（§7.1）：create / decide / execute / resume
+                    data = self._read_json()
+                    self._json(200, ui.evolution_proposals_action(data))
+                elif path == "/api/settings/set":
+                    # 设置事实源写入（§5 / §6.3；schema 校验 + 桥接热应用）
+                    data = self._read_json()
+                    self._json(200, ui.settings_set(data))
+                elif path == "/api/settings/import":
+                    data = self._read_json(limit=_MAX_UPLOAD_JSON)
+                    self._json(200, ui.settings_import(data))
                 elif path == "/api/log":
                     data = self._read_json()
-                    _logger.info("frontend: %s", str(data.get("message") or "")[:2000])
-                    self._json(200, {"ok": True})
+                    self._json(200, ui.frontend_log(data))
+                elif path == "/api/fs/mkdir":
+                    data = self._read_json()
+                    self._json(200, ui.make_fs_dir(
+                        str(data.get("parent") or ""),
+                        str(data.get("name") or ""),
+                    ))
                 elif path == "/api/quit":
                     self._json(200, {"ok": True})
                     ui.request_quit()
@@ -1285,6 +1566,10 @@ class WebUI:
                     self._json(200, {"session": ui.session_info(sid)})
                 elif parts[1] == "messages":
                     self._json(200, {"messages": ui.session_messages(sid)})
+                elif parts[1] == "variants":
+                    self._json(200, ui.session_variants(sid))
+                elif parts[1] == "system_prompt":
+                    self._json(200, ui.session_system_prompt(sid))
                 else:
                     self._json(404, {"error": "not found"})
 
@@ -1294,13 +1579,52 @@ class WebUI:
                 sid = parts[0] if parts else ""
                 if len(parts) >= 2:
                     if parts[1] == "title":
-                        ui.set_session_title(sid, str(data.get("title") or ""))
-                        self._json(200, {"ok": True})
+                        # rename (persisted; 2026-09-12 round 9)
+                        self._json(200, ui.set_session_title(
+                            sid, str(data.get("title") or "")))
+                        return
+                    if parts[1] == "pin":
+                        # pin / unpin to the top of the list (2026-09-12 round 9)
+                        self._json(200, ui.set_session_pinned(
+                            sid, bool(data.get("pinned"))))
                         return
                     if parts[1] == "workspace":
                         ui.set_session_workspace(sid, str(data.get("workspace") or ""))
                         self._json(200, {"ok": True})
                         return
+                    if parts[1] == "system_prompt":
+                        # per-session system prompt: text + append/replace mode
+                        self._json(200, ui.set_session_system_prompt(
+                            sid, str(data.get("prompt") or ""),
+                            str(data.get("mode") or "append")))
+                        return
+                    if parts[1] == "truncate":
+                        # rewind: keep the first N messages (regenerate / edit a turn)
+                        self._json(200, ui.truncate_session(
+                            sid, int(data.get("keep") or 0)))
+                        return
+                    if parts[1] == "rewind":
+                        # rewind: drop the turn-th user message (0-based) and
+                        # everything after it, resolving the cutoff on the server
+                        # (regenerate / edit a turn — robust to local messages).
+                        if "turn" not in data:
+                            self._json(400, {"ok": False, "error": "turn required"})
+                            return
+                        self._json(200, ui.rewind_turn(
+                            sid, int(data.get("turn") or 0),
+                            bool(data.get("snapshot", True))))
+                        return
+                    if parts[1] == "variants" and len(parts) >= 3:
+                        if parts[2] == "snapshot":
+                            self._json(200, ui.variant_snapshot(
+                                sid, int(data.get("turn") or 0),
+                                int(data.get("keep") or 0)))
+                            return
+                        if parts[2] == "restore":
+                            self._json(200, ui.variant_restore(
+                                sid, int(data.get("turn") or 0),
+                                int(data.get("index") or 0)))
+                            return
                 self._json(404, {"error": "not found"})
 
             def _handle_sse(self) -> None:
@@ -1491,6 +1815,32 @@ class WebUI:
         self._page_cache[page] = (sig, data)
         return data
 
+    def asset_bytes(self, name: str) -> bytes:
+        """Return a built-in shared asset's bytes（如 i18n.js；带 mtime 缓存）。
+
+        路径限定在 assets 目录内（basename 过滤，防目录穿越）；缺失文件返回 b""。
+        """
+        safe = os.path.basename(str(name or ""))
+        if not safe:
+            return b""
+        path = os.path.join(_ASSET_DIR, safe)
+        try:
+            st = os.stat(path)
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return b""
+        key = f"asset:{safe}"
+        cached = self._page_cache.get(key)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return b""
+        self._page_cache[key] = (sig, data)
+        return data
+
     def mount_page(self, page: str, html: Optional[str]) -> bytes:
         """Hot-replace page bytes at runtime (HTTP service not restarted; port unchanged).
 
@@ -1539,7 +1889,10 @@ class WebUI:
         with self._lock:
             think = str(self._config.get("think_level") or "high")
             temperature = self._config.get("temperature")
+            top_p = self._config.get("top_p")
+            call_timeout = self._config.get("call_timeout")
             max_tokens = self._config.get("max_tokens")
+            ctx_budget = self._config.get("context_token_budget")
         effort = _THINK_LEVEL_MAP.get(think, "high")
         defaults: Dict[str, Any] = {}
         if effort != "none":
@@ -1549,11 +1902,32 @@ class WebUI:
                 defaults["temperature"] = float(temperature) if temperature is not None else 1.0
             except (TypeError, ValueError):
                 defaults["temperature"] = 1.0
+        # top_p (nucleus sampling; 1.0 = no truncation). Forwarded verbatim to the
+        # adapter, which passes it to the endpoint alongside temperature.
+        try:
+            if top_p is not None:
+                defaults["top_p"] = float(top_p)
+        except (TypeError, ValueError):
+            pass
+        # per-call hard timeout (0 = unlimited): the kernel aborts a single model
+        # call that exceeds it (AgentRuntime.params["call_timeout"]).
+        try:
+            if call_timeout:
+                defaults["call_timeout"] = float(call_timeout)
+        except (TypeError, ValueError):
+            pass
         if max_tokens:
             try:
                 defaults["max_tokens"] = int(max_tokens)
             except (TypeError, ValueError):
                 pass
+        # 2026-09-13: context window budget (0 = unlimited). Passed to the kernel,
+        # which drops the oldest whole turns when the request would exceed it.
+        try:
+            if ctx_budget:
+                defaults["context_token_budget"] = int(ctx_budget)
+        except (TypeError, ValueError):
+            pass
         return defaults
 
     def submit(self, prompt: str, session_id: Optional[str],
@@ -1574,6 +1948,9 @@ class WebUI:
             self._task_session[task_id] = sid
             if sid:
                 self._running_sessions[sid] = task_id
+                # create the cancel event up-front (before the worker starts) so a
+                # stop request arriving immediately is never missed
+                self._stop_events[sid] = threading.Event()
             self._prune_tasks()
         self._publish({
             "type": "notify",
@@ -1593,16 +1970,30 @@ class WebUI:
                 else:
                     if self._handler_fn is None:
                         raise RuntimeError("WebUI has no execution callback (ui.set_handler(...))")
-                    tp = dict(task_params or {})
-                    # the settings panel's sampling parameters inject into the task
-                    # (callers may override explicitly)
-                    for key, value in self._task_defaults().items():
-                        tp.setdefault(key, value)
-                    tp.setdefault("_stop_check", lambda: sid in self._stop_requests)
-                    meta = self._session_meta.get(sid)
-                    if meta and meta.get("workspace") and "workspace_root" not in tp:
-                        tp["workspace_root"] = meta["workspace"]
-                    result = self._invoke_handler(self._handler_fn, prompt, sid, tp)
+                    tp = self._compose_task_params(task_params, sid)
+                    # v2.x multimodal attachments: route per settings (direct /
+                    # service); service-routed items become text, direct ones stay
+                    # native multimodal parts for the model.
+                    final_prompt = prompt
+                    prepared = self._prepare_chat_attachments(tp.get("attachments"))
+                    if prepared is not None:
+                        extra_text, media = prepared
+                        if extra_text:
+                            final_prompt = (prompt + "\n\n" + extra_text) if prompt else extra_text
+                        tp["attachments"] = media or None
+                    # immediate stop: hand the per-session cancel event to the task
+                    # so the model streaming loop aborts mid-generation (checked on
+                    # every chunk); _stop_check still covers step boundaries.
+                    stop_ev = self._stop_events.get(sid)
+                    if isinstance(stop_ev, threading.Event):
+                        tp.setdefault("_cancel_event", stop_ev)
+                        tp.setdefault(
+                            "_stop_check",
+                            lambda: stop_ev.is_set() or (sid in self._stop_requests),
+                        )
+                    else:
+                        tp.setdefault("_stop_check", lambda: sid in self._stop_requests)
+                    result = self._invoke_handler(self._handler_fn, final_prompt, sid, tp)
                 status = getattr(result, "status", "done")
                 content = getattr(result, "final_content", "") or ""
                 error = getattr(result, "error", "") or ""
@@ -1617,6 +2008,13 @@ class WebUI:
                     "ts": time.time(),
                     "sid": getattr(result, "session_id", "") or sid or None,
                 })
+                # 2026-09-13: the first round has finished — auto-summarize the
+                # session title with a separate one-off model call. Runs on its
+                # own thread and never blocks or breaks the task result.
+                try:
+                    self._maybe_auto_title(getattr(result, "session_id", "") or sid)
+                except Exception:  # noqa: BLE001 — titles must never break a task
+                    pass
             except Exception as exc:  # noqa: BLE001
                 record["status"] = "error"
                 record["error"] = str(exc)
@@ -1633,6 +2031,7 @@ class WebUI:
                     self._task_session.pop(task_id, None)
                     if sid:
                         self._running_sessions.pop(sid, None)
+                        self._stop_events.pop(sid, None)
                     self._stop_requests.discard(sid)
 
         threading.Thread(
@@ -1640,14 +2039,180 @@ class WebUI:
         ).start()
         return task_id
 
+    def _compose_task_params(self, task_params: Optional[Dict[str, Any]],
+                             sid: str) -> Dict[str, Any]:
+        """Compose the task-level parameters of one chat submission (2026-09-12 round 9).
+
+        Workspace root priority: explicit task params > per-session workspace >
+        global config ``project_root`` (settings "workspace root" / composer
+        workspace field). Previously the global value never reached the task —
+        the file tools / sandbox kept using the process working directory, so
+        changing the workspace directory looked like a no-op.
+        """
+        tp = dict(task_params or {})
+        # the settings panel's sampling parameters inject into the task
+        # (callers may override explicitly)
+        for key, value in self._task_defaults().items():
+            tp.setdefault(key, value)
+        with self._lock:
+            meta = dict(self._session_meta.get(sid) or {})
+            global_root = str(self._config.get("project_root") or "").strip()
+        if meta.get("workspace") and "workspace_root" not in tp:
+            tp["workspace_root"] = str(meta["workspace"])
+        if "workspace_root" not in tp and global_root:
+            tp["workspace_root"] = global_root
+        # per-session system prompt: composed fresh on every submission so a
+        # global-prompt edit also reaches already-open sessions on their next
+        # message (2026-09-13).
+        if "system_prompt" not in tp:
+            composed = self.compose_session_system_prompt(sid)
+            if composed:
+                tp["system_prompt"] = composed
+        return tp
+
+    # ── system prompt composition（2026-09-13）──────────────
+    #
+    # effective prompt = global base + per-session prompt
+    #   global base  = settings "custom system prompt" when enabled and non-empty,
+    #                  otherwise the engine preset's built-in prompt;
+    #   per-session  = stored on the session (append after the base / replace it).
+    # A session without its own prompt keeps the previous behaviour.
+    def _preset_default_prompt(self) -> str:
+        agent = self._agent
+        if agent is None:
+            return ""
+        preset = getattr(agent, "preset", None)
+        params = getattr(preset, "params", None) or {}
+        try:
+            return str(params.get("system_prompt") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _global_system_prompt(self) -> str:
+        """The settings-level global system prompt; empty when not enabled."""
+        try:
+            with self._lock:
+                cfg = dict(self._config or {})
+        except Exception:  # noqa: BLE001
+            cfg = {}
+        if not bool(cfg.get("custom_system_prompt_enabled", False)):
+            return ""
+        text = str(cfg.get("custom_system_prompt") or "").strip()
+        if not text:
+            path = str(cfg.get("custom_system_prompt_file") or "").strip()
+            if path:
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        text = fh.read().strip()
+                except OSError:
+                    text = ""
+        return text
+
+    def _global_base_prompt(self) -> str:
+        return self._global_system_prompt() or self._preset_default_prompt()
+
+    def session_prompt_state(self, sid: str) -> Dict[str, Any]:
+        """Return ``{prompt, mode}`` of a session (empty prompt when unset)."""
+        prompt, mode = "", "append"
+        if sid:
+            try:
+                sess = self._session_manager().get_session(sid)
+            except Exception:  # noqa: BLE001
+                sess = None
+            if sess is not None:
+                prompt = str(getattr(sess, "system_prompt", "") or "")
+                mode = str(getattr(sess, "system_prompt_mode", "append") or "append")
+        if mode not in ("append", "replace"):
+            mode = "append"
+        return {"prompt": prompt, "mode": mode}
+
+    def compose_session_system_prompt(self, sid: str) -> str:
+        base = self._global_base_prompt()
+        state = self.session_prompt_state(sid)
+        text = state["prompt"].strip()
+        if not text:
+            return base
+        if state["mode"] == "replace":
+            return text
+        return (base + "\n\n" + text) if base.strip() else text
+
+    def session_system_prompt(self, sid: str) -> Dict[str, Any]:
+        state = self.session_prompt_state(sid)
+        base = self._global_base_prompt()
+        return {
+            "ok": True,
+            "session_id": sid,
+            "prompt": state["prompt"],
+            "mode": state["mode"],
+            "global_prompt": base,
+            "effective": self.compose_session_system_prompt(sid),
+        }
+
+    def set_session_system_prompt(self, sid: str, prompt: str,
+                                  mode: str = "append") -> Dict[str, Any]:
+        if not sid:
+            return {"ok": False, "error": "session id required"}
+        mode = "replace" if str(mode or "").strip().lower() == "replace" else "append"
+        try:
+            sm = self._session_manager()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        if sm.get_session(sid) is None:
+            return {"ok": False, "error": "session not found"}
+        fn = getattr(sm, "set_system_prompt", None)
+        if callable(fn):
+            ok = bool(fn(sid, str(prompt or ""), mode))
+        else:
+            # fallback for custom managers without the optional capability
+            sess = sm.get_session(sid)
+            try:
+                sess.system_prompt = str(prompt or "")
+                sess.system_prompt_mode = mode
+                ok = True
+            except Exception:  # noqa: BLE001
+                ok = False
+        return {"ok": ok, "session_id": sid,
+                "prompt": str(prompt or ""), "mode": mode}
+
+    def set_global_system_prompt(self, text: str) -> Dict[str, Any]:
+        """Update the settings-level global system prompt (applies to every session).
+
+        Writes ``custom_system_prompt`` (+ its enable flag) and persists at once,
+        so the next composed prompt of any session — new or existing — picks up
+        the change without re-creating the session.
+        """
+        text = str(text or "")
+        with self._lock:
+            self._config["custom_system_prompt"] = text
+            self._config["custom_system_prompt_enabled"] = bool(text.strip())
+            self._config["_initialized"] = True
+            cfg = dict(self._config)
+        self._save_config_to_disk(cfg)
+        self._apply_config(cfg)
+        self._mirror_settings_to_store(cfg)
+        return {"ok": True, "global_prompt": self._global_base_prompt()}
+
     def stop_task(self, session_id: Optional[str]) -> None:
-        """Request stopping the running task of a session (takes effect at step boundaries)."""
+        """Request stopping the running task of a session.
+
+        Immediate: the per-session cancel event is set synchronously, so the model
+        streaming loop aborts mid-generation (not only at the next step boundary).
+        """
         sid = session_id or ""
         runner = None
+        stop_ev = None
         with self._lock:
             if sid and sid in self._running_sessions:
                 self._stop_requests.add(sid)
             runner = self._chat_flow_runs.get(sid)
+            stop_ev = self._stop_events.get(sid)
+        # set the cancel event outside the lock: the running model stream polls it
+        # on every chunk and unwinds at once (clearing the UI "generating" state)
+        if stop_ev is not None:
+            try:
+                stop_ev.set()
+            except Exception:  # noqa: BLE001 — a dead event must not break the request
+                pass
         # a task executing under the active flow: send a stop signal directly to
         # the FlowRunner (the same node-boundary safe-wrap semantics as /api/flow/stop)
         if runner is not None:
@@ -1750,7 +2315,8 @@ class WebUI:
         for key in ("content", "tool_name", "args", "result", "task_id",
                     "user_input", "error", "steps", "timeout", "stream",
                     "input", "output", "total", "session_id", "question",
-                    "reason", "reasoning", "tool_call_tokens"):
+                    "reason", "reasoning", "tool_call_tokens",
+                    "gen_seconds", "stats", "estimated"):
             if key in payload:
                 item[key] = payload[key]
         # usage accumulation
@@ -1763,11 +2329,64 @@ class WebUI:
             except (TypeError, ValueError):
                 pass
         self._publish(item)
+        # security / sandbox interception -> prominent top-right alert
+        _alert = self._security_alert_for(item)
+        if _alert is not None:
+            self._publish({
+                "type": "security_alert",
+                "level": _alert[0],
+                "message": _alert[1],
+                "sid": sid or None,
+                "ts": time.time(),
+            })
 
-    def ask_user(self, question: str, default: str = "") -> str:
+    @staticmethod
+    def _security_alert_for(item: Dict[str, Any]) -> Optional[tuple]:
+        """Detect a security / sandbox interception in an agent event.
+
+        Returns (level, message) where level is "danger" for a hard block and
+        "warn" otherwise, or None when the event is not a security intervention.
+        This is the single choke point where every subsystem's block (sandbox AST
+        precheck, jailbreak/injection guard, hook veto, approval denial, SSRF
+        network policy) is turned into a frontend alert — no per-tool plumbing.
+        """
+        etype = item.get("type") or ""
+        payload = item.get("payload") or {}
+        if not isinstance(payload, dict):
+            return None
+        text = ""
+        if etype == "after_tool_call":
+            res = payload.get("result")
+            if isinstance(res, dict):
+                text = " ".join(str(res.get(k) or "") for k in ("output", "error"))
+            else:
+                text = str(res or "")
+            text += " " + str(payload.get("error") or "")
+        elif etype == "on_tool_error":
+            text = " ".join(str(payload.get(k) or "") for k in ("error", "tool_name"))
+        elif etype in ("on_task_stopped", "on_task_error"):
+            text = " ".join(str(payload.get(k) or "") for k in ("reason", "error", "detail"))
+        else:
+            return None
+        text = text.strip()
+        if not text:
+            return None
+        low = text.lower()
+        for sig in _SEC_BLOCK_SIGNATURES:
+            if sig.lower() in low:
+                danger = ("拦截" in text) or any(
+                    k in low for k in ("blocked", "denied", "jailbreak", "injection"))
+                return ("danger" if danger else "warn", text[:300])
+        return None
+
+    def ask_user(self, question: str, default: str = "", kind: str = "") -> str:
         """Ask the user (human approval / clarification). Waits for the user to
         answer on the page; on timeout returns default, so automation scenarios
         never hang.
+
+        ``kind`` is forwarded to the frontend so the modal can switch controls:
+        ``"approval"`` hides the free-text box and shows only reject/approve,
+        while a clarification keeps the text box.
         """
         question_id = uuid.uuid4().hex[:12]
         box = {"answer": None, "event": threading.Event()}
@@ -1785,6 +2404,7 @@ class WebUI:
                 self._question_sessions[sid] = question_id
         self._publish({
             "type": "question", "question": question,
+            "kind": kind or "clarify",
             "question_id": question_id, "ts": time.time(),
             "sid": sid or None,
         })
@@ -1826,10 +2446,23 @@ class WebUI:
     def create_session(self, title: str = "", workspace: str = "") -> Dict[str, Any]:
         sm = self._session_manager()
         sess = sm.create_session(title=title or "")
+        ws = str(workspace or "").strip()
+        if not ws:
+            # 每会话独立工作区（2026-09-12）：未显式指定时，默认落在全局根目录下的
+            # sessions/<sid> 子目录，物理隔离每个会话；全局根目录为空则不设（沿用
+            # 运行态默认工作目录）。
+            with self._lock:
+                root = str(self._config.get("project_root") or "").strip()
+            if root:
+                ws = os.path.join(root, "sessions", sess.id)
+                try:
+                    os.makedirs(ws, exist_ok=True)
+                except OSError:
+                    ws = ""
         with self._lock:
             self._session_meta[sess.id] = {
                 "title": title or sess.title or sess.id[:8],
-                "workspace": workspace or "",
+                "workspace": ws,
                 "created_at": getattr(sess, "created_at", time.time()),
             }
         return self.session_info(sess.id)
@@ -1841,11 +2474,16 @@ class WebUI:
             meta = self._session_meta.get(sid) or {}
         if sess is None and not meta:
             return {"id": sid, "exists": False}
+        created = meta.get("created_at") or getattr(sess, "created_at", 0.0)
+        updated = getattr(sess, "updated_at", 0.0) or created
         return {
             "id": sid,
             "title": meta.get("title") or (getattr(sess, "title", "") or sid[:8]),
             "workspace": meta.get("workspace") or "",
-            "created_at": meta.get("created_at") or getattr(sess, "created_at", 0.0),
+            "created_at": created,
+            "updated_at": max(updated, created or 0.0),
+            "pinned": bool(meta.get("pinned")
+                           if "pinned" in meta else getattr(sess, "pinned", False)),
             "exists": sess is not None,
         }
 
@@ -1858,61 +2496,635 @@ class WebUI:
         out = []
         for sess in sessions:
             meta = meta_map.get(sess.id) or {}
+            created = meta.get("created_at") or getattr(sess, "created_at", time.time())
+            updated = getattr(sess, "updated_at", 0.0) or created
             out.append({
                 "id": sess.id,
                 "title": meta.get("title") or getattr(sess, "title", "") or sess.id[:8],
                 "workspace": meta.get("workspace") or "",
-                "created_at": meta.get("created_at")
-                or getattr(sess, "created_at", time.time()),
+                "created_at": created,
+                # last activity time: the front session list sorts by this field
+                # (newest first) and buckets by date — 2026-09-12 round 9
+                "updated_at": max(updated, created or 0.0),
+                # user pinned to the top of the list — 2026-09-12 round 9
+                "pinned": bool(meta.get("pinned")
+                               if "pinned" in meta else getattr(sess, "pinned", False)),
                 # front session-pill state: whether a task is currently running
                 "running": sess.id in running,
                 "has_task": bool(sess.id in running
                                  or getattr(sess, "message_count", 0)),
             })
+        # pinned first, then last-activity descending (stable across stores)
+        out.sort(key=lambda r: (
+            0 if r.get("pinned") else 1,
+            -(r.get("updated_at") or 0.0),
+            -(r.get("created_at") or 0.0),
+        ))
         return out
 
-    def session_messages(self, sid: str) -> List[Dict[str, str]]:
+    def session_messages(self, sid: str) -> List[Dict[str, Any]]:
+        """Display messages of a session (2026-09-12 round 9: ordered segments).
+
+        Tool messages stay internal (not returned as standalone messages); each
+        assistant message additionally carries ``segments`` (ordered
+        think/output/tool blocks). Tool segments are filled with their execution
+        result (joined from the following tool messages by tool_call id) so the
+        front can re-render the interleaved timeline after a reload.
+        """
         sm = self._session_manager()
-        messages = []
-        for m in sm.history(sid):
+        raw = list(sm.history(sid))
+        # tool_call_id -> result text (for joining into the assistant segments)
+        tool_results: Dict[str, str] = {}
+        for m in raw:
+            if (getattr(m, "role", "") or "") == "tool":
+                cid = str(getattr(m, "tool_call_id", "") or "")
+                if cid:
+                    tool_results[cid] = str(getattr(m, "content", "") or "")
+        messages: List[Dict[str, Any]] = []
+        for ridx, m in enumerate(raw):
             role = getattr(m, "role", "") or ""
             if role == "tool":
                 continue  # tool messages are internal process; not shown in the chat panel
+            attachments = []
+            for a in getattr(m, "attachments", None) or []:
+                if not isinstance(a, dict):
+                    continue
+                attachments.append({
+                    "kind": str(a.get("kind") or ""),
+                    "name": str(a.get("name") or ""),
+                    "mime": str(a.get("mime") or ""),
+                    "route": str(a.get("route") or "direct"),
+                })
             messages.append({
                 "role": role,
                 "content": getattr(m, "content", "") or "",
                 # 思考过程随历史返回，前端切会话 / 空闲同步重绘后思考块不丢失
                 "thinking": getattr(m, "reasoning", "") or "",
+                # 有序分段（多段思考 / 多段输出 / 工具卡片）——多段工作回载的关键
+                "segments": self._message_segments(m, tool_results),
+                # 附件摘要（不携带 base64 数据）：历史回显附件标记
+                "attachments": attachments,
+                # 生成统计（token 速度 / 总 token / 生成时间）：刷新后仍可回显
+                "stats": getattr(m, "stats", None) or None,
+                # 原始消息下标（含内部 tool 消息）：重新生成 / 编辑对话的回退定位锚点
+                "ridx": ridx,
             })
         return messages
 
+    @staticmethod
+    def _message_segments(message: Any,
+                          tool_results: Dict[str, str]) -> List[Dict[str, Any]]:
+        """Normalize the display segments of one assistant message.
+
+        - stored ``segments`` are passed through (tool results joined);
+        - legacy messages without segments are synthesized from reasoning/content;
+        - best-effort: malformed entries are dropped instead of raising.
+        """
+        out: List[Dict[str, Any]] = []
+        raw = getattr(message, "segments", None)
+        if isinstance(raw, list) and raw:
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("type") or "")
+                if kind == "think":
+                    text = str(item.get("text") or "")
+                    if text:
+                        out.append({"type": "think", "text": text})
+                elif kind == "output":
+                    text = str(item.get("text") or "")
+                    if text:
+                        out.append({"type": "output", "text": text})
+                elif kind == "tool":
+                    cid = str(item.get("id") or "")
+                    result = str(item.get("result") or "")
+                    if not result and cid:
+                        result = tool_results.get(cid, "")
+                    if len(result) > 4000:
+                        result = result[:4000] + " …[truncated]"
+                    status = str(item.get("status") or "")
+                    if status == "running":
+                        status = "ok" if result else "running"
+                    out.append({
+                        "type": "tool",
+                        "id": cid,
+                        "name": str(item.get("name") or "tool"),
+                        "args": item.get("args") or {},
+                        "status": status or ("ok" if result else "running"),
+                        "result": result,
+                    })
+            if out:
+                return out
+        # legacy fallback: think block then output block
+        thinking = str(getattr(message, "reasoning", "") or "")
+        content = str(getattr(message, "content", "") or "")
+        if thinking:
+            out.append({"type": "think", "text": thinking})
+        if content:
+            out.append({"type": "output", "text": content})
+        return out
+
     def close_session(self, sid: str) -> Dict[str, Any]:
+        """Close (delete) one session; reports whether it was really removed.
+
+        2026-09-12（反馈轮 2）：删除结果如实回传（deleted / existed / error），
+        供「清空全部 / 清除记忆」等路径如实记账，不再无条件默认成功。
+        """
         self.stop_task(sid)
+        deleted = False
+        error = ""
         try:
             sm = self._session_manager()
-            sm.delete_session(sid)
-        except Exception:  # noqa: BLE001 — runtime not bound etc.
-            pass
+            deleted = bool(sm.delete_session(sid))
+        except Exception as exc:  # noqa: BLE001 — runtime not bound etc.
+            error = f"{type(exc).__name__}: {exc}"
         with self._lock:
-            self._session_meta.pop(sid, None)
-        return {"ok": True}
+            had_meta = self._session_meta.pop(sid, None) is not None
+        return {"ok": True, "session_id": sid, "deleted": deleted,
+                "existed": bool(deleted or had_meta), "error": error}
 
-    def set_session_title(self, sid: str, title: str) -> None:
+    def clear_sessions(self, ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """批量清除会话（chat「批量清除 / 清空全部」，2026-09-12）。
+
+        ``ids`` 为 None/空 → 清空全部；给定列表 → 只清选中项。运行中的会话
+        先停止任务再删除（close_session 语义，幂等）。返回实际删除清单与失败
+        清单（反馈轮 2：删除失败不再谎报成功）。
+        """
+        if self._agent is None:
+            return {"ok": False, "error": "engine not assembled (runtime not bound)"}
+        try:
+            all_sessions = self.list_sessions()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        targets = [str(s.get("id") or "") for s in all_sessions]
+        targets = [t for t in targets if t]
+        if ids:
+            wanted = {str(i) for i in ids}
+            targets = [t for t in targets if t in wanted]
+        cleared: List[str] = []
+        failed: List[str] = []
+        for sid in targets:
+            try:
+                res = self.close_session(sid)
+                (cleared if res.get("deleted") else failed).append(sid)
+            except Exception:  # noqa: BLE001 — 单个失败不阻塞其余
+                failed.append(sid)
+        return {"ok": True, "cleared": cleared, "count": len(cleared),
+                "failed": failed, "total": len(targets)}
+
+    def memory_clear(self, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """清空会话记忆（星轨控制台「清除记忆」外部通道；2026-09-12 反馈轮 2）。
+
+        - ``session_id`` 省略/为空 → 清空全部会话（真实删除；返回数量与失败清单）；
+        - 给定 ``session_id`` → 只清该会话；
+        - 引擎未装配 / 存储异常时如实返回 ``ok=False``（修复：原先为空实现，
+          返回 ok 但什么都不删的假成功）。
+        """
+        if self._agent is None:
+            return {"ok": False, "error": "engine not assembled (runtime not bound)"}
+        payload = data if isinstance(data, dict) else {}
+        sid = str(payload.get("session_id") or "").strip()
+        if sid:
+            res = self.close_session(sid)
+            if res.get("error"):
+                return {"ok": False, "scope": "session", "session_id": sid,
+                        "error": res.get("error"), "count": 0, "cleared": []}
+            cleared = [sid] if res.get("deleted") else []
+            return {"ok": True, "scope": "session", "session_id": sid,
+                    "cleared": cleared, "count": len(cleared),
+                    "total": 1, "failed": [] if cleared else [sid]}
+        result = self.clear_sessions(None)
+        result["scope"] = "all"
+        return result
+
+    def memory_read(self, sid: str = "") -> Dict[str, Any]:
+        """读取会话记忆（星轨控制台外部通道；``sid`` 为空 → 最近一次会话）。
+
+        返回 ``content``：最近若干条非工具消息的纯文本（无会话 = None）。
+        """
+        if self._agent is None:
+            return {"ok": False, "content": None,
+                    "error": "engine not assembled (runtime not bound)"}
+        try:
+            sm = self._session_manager()
+            if not sid:
+                sessions = sm.list_sessions()
+                sid = sessions[0].id if sessions else ""
+            if not sid:
+                return {"ok": True, "session_id": "", "content": None,
+                        "messages": 0}
+            messages = sm.history(sid)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "content": None,
+                    "error": f"{type(exc).__name__}: {exc}"}
+        lines: List[str] = []
+        for m in messages[-20:]:
+            role = getattr(m, "role", "") or ""
+            if role == "tool":
+                continue
+            text = str(getattr(m, "content", "") or "").strip()
+            if text:
+                lines.append(f"[{role}] {text}")
+        content = "\n".join(lines)
+        if len(content) > 4000:
+            content = content[-4000:]
+        return {"ok": True, "session_id": sid, "content": content or None,
+                "messages": len(messages)}
+
+    # ── session title auto-summary (2026-09-13) ─────────────
+
+    _TITLE_SYSTEM_PROMPT = (
+        "You name chat sessions. Read the user's first request and the "
+        "assistant's first reply, then output a concise title for the session. "
+        "Rules: at most 6 words (or 16 Chinese characters); no quotes, no "
+        "trailing punctuation, no explanation; output the title only."
+    )
+
+    def _title_provider(self, agent: Any) -> Any:
+        """Provider used for title generation (a separate one-off call).
+
+        Priority: the optional ``title_model`` config (a registered model name,
+        or a remote model name mounted on the openai_compat adapter) > the
+        session's current effective model. This keeps summarizing on a cheap
+        model when the user configures one, without reusing the chat loop.
+        """
+        reg = getattr(agent, "registry", None)
+        if reg is None:
+            return None
+        with self._lock:
+            name = str(self._config.get("title_model") or "").strip()
+        preset = getattr(agent, "preset", None)
+        current = str(getattr(preset, "model", "") or "")
+        if name and name != current:
+            try:
+                if name in reg.list_models():
+                    return reg.resolve_model(name)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from norpagent.builtin.models.openai_compat import OpenAICompatProvider
+
+                cfg = self._config
+                return OpenAICompatProvider(
+                    model_name=name,
+                    base_url=str(cfg.get("api_base") or "") or None,
+                    api_key=str(cfg.get("api_key") or "") or None,
+                )
+            except Exception:  # noqa: BLE001
+                return None
+        if current:
+            try:
+                return reg.resolve_model(current)
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    def _run_title_call(self, provider: Any, first_user: str,
+                        first_assistant: str) -> str:
+        """One-shot, tool-free model call summarizing the first round."""
+        from norpagent.protocols.model import ChatMessage
+
+        body = "User's first request:\n%s\n\nAssistant's first reply:\n%s" % (
+            first_user[:4000], first_assistant[:4000])
+        messages = [
+            ChatMessage(role="system", content=self._TITLE_SYSTEM_PROMPT),
+            ChatMessage(role="user", content=body),
+        ]
+        params = {"max_tokens": 32, "temperature": 0.3}
+        text = ""
+        gen = getattr(provider, "generate", None)
+        if callable(gen):
+            try:
+                out = gen(messages, None, dict(params))
+                text = str(getattr(out, "content", "") or "")
+            except NotImplementedError:
+                text = ""
+            except Exception:  # noqa: BLE001 — fall back to streaming
+                text = ""
+        if not text:
+            stream = getattr(provider, "stream", None)
+            if callable(stream):
+                try:
+                    parts = []
+                    for chunk in stream(messages, None, dict(params)):
+                        parts.append(str(getattr(chunk, "delta_content", "") or ""))
+                    text = "".join(parts)
+                except Exception:  # noqa: BLE001
+                    text = ""
+        return self._clean_title(text)
+
+    @staticmethod
+    def _clean_title(text: str) -> str:
+        """Normalize a model-produced title: first line, no quotes / markdown."""
+        t = str(text or "").strip()
+        if not t:
+            return ""
+        t = t.splitlines()[0].strip()
+        t = t.strip("`*_# ").strip()
+        if len(t) >= 2 and t[0] in "\"'“”‘’" and t[-1] in "\"'“”‘’":
+            t = t[1:-1].strip()
+        t = t.rstrip("。.,;；:：!！?？")
+        t = t.strip()
+        if len(t) > 60:
+            t = t[:60].rstrip()
+        return t
+
+    def _maybe_auto_title(self, sid: str) -> None:
+        """Summarize the first round into the session title (once, detached).
+
+        Never blocks or breaks a task: it claims the session up-front, runs the
+        one-off model call on its own daemon thread, and silently no-ops when the
+        session is gone, is not on its first round, or was already titled.
+        """
+        if not sid:
+            return
+        with self._lock:
+            if sid in self._auto_titled_sids:
+                return
+        agent = self._agent
+        if agent is None:
+            return
+        sm = getattr(agent, "session_manager", None)
+        if sm is None:
+            return
+        try:
+            history = list(sm.history(sid))
+        except Exception:  # noqa: BLE001
+            return
+        user_msgs = [m for m in history
+                     if (getattr(m, "role", "") or "") == "user"]
+        if len(user_msgs) != 1:
+            return  # only the first round is summarized
+        first_user = str(getattr(user_msgs[0], "content", "") or "").strip()
+        if not first_user:
+            return
+        first_assistant = ""
+        for m in history:
+            if (getattr(m, "role", "") or "") == "assistant":
+                c = str(getattr(m, "content", "") or "").strip()
+                if c:
+                    first_assistant = c
+                    break
+        with self._lock:
+            if sid in self._auto_titled_sids:
+                return
+            self._auto_titled_sids.add(sid)
+
+        def gen() -> None:
+            title = ""
+            try:
+                provider = self._title_provider(agent)
+                if provider is not None:
+                    title = self._run_title_call(
+                        provider, first_user, first_assistant)
+            except Exception:  # noqa: BLE001
+                title = ""
+            if not title:
+                title = first_user.replace("\n", " ")[:24]
+            if not title:
+                return
+            try:
+                self.set_session_title(sid, title)
+            except Exception:  # noqa: BLE001
+                return
+            self._publish({
+                "type": "on_session_title",
+                "sid": sid,
+                "title": title,
+                "ts": time.time(),
+            })
+
+        threading.Thread(target=gen, daemon=True,
+                         name=f"norpagent-title-{sid[:8]}").start()
+
+    def set_session_title(self, sid: str, title: str) -> Dict[str, Any]:
+        """Rename a session (persisted through the session store; 2026-09-12 round 9).
+
+        Previously the title only lived in the in-memory meta map / a transient
+        Session object, so a rename was lost after a restart for SQLite sessions.
+        """
+        title = str(title or "").strip()
         with self._lock:
             meta = self._session_meta.setdefault(sid, {})
             meta["title"] = title
+        persisted = False
         try:
             sm = self._session_manager()
-            sess = sm.get_session(sid)
-            if sess is not None:
-                sess.title = title
+            setter = getattr(sm, "set_title", None)
+            if callable(setter):
+                persisted = bool(setter(sid, title))
+            else:
+                sess = sm.get_session(sid)
+                if sess is not None:
+                    sess.title = title
+        except Exception:  # noqa: BLE001 — rename must not break the HTTP server
+            pass
+        return {"ok": True, "session_id": sid, "title": title,
+                "persisted": persisted}
+
+    def set_session_pinned(self, sid: str, pinned: bool) -> Dict[str, Any]:
+        """Pin / unpin a session to the top of the list (persisted; 2026-09-12 round 9)."""
+        pinned = bool(pinned)
+        with self._lock:
+            meta = self._session_meta.setdefault(sid, {})
+            meta["pinned"] = pinned
+        persisted = False
+        try:
+            sm = self._session_manager()
+            setter = getattr(sm, "set_pinned", None)
+            if callable(setter):
+                persisted = bool(setter(sid, pinned))
         except Exception:  # noqa: BLE001
             pass
+        return {"ok": True, "session_id": sid, "pinned": pinned,
+                "persisted": persisted}
 
     def set_session_workspace(self, sid: str, workspace: str) -> None:
         with self._lock:
             meta = self._session_meta.setdefault(sid, {})
             meta["workspace"] = workspace
+
+    def truncate_session(self, sid: str, keep: int) -> Dict[str, Any]:
+        """Rewind a session to its first ``keep`` messages (regenerate / edit a turn).
+
+        Drops the trailing messages from the session store so the edited / regenerated
+        turn is submitted as the current message instead of piling up as history.
+        """
+        try:
+            sm = self._session_manager()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "dropped": 0}
+        fn = getattr(sm, "truncate", None)
+        if not callable(fn):
+            return {"ok": False, "error": "session store does not support truncate",
+                    "dropped": 0, "session_id": sid}
+        try:
+            dropped = int(fn(sid, max(0, int(keep))) or 0)
+        except Exception as exc:  # noqa: BLE001 — report honestly instead of faking success
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                    "dropped": 0, "session_id": sid}
+        return {"ok": True, "session_id": sid, "keep": max(0, int(keep)),
+                "dropped": dropped}
+
+    def rewind_turn(self, sid: str, turn: int, snapshot: bool = True) -> Dict[str, Any]:
+        """Rewind a session to the start of its ``turn``-th user message (0-based).
+
+        The truncation point is resolved **on the server** by counting the
+        session's own user messages — the caller never has to pass a raw index
+        (``ridx``) that a locally-appended, not-yet-persisted message can
+        invalidate. That fragile index was the cause of the regenerate / edit
+        failure "cannot locate message" (无法定位该消息).
+
+        When ``snapshot`` is true, the turn being replaced (its previous reply and
+        its then-downstream) is first saved into the per-turn version store, so the
+        ``< n/N >`` switcher can restore it. Returns the resolved ``keep`` plus the
+        original user text, so the caller can resubmit even without its local copy.
+        """
+        try:
+            sm = self._session_manager()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            turn = int(turn)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad turn"}
+        if turn < 0:
+            return {"ok": False, "error": "turn out of range", "turn": turn}
+        try:
+            hist = list(sm.history(sid))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        seen = -1
+        keep = None
+        prompt = ""
+        for i, m in enumerate(hist):
+            if (getattr(m, "role", "") or "") == "user":
+                seen += 1
+                if seen == turn:
+                    keep = i
+                    prompt = str(getattr(m, "content", "") or "")
+                    break
+        if keep is None:
+            return {"ok": False, "error": "turn out of range", "turn": turn,
+                    "history": len(hist)}
+        out: Dict[str, Any] = {"ok": True, "session_id": sid, "turn": turn,
+                               "keep": keep, "prompt": prompt, "dropped": 0,
+                               "count": 0, "active": -1}
+        # remember the version being replaced BEFORE dropping it (best-effort)
+        if snapshot and self._variants_supported():
+            try:
+                snap = self.variant_snapshot(sid, turn, keep)
+                if isinstance(snap, dict):
+                    out["count"] = int(snap.get("count", 0) or 0)
+                    out["active"] = int(snap.get("active", -1))
+            except Exception:  # noqa: BLE001 — a failed snapshot must not block the rewind
+                pass
+        fn = getattr(sm, "truncate", None)
+        if not callable(fn):
+            return {"ok": False, "error": "session store does not support truncate",
+                    "turn": turn}
+        try:
+            out["dropped"] = int(fn(sid, keep) or 0)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "turn": turn}
+        return out
+
+    # ── branch / version store (regenerate version switching) ─────
+
+    def _variants_supported(self) -> bool:
+        try:
+            sm = self._session_manager()
+        except Exception:  # noqa: BLE001
+            return False
+        return callable(getattr(sm, "get_variants", None)) and \
+            callable(getattr(sm, "set_variants", None))
+
+    def session_variants(self, sid: str) -> Dict[str, Any]:
+        """Per-turn branch / version metadata (count + active index) of a session.
+
+        Persisted in the session store (2026-09-13) so the switcher survives a
+        reload / restart. ``active == -1`` means the live store is the active view.
+        """
+        try:
+            sm = self._session_manager()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "turns": {}}
+        fn = getattr(sm, "get_variants", None)
+        data = fn(sid) if callable(fn) else {}
+        turns = data.get("turns") if isinstance(data, dict) else {}
+        out: Dict[str, Any] = {}
+        if isinstance(turns, dict):
+            for key, entry in turns.items():
+                if not isinstance(entry, dict):
+                    continue
+                versions = entry.get("versions") or []
+                active = int(entry.get("active", -1))
+                count = len(versions) + (1 if active == -1 else 0)
+                out[str(key)] = {
+                    "count": count,
+                    "active": active,
+                    "keep": int(entry.get("keep", 0) or 0),
+                }
+        return {"ok": True, "turns": out}
+
+    def variant_snapshot(self, sid: str, turn: int, keep: int) -> Dict[str, Any]:
+        """Snapshot the live tail (from ``keep``) as a new version of ``turn``.
+
+        Called before regenerating / editing a turn: the previous output (and its
+        then-downstream) is preserved so the switcher can bring it back.
+        """
+        if not self._variants_supported():
+            return {"ok": False, "error": "session store does not support variants"}
+        sm = self._session_manager()
+        hist = list(sm.history(sid))
+        keep = max(0, int(keep))
+        snapshot = [m.to_dict() for m in hist[keep:]]
+        data = sm.get_variants(sid) or {}
+        turns = data.setdefault("turns", {})
+        key = str(int(turn))
+        entry = turns.setdefault(key, {"keep": keep, "versions": [], "active": -1})
+        entry["keep"] = keep
+        versions = entry.setdefault("versions", [])
+        if not versions or versions[-1].get("messages") != snapshot:
+            versions.append({"messages": snapshot})
+        # a freshly snapshotted branch becomes the "previous" one; the live store
+        # is the active view from now on (active = -1)
+        entry["active"] = -1
+        sm.set_variants(sid, data)
+        count = len(versions) + 1
+        return {"ok": True, "turn": int(turn), "count": count, "active": -1}
+
+    def variant_restore(self, sid: str, turn: int, index: int) -> Dict[str, Any]:
+        """Switch a turn to a stored version (replaces the live tail)."""
+        if not self._variants_supported():
+            return {"ok": False, "error": "session store does not support variants"}
+        sm = self._session_manager()
+        data = sm.get_variants(sid) or {}
+        turns = data.get("turns") or {}
+        key = str(int(turn))
+        entry = turns.get(key)
+        if not isinstance(entry, dict):
+            return {"ok": False, "error": "no variants for this turn"}
+        versions = entry.get("versions") or []
+        index = int(index)
+        if index < 0 or index >= len(versions):
+            return {"ok": False, "error": "version index out of range", "count": len(versions)}
+        keep = int(entry.get("keep", 0) or 0)
+        if int(entry.get("active", -1)) == -1:
+            # preserve the live tail before switching away from it
+            hist = list(sm.history(sid))
+            snapshot = [m.to_dict() for m in hist[keep:]]
+            if not versions or versions[-1].get("messages") != snapshot:
+                versions.append({"messages": snapshot})
+        from norpagent.protocols.model import ChatMessage
+
+        target = versions[index].get("messages") or []
+        msgs = [ChatMessage.from_dict(d) for d in target]
+        sm.replace_tail(sid, keep, msgs)
+        entry["active"] = index
+        sm.set_variants(sid, data)
+        return {"ok": True, "turn": int(turn), "index": index,
+                "active": index, "count": len(versions)}
 
     # ── config ───────────────────────────────────────────
 
@@ -1989,6 +3201,17 @@ class WebUI:
         cfg["agent_effective_tools"] = self.agent_effective_tools()
         cfg["agent_base_tools"] = list(self._agent_base_tools)
         return cfg
+
+    def config_for_apply(self) -> Dict[str, Any]:
+        """Full runtime config **including secrets** — for the local apply pipeline.
+
+        The HTTP-facing :meth:`get_config` strips ``api_key``; the in-process
+        startup restore (WebFrontend.restore_startup_config / CLI web runner)
+        needs the plaintext key to register the model provider. Never serialize
+        this dict into an HTTP response (2026-09-12 round 9).
+        """
+        with self._lock:
+            return dict(self._config)
 
     # ── agent tool mounting (file-as-module → front auto-invocation) ──
 
@@ -2078,6 +3301,9 @@ class WebUI:
             for key, value in (incoming or {}).items():
                 if key == "_initialized":
                     continue
+                # Security master switches are honored, not forced: turning them
+                # off is allowed, but the frontend gates it behind an explicit,
+                # non-dismissable confirmation before it reaches this endpoint.
                 if key in _SECRET_KEYS:
                     # accept plaintext or an already-encrypted (marker) value
                     self._config[key] = _decrypt_api_key(value)
@@ -2087,6 +3313,8 @@ class WebUI:
             cfg = dict(self._config)
         self._save_config_to_disk(cfg)
         self._apply_config(cfg)
+        # 设置事实源镜像（§5.3）：运行态配置 → 设置库
+        self._mirror_settings_to_store(cfg)
         return self.get_config()
 
     def reset_config(self) -> Dict[str, Any]:
@@ -2100,6 +3328,7 @@ class WebUI:
             cfg = dict(self._config)
         self._save_config_to_disk(cfg)
         self._apply_config(cfg)
+        self._mirror_settings_to_store(cfg)
         return self.get_config()
 
     def set_api_key(self, api_key: str) -> Dict[str, Any]:
@@ -2109,6 +3338,7 @@ class WebUI:
             cfg = dict(self._config)
         self._save_config_to_disk(cfg)
         self._apply_config(cfg)
+        self._mirror_settings_to_store(cfg)
         return {"ok": True, "config": self.get_config()}
 
     def validate_api_key(self, api_key: str, base_url: str = "") -> Dict[str, Any]:
@@ -2169,6 +3399,21 @@ class WebUI:
                 self._config[secret] = _decrypt_api_key(
                     self._config.get(secret) or ""
                 )
+        # 设置事实源镜像（§5.3，2026-09-12）：运行态配置 → 设置库（失败不阻塞）
+        self._mirror_settings_to_store()
+
+    def _mirror_settings_to_store(self,
+                                  cfg: Optional[Dict[str, Any]] = None) -> None:
+        """运行态配置 → 设置库镜像（非密键；失败只记录，不拖垮请求 / 启动）。"""
+        try:
+            from norpagent.settings import ensure_schema, mirror_config_to_store
+
+            mirror_config_to_store(
+                cfg if isinstance(cfg, dict) else dict(self._config),
+                store=ensure_schema(),
+            )
+        except Exception:  # noqa: BLE001 — 镜像尽力而为
+            _logger.debug("settings mirror skipped", exc_info=True)
 
     def _save_config_to_disk(self, cfg: Dict[str, Any]) -> None:
         """Atomically write the config to disk (failures only log; never break the save flow).
@@ -2223,43 +3468,73 @@ class WebUI:
 
     def list_models(self, base_url: str = "",
                     api_key: Optional[str] = None) -> Dict[str, Any]:
-        """List models: registry models + (when base_url and a key are provided) remote models.
+        """List models: registry models + remote models (when a base URL + key are available).
 
-        An explicit ``api_key`` is preferred when passed (the frontend "fetch model
-        list" sends the key currently typed in the input box, no save needed to
-        fetch). After a successful fetch, the remote model list is cached in the
-        config (``remote_models``), shown in real time by the flow snapshot's
-        module-dock "models" group.
+        Robustness (2026-09-12, 面板抓取修复):
+        - **不读写 / 不清空密钥**——表单里刚输入的 key 直接用于抓取（无需先保存）；
+        - base URL 容错：去尾斜杠、缺协议自动补 https://、空值回落到已保存 api_base；
+        - 双路抓取：openai SDK 优先，失败自动回退 `GET {base}/models`（Bearer）；
+        - 错误信息明确（缺 key / SDK 缺失 / 端点错误分别说明）；
+        - 返回 registry / remote / models 三份列表：远端失败时下拉仍可用注册表模型。
+        成功后把远端模型列表缓存进配置（remote_models）。
         """
         reg = self._registry()
-        names = sorted(reg.list_models()) if reg is not None else []
+        registry = sorted(reg.list_models()) if reg is not None else []
         remote: List[str] = []
         error: Optional[str] = None
-        used_key = api_key or self._config.get("api_key")
-        if base_url and used_key:
+        base = str(base_url or "").strip().rstrip("/")
+        if not base:
+            base = str(self._config.get("api_base") or "").strip().rstrip("/")
+        if base and not re.match(r"^https?://", base, re.IGNORECASE):
+            base = "https://" + base
+        used_key = (str(api_key or "").strip()
+                    or str(self._config.get("api_key") or "").strip())
+        if base and not used_key:
+            error = ("API key is empty: type it in the API key field "
+                     "(no save needed before fetching).")
+        elif base:
+            sdk_error = ""
             try:
-                from openai import OpenAI  # noqa: F401  optional dependency
+                from openai import OpenAI
+
+                client = OpenAI(base_url=base, api_key=used_key, timeout=20)
+                remote = [m.id for m in client.models.list()][:200]
             except ImportError:
-                error = "openai SDK not installed (pip install norpagent[openai])"
-            else:
+                sdk_error = "openai SDK not installed (pip install norpagent[openai])"
+                remote = []
+            except Exception as exc:  # noqa: BLE001 — 回退到纯 HTTP
+                sdk_error = f"{type(exc).__name__}: {exc}"
+                remote = []
+            if not remote:
                 try:
-                    client = OpenAI(
-                        base_url=base_url,
-                        api_key=used_key,
-                        timeout=15,
-                    )
-                    remote = [m.id for m in client.models.list()][:200]
-                    remote = filter_remote_models(remote)
-                except Exception as exc:  # noqa: BLE001
-                    error = f"{exc}"
+                    req = urllib.request.Request(
+                        base + "/models",
+                        headers={"Authorization": f"Bearer {used_key}",
+                                 "Accept": "application/json"})
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        payload = json.loads(
+                            resp.read().decode("utf-8", errors="replace"))
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    if isinstance(data, list):
+                        remote = [str(m.get("id")) for m in data
+                                  if isinstance(m, dict) and m.get("id")][:200]
+                except Exception as exc:  # noqa: BLE001 — 两路都失败：如实报错
+                    if not sdk_error:
+                        sdk_error = f"{type(exc).__name__}: {exc}"
+            if remote:
+                remote = filter_remote_models(remote)
+                error = None
+            else:
+                error = sdk_error or "the endpoint returned no models"
         if remote:
             # remote model list cache: update memory + persist the config (failures do not block)
             with self._lock:
                 self._config["remote_models"] = list(remote)
                 cfg = dict(self._config)
             self._save_config_to_disk(cfg)
-            return {"models": remote, "error": None}
-        return {"models": names, "error": error}
+        models = list(dict.fromkeys(list(registry) + list(remote)))
+        return {"models": models, "registry": registry, "remote": remote,
+                "error": error, "base_url": base}
 
     def get_plugin_dirs(self) -> List[str]:
         with self._lock:
@@ -2267,9 +3542,40 @@ class WebUI:
         return list(dirs)
 
     def list_plugins(self) -> List[Dict[str, Any]]:
+        """List plugins.
+
+        2026-09-11: prefers the loader's full record — failed / disabled / blocked
+        plugins are included together with signature status, isolation mode,
+        warnings, approval hints, audit issues, diagnostics and call counters.
+        Falls back to the registered plugin objects when no loader is recorded.
+        """
         reg = self._registry()
         if reg is None:
             return []
+        loader = getattr(reg, "plugin_loader", None)
+        if loader is not None:
+            with self._lock:
+                disabled_cfg = {str(n) for n in (self._config.get("plugin_disabled") or [])}
+            out: List[Dict[str, Any]] = []
+            for info in list(getattr(loader, "plugins", ()) or ()):
+                rec = info.to_dict() if hasattr(info, "to_dict") else {}
+                name = str(rec.get("name") or "")
+                rec["disabled_in_config"] = name in disabled_cfg
+                rec.setdefault("isolation", "inproc")
+                # audit counters for the existing panels (derived from audit_issues)
+                issues = rec.get("audit_issues") or []
+                crit = sum(1 for i in issues
+                           if str((i or {}).get("severity", "")).lower() == "critical")
+                warn_cnt = sum(1 for i in issues
+                               if str((i or {}).get("severity", "")).lower() == "warning")
+                rec["audit_critical"] = crit
+                rec["audit_warning"] = warn_cnt
+                rec["audit_info"] = max(len(issues) - crit - warn_cnt, 0)
+                rec["source"] = "loader"
+                out.append(rec)
+            if out:
+                return out
+        # fallback: registry-registered plugin objects (no loader record)
         plugins = getattr(reg, "_plugins", {}) or {}
         out = []
         for name in sorted(plugins):
@@ -2300,8 +3606,97 @@ class WebUI:
                 "audit_info": 0,
                 "signature_status": "unknown",
                 "isolation": "inproc",
+                "source": "registry",
             })
         return out
+
+    def set_plugin_enabled(self, name: str, enabled: bool) -> List[Dict[str, Any]]:
+        """Enable / disable one plugin: persisted in the config (plugin_disabled) and reloaded."""
+        name = (name or "").strip()
+        if name:
+            with self._lock:
+                disabled = [str(n) for n in (self._config.get("plugin_disabled") or [])]
+                if enabled:
+                    disabled = [n for n in disabled if n != name]
+                else:
+                    if name not in disabled:
+                        disabled.append(name)
+                self._config["plugin_disabled"] = disabled
+                self._config["_initialized"] = True
+                cfg = dict(self._config)
+            self._save_config_to_disk(cfg)
+            self._apply_config(cfg)
+        return self.list_plugins()
+
+    def delete_plugin(self, name: str) -> Dict[str, Any]:
+        """Uninstall one plugin: delete its file (or package directory) and reload.
+
+        The path must live inside one of the configured plugin directories.
+        """
+        name = (name or "").strip()
+        info = self._find_plugin_info(name)
+        if info is None:
+            return {"ok": False, "error": f"plugin not found: {name}"}
+        path = str(getattr(info, "path", "") or "")
+        ok, message = _safe_delete_plugin_path(path, self.get_plugin_dirs())
+        if not ok:
+            return {"ok": False, "error": message}
+        with self._lock:
+            disabled = [n for n in (self._config.get("plugin_disabled") or []) if n != name]
+            self._config["plugin_disabled"] = disabled
+            self._config["_initialized"] = True
+            cfg = dict(self._config)
+        self._save_config_to_disk(cfg)
+        self._apply_config(cfg)
+        return {"ok": True, "removed": message, "plugins": self.list_plugins()}
+
+    def install_plugin_file(self, filename: str, content: str,
+                            encoded: bool = True) -> Dict[str, Any]:
+        """Install a single-file .py plugin into the first configured plugin directory."""
+        import base64 as _b64
+
+        base_name = os.path.basename((filename or "").strip())
+        if not base_name or not base_name.endswith(".py"):
+            return {"ok": False, "error": "only single-file .py plugins can be installed here"}
+        target_dir = ""
+        for d in self.get_plugin_dirs():
+            if d and os.path.isdir(d):
+                target_dir = d
+                break
+        if not target_dir:
+            return {"ok": False, "error": "no plugin directory configured; add one first"}
+        try:
+            data = _b64.b64decode(content or "", validate=True) if encoded \
+                else (content or "").encode("utf-8")
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "error": "invalid base64 content"}
+        if len(data) > 2 * 1024 * 1024:
+            return {"ok": False, "error": "plugin file too large (2 MB limit)"}
+        stem, ext = os.path.splitext(base_name)
+        target = os.path.join(target_dir, base_name)
+        index = 1
+        while os.path.exists(target):
+            target = os.path.join(target_dir, f"{stem}_{index}{ext}")
+            index += 1
+        try:
+            with open(target, "wb") as fh:
+                fh.write(data)
+        except OSError as exc:
+            return {"ok": False, "error": f"write failed: {exc}"}
+        with self._lock:
+            self._config["_initialized"] = True
+            cfg = dict(self._config)
+        self._save_config_to_disk(cfg)
+        self._apply_config(cfg)
+        return {"ok": True, "installed": target, "plugins": self.list_plugins()}
+
+    def _find_plugin_info(self, name: str) -> Any:
+        reg = self._registry()
+        loader = getattr(reg, "plugin_loader", None) if reg is not None else None
+        for info in list(getattr(loader, "plugins", ()) or ()):
+            if str(getattr(info, "name", "")) == name:
+                return info
+        return None
 
     def add_plugin_dir(self, path: str) -> List[str]:
         path = (path or "").strip()
@@ -2335,6 +3730,7 @@ class WebUI:
         # aligned with the flat structure the desktop frontend's openPluginPanel expects
         return {
             "norp_safe_enabled": cfg.get("norp_safe_enabled", True),
+            "security_enabled": cfg.get("security_enabled", True),
             "plugins_enabled": cfg.get("plugins_enabled", True),
             "audit": cfg.get("plugin_security_audit", "block"),
             "import_restrict": cfg.get("plugin_security_import_restrict", "strict"),
@@ -2369,10 +3765,13 @@ class WebUI:
         with self._lock:
             if "norp_safe_enabled" in data:
                 self._config["norp_safe_enabled"] = bool(data["norp_safe_enabled"])
+            if "security_enabled" in data:
+                self._config["security_enabled"] = bool(data["security_enabled"])
             sec = data.get("security")
             if isinstance(sec, dict):
                 for key, value in sec.items():
-                    if key.startswith("plugin_") or key in ("norp_safe_enabled",):
+                    if key.startswith("plugin_") or key in (
+                            "norp_safe_enabled", "security_enabled"):
                         self._config[key] = value
             args = data.get("security_args")
             if isinstance(args, list):
@@ -2452,8 +3851,448 @@ class WebUI:
             "tasks_total": len(self._tasks),
         }
 
+    # ── 进化面板数据面（R-005 勾选制 / R-010 导出 / R-012 导入） ──
+    # 进化底座（norpagent.evolution）为可选能力：不可用时面板如实降级为空。
+
+    def evolution_points(self) -> Dict[str, Any]:
+        """全部可进化点 + 当前勾选裁决（设置面板数据源）。"""
+        try:
+            from norpagent.evolution import ApprovalPolicy, get_store
+
+            store = get_store()
+            policy = ApprovalPolicy(store)
+            return {
+                "ok": True,
+                "enabled": bool(store.get("evolution.enabled", True)),
+                "points": policy.decisions(),
+            }
+        except Exception as exc:  # noqa: BLE001 — 面板降级不拖垮 WebUI
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                    "points": []}
+
+    def evolution_log(self, n: int = 50) -> Dict[str, Any]:
+        """进化日志尾部（热重载 / 进化包导入记录，R-004 / R-012）。"""
+        try:
+            from norpagent.evolution import read_log
+
+            return {"ok": True, "log": read_log(int(n))}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "log": []}
+
+    def evolution_set_point(self, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """改一个点的勾选/分类（勾了=人工、不勾=自动；变更入审计）。"""
+        try:
+            from norpagent.evolution import ApprovalPolicy, get_store
+
+            data = dict(data or {})
+            point = str(data.get("point") or "").strip()
+            policy = ApprovalPolicy(get_store())
+            if data.get("reset"):
+                policy.clear_manual(point)
+            elif "category" in data:
+                policy.set_category(point, str(data.get("category")))
+            else:
+                policy.set_manual(point, bool(data.get("manual")))
+            return {"ok": True, "points": policy.decisions()}
+        except Exception as exc:  # noqa: BLE001 — 如实报错
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    # ── 提案引擎 / 熔断（§7.1 进化环；面板「提案中心」数据面） ──
+
+    def _evolution_board(self):
+        from norpagent.evolution import ProposalBoard
+
+        return ProposalBoard(notifier=self._evolution_notify)
+
+    def _evolution_notify(self, payload: Dict[str, Any]) -> None:
+        """进化通知 → SSE（熔断打开 / 提案状态变化；失败不阻塞）。"""
+        try:
+            self._publish({
+                "type": "notify",
+                "level": "warn" if payload.get("kind") == "breaker" else "info",
+                "message": str(payload.get("message") or ""),
+                "ts": time.time(),
+                "channel": "evolution",
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
+    def evolution_proposals(self, status: Optional[str] = None) -> Dict[str, Any]:
+        """提案列表 + 熔断状态（提案中心数据源）。"""
+        try:
+            board = self._evolution_board()
+            items = board.list(status=status or None, limit=200)
+            pending = [p for p in items if p.get("status") == "awaiting"]
+            return {"ok": True, "proposals": items, "pending": pending,
+                    "breakers": board.breaker.all_states()}
+        except Exception as exc:  # noqa: BLE001 — 面板降级不拖垮 WebUI
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                    "proposals": [], "pending": [], "breakers": []}
+
+    def evolution_proposals_action(self, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """提案中心动作面（run / decide / execute / breaker_resume /
+        memory_plan / memory_apply / skill_candidates / skill_apply / config_tune）。"""
+        data = dict(data or {})
+        action = str(data.get("action") or "").strip()
+        try:
+            from norpagent.evolution import (
+                ConfigEvolver, MemoryEvolver, ProposalBoard, SkillEvolver,
+                UsageTracker,
+            )
+
+            board = self._evolution_board()
+            if action == "run":
+                # 一键：创建 → 勾选制裁决 →（批准即）执行
+                rec = board.create(
+                    str(data.get("point") or "kernel.agent"),
+                    str(data.get("kind") or "config"),
+                    str(data.get("title") or "evolution proposal"),
+                    summary=str(data.get("summary") or ""),
+                    payload=dict(data.get("payload") or {}),
+                    reason=str(data.get("reason") or ""),
+                    impact=str(data.get("impact") or ""),
+                    risk=str(data.get("risk") or "medium"),
+                    diff=str(data.get("diff") or ""),
+                )
+                rec = board.decide(rec["id"])
+                if rec.get("status") == "approved":
+                    rec = board.execute(rec["id"])
+                return {"ok": True, "proposal": rec,
+                        "proposals": board.list(limit=200),
+                        "breakers": board.breaker.all_states()}
+            if action == "decide":
+                rec = board.decide(str(data.get("id") or ""),
+                                   approve=(bool(data["approve"])
+                                            if "approve" in data else None))
+                return {"ok": True, "proposal": rec,
+                        "proposals": board.list(limit=200),
+                        "breakers": board.breaker.all_states()}
+            if action == "execute":
+                rec = board.execute(str(data.get("id") or ""))
+                return {"ok": True, "proposal": rec,
+                        "proposals": board.list(limit=200),
+                        "breakers": board.breaker.all_states()}
+            if action == "breaker_resume":
+                state = board.breaker.resume(str(data.get("point") or ""))
+                return {"ok": True, "breaker": state,
+                        "breakers": board.breaker.all_states()}
+            if action == "memory_plan":
+                plan = MemoryEvolver().plan()
+                return {"ok": True, "plan": plan}
+            if action == "memory_apply":
+                ids = [int(i) for i in (data.get("ids") or [])]
+                rec = board.propose_memory(
+                    "forget", ids, reason=str(data.get("reason") or "memory plan"))
+                rec = board.decide(rec["id"])
+                if rec.get("status") == "approved":
+                    rec = board.execute(rec["id"])
+                return {"ok": True, "proposal": rec,
+                        "proposals": board.list(limit=200),
+                        "breakers": board.breaker.all_states()}
+            if action == "memory_restore":
+                result = MemoryEvolver().restore(int(data.get("origin_id") or 0))
+                return {"ok": bool(result.get("ok")), "result": result}
+            if action == "memory_forgotten":
+                return {"ok": True, "forgotten": MemoryEvolver().forgotten()}
+            if action == "skill_candidates":
+                tracker = UsageTracker(board.store)
+                cands = SkillEvolver(board.store).candidate_payloads(tracker)
+                return {"ok": True, "candidates": cands}
+            if action == "skill_apply":
+                rec = board.propose_skill(
+                    str(data.get("name") or ""),
+                    dict(data.get("artifact") or {}),
+                    reason=str(data.get("reason") or "skill candidate"))
+                rec = board.decide(rec["id"])
+                if rec.get("status") == "approved":
+                    rec = board.execute(rec["id"])
+                return {"ok": True, "proposal": rec,
+                        "proposals": board.list(limit=200),
+                        "breakers": board.breaker.all_states()}
+            if action == "config_tune":
+                ce = ConfigEvolver(board.store, board=board)
+                rec = ce.propose(str(data.get("key") or ""),
+                                 data.get("value"),
+                                 reason=str(data.get("reason") or "config tune"))
+                rec = board.decide(rec["id"])
+                if rec.get("status") == "approved":
+                    rec = board.execute(rec["id"])
+                return {"ok": True, "proposal": rec,
+                        "proposals": board.list(limit=200),
+                        "breakers": board.breaker.all_states()}
+            return {"ok": False, "error": f"unknown action: {action!r}"}
+        except Exception as exc:  # noqa: BLE001 — 如实报错（面板显示原因）
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def evolution_export(self, kind: str = "settings", author: str = ""):
+        """导出（返回 (bytes, filename, mime)）。
+
+        - kind="fspack"：进化状态打包为 .fspack（含作者署名；R-010）；
+        - kind="settings"（默认）：设置事实源 JSON 快照（R-017）。
+        """
+        import json as _json
+
+        from norpagent.evolution import (
+            ApprovalPolicy, build_fspack, get_store, read_log,
+        )
+
+        store = get_store()
+        if str(kind) == "fspack":
+            item = {
+                "kind": "evolution-state",
+                "settings": store.all(include_schema_defaults=True),
+                "approvals": ApprovalPolicy(store).decisions(),
+                "log_tail": read_log(100),
+            }
+            payload = build_fspack(item, author=str(author or "user"))
+            body = _json.dumps(payload, ensure_ascii=False, indent=2,
+                               default=str).encode("utf-8")
+            return body, "farstars-evolution.fspack", "application/json"
+        snap = store.export_json()
+        body = _json.dumps(snap, ensure_ascii=False, indent=2,
+                           default=str).encode("utf-8")
+        return body, "farstars-settings.json", "application/json"
+
+    def evolution_import(self, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """导入进化包（.fspack/.json/.py）或整合包（.zip）（R-010 / R-012）。
+
+        失败项不阻塞其余（整合包逐条语义）；失败逻辑完全不使用并如实报错。
+        """
+        import base64
+        import json as _json
+        import os as _os
+        import tempfile
+
+        from norpagent.evolution import get_store, import_bundle, import_fspack
+
+        data = dict(data or {})
+        name = str(data.get("name") or "import.bin")
+        try:
+            blob = base64.b64decode(str(data.get("data") or ""))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"invalid base64 payload: {exc}"}
+        suffix = _os.path.splitext(name)[1].lower()
+        store = get_store()
+
+        def apply_fn(item: Any) -> None:
+            if isinstance(item, dict) and isinstance(item.get("settings"), dict):
+                # 快照导入是「用户导入」行为（非进化器自写）：actor 不以
+                # "evolution" 开头，因此不受「进化器写锁定/非可进化项拒绝」
+                # 守卫限制（R-005/§7.6 守卫只拦进化器自身的写入；用户经面板
+                # / CLI / 导入恢复快照属用户级操作，入审计）。
+                store.set_many(item["settings"], actor="settings-import",
+                               reason=f"import {name}")
+
+        tmp_dir = tempfile.mkdtemp(prefix="np_evo_import_")
+        tmp_path = _os.path.join(tmp_dir, _os.path.basename(name) or "import.bin")
+        with open(tmp_path, "wb") as fh:
+            fh.write(blob)
+        try:
+            if suffix == ".zip":
+                report = import_bundle(tmp_path, apply_fn=apply_fn)
+                return {"ok": True, "report": report}
+            if suffix == ".py":
+                import_fspack(tmp_path, apply_fn=apply_fn)
+                return {"ok": True, "report": {"total": 1, "ok": 1,
+                                               "failed": 0,
+                                               "applied": [{"entry": name}]}}
+            if suffix in (".fspack", ".json"):
+                try:
+                    payload = _json.loads(blob.decode("utf-8", errors="replace"))
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict) and payload.get("format") == "fspack/1":
+                    import_fspack(tmp_path, apply_fn=apply_fn)
+                    return {"ok": True, "report": {"total": 1, "ok": 1,
+                                                   "failed": 0,
+                                                   "applied": [{"entry": name}]}}
+                if isinstance(payload, dict) and (
+                        "values" in payload or "schema" in payload):
+                    n = store.import_json(payload, actor="user",
+                                          reason=f"import {name}")
+                    return {"ok": True, "report": {"total": 1, "ok": 1,
+                                                   "failed": 0, "imported": n}}
+                return {"ok": False, "error": "unrecognized package format"}
+            return {"ok": False, "error": f"unsupported suffix: {suffix}"}
+        except Exception as exc:  # noqa: BLE001 — 导入失败如实报错
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            try:
+                _os.remove(tmp_path)
+                _os.rmdir(tmp_dir)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ── 设置事实源（§5 / §6.3：Web 面板 / CLI / REST 三通道同源） ──
+
+    def _settings_store(self):
+        """确保 schema 注册并返回设置事实源（懒加载；测试可经环境变量隔离）。"""
+        from norpagent.settings import ensure_schema
+
+        return ensure_schema()
+
+    def settings_schema(self, category: Optional[str] = None,
+                        view: Optional[str] = None) -> Dict[str, Any]:
+        """注册表合并视图（可按 category / 三视角过滤）。"""
+        try:
+            from norpagent.settings import schema_view
+
+            rows = schema_view(self._settings_store())
+            if category:
+                rows = [r for r in rows if r.get("category") == category]
+            if view:
+                rows = [r for r in rows if view in (r.get("views") or [])]
+            # 密钥项不返回默认值之外的信息（面板仍可见字段位，值由配置链路管理）
+            return {"ok": True, "schema": rows, "count": len(rows)}
+        except Exception as exc:  # noqa: BLE001 — 面板降级不拖垮 WebUI
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                    "schema": []}
+
+    def settings_values(self) -> Dict[str, Any]:
+        """全部设置项的解析视图（值 + 来源 + 三态：默认 / 继承 / 显式）。"""
+        try:
+            store = self._settings_store()
+            return {"ok": True, "values": store.all_resolved(),
+                    "scopes": dict(_SCOPE_TITLES_CACHE)}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                    "values": {}}
+
+    def settings_set(self, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """写入一个设置项（schema 校验 + 分层作用域 + 桥接热应用）。
+
+        - ``reset=True``：删除显式值（恢复上级继承 / 默认）；
+        - ``scope``：global（默认）/ profile / session / temp；
+        - 桥接热应用仅针对**全局层**的非密键（config_key）：合并进运行态配置并
+          立即生效（与既有面板同一链路）；作用域层保持设置库内部语义；密钥类
+          项仅在配置链路处理（不落设置库）。
+        """
+        data = dict(data or {})
+        key = str(data.get("key") or "").strip()
+        scope = str(data.get("scope") or "global").strip().lower()
+        try:
+            from norpagent.settings_cli import _validate_value
+
+            store = self._settings_store()
+            if data.get("reset"):
+                ok = store.delete(key, scope=scope, actor="user",
+                                  reason="settings panel reset")
+                if not ok:
+                    return {"ok": False, "error": f"no explicit value for {key!r} at scope {scope}"}
+            else:
+                value = data.get("value")
+                err = _validate_value(key, value)
+                if err:
+                    return {"ok": False, "error": err}
+                if scope == "global":
+                    store.set(key, value, actor="user",
+                              reason="settings panel")
+                else:
+                    store.set_scoped(key, value, scope, actor="user",
+                                     reason="settings panel")
+            # 桥接热应用（§5.3）：仅全局层的非密键 → 运行态配置（保存 + 立即应用）；
+            # 作用域层（profile/session/temp）保持设置库内部语义，不污染运行态配置。
+            from norpagent.settings import config_patch_for_key
+
+            patch = config_patch_for_key(key) if scope == "global" else {}
+            if patch:
+                self.save_config(patch)
+            return {"ok": True, "key": key, "scope": scope,
+                    "resolved": store.resolve(key),
+                    "applied_to_config": bool(patch)}
+        except Exception as exc:  # noqa: BLE001 — 如实报错
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def settings_audit(self, n: int = 50) -> Dict[str, Any]:
+        """设置审计尾部（谁在何时改了什么；含被拒绝的写入）。"""
+        try:
+            store = self._settings_store()
+            return {"ok": True, "audit": store.audit_tail(int(n))}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                    "audit": []}
+
+    def frontend_log(self, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """前端日志上报（``POST /api/log``）。
+
+        无结构（只有 message）时按原样写进程日志；带 ``kind`` 的结构化事件
+        （渲染降级 / CDN 回退等）额外**计入审计**——写入设置库的同一审计环
+        （``norpagent settings audit`` / ``/api/settings/audit`` 可查），
+        记录失败不影响上报本身（审计尽力而为，前端永远静默）。
+        """
+        data = dict(data or {})
+        message = str(data.get("message") or "")[:2000]
+        _logger.info("frontend: %s", message)
+        kind = str(data.get("kind") or "").strip()[:64]
+        audited = False
+        if kind:
+            try:
+                store = self._settings_store()
+                record = getattr(store, "record_event", None)
+                if callable(record):
+                    detail = data.get("detail")
+                    if not isinstance(detail, (dict, list)):
+                        detail = {"detail": detail} if detail is not None else None
+                    record(
+                        "frontend." + kind,
+                        key=kind,
+                        new=detail,
+                        actor="frontend",
+                        reason=message[:500],
+                    )
+                    audited = True
+            except Exception:  # noqa: BLE001 — 审计尽力而为
+                audited = False
+        return {"ok": True, "audited": audited}
+
+    def settings_export(self):
+        """导出设置库快照（返回 (bytes, filename, mime)）。"""
+        import json as _json
+
+        store = self._settings_store()
+        snap = store.export_json()
+        body = _json.dumps(snap, ensure_ascii=False, indent=2,
+                           default=str).encode("utf-8")
+        return body, "farstars-settings-v2.json", "application/json"
+
+    def settings_import(self, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """导入设置库快照（JSON；支持版本 1/2 格式）。"""
+        import base64
+        import json as _json
+
+        data = dict(data or {})
+        name = str(data.get("name") or "settings.json")
+        try:
+            blob = base64.b64decode(str(data.get("data") or ""))
+            payload = _json.loads(blob.decode("utf-8", errors="replace"))
+            store = self._settings_store()
+            n = store.import_json(payload, actor="user",
+                                  reason=f"settings import {name}")
+            return {"ok": True, "imported": n}
+        except Exception as exc:  # noqa: BLE001 — 导入失败如实报错
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def whitebox_overview(self) -> Dict[str, Any]:
+        """白盒总览（§4）：按环节树统一遍历「可看 / 可测 / 可改 / 可设」。"""
+        try:
+            from norpagent.whitebox import overview
+
+            engine = None
+            try:
+                import norpagent as np
+
+                engine = np.current()
+            except Exception:  # noqa: BLE001
+                engine = None
+            if engine is None:
+                engine = getattr(self, "_engine", None)  # 兼容注入
+            return overview(engine)
+        except Exception as exc:  # noqa: BLE001 — 面板降级不拖垮 WebUI
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                    "sections": []}
+
     # ── CNB cortex loopback proxy (FarStars console data plane) ──
-    # 星轨控制台（norp-farstars.html）通过本同源代理访问真实 CNB 皮层总线：
+    # 星轨控制台（norp-farstars.html）通过本同源代理访问真实 CNB 中枢总线：
     #   GET  /api/cnb/health?base=http://127.0.0.1:17800
     #   POST /api/cnb/ctrl?base=...   body = /cnb/ctrl 请求原样
     # 目标仅允许 http://127.0.0.1:<port> 与 http://localhost:<port>
@@ -2468,15 +4307,15 @@ class WebUI:
     def cnb_proxy(self, method: str, base: str,
                   ctrl: Optional[Dict] = None,
                   timeout: float = 8.0) -> Dict[str, Any]:
-        """转发皮层总线请求（GET /cnb/health 或 POST /cnb/ctrl）。
+        """转发中枢总线请求（GET /cnb/health 或 POST /cnb/ctrl）。
 
         失败不抛异常——统一返回 {"ok": False, "error": ...}，前端据此显示
-        连接错误（皮层未启动 / 地址不可达 / 非回环目标被拒）。
+        连接错误（中枢未启动 / 地址不可达 / 非回环目标被拒）。
         """
         base = (base or "").strip()
         if not self._cnb_base_ok(base):
             return {"ok": False,
-                    "error": "cortex base 仅允许本机回环 http://127.0.0.1:<port> / http://localhost:<port>"}
+                    "error": "cortex base only allows loopback http://127.0.0.1:<port> / http://localhost:<port>"}
         try:
             if method == "GET":
                 url = base.rstrip("/") + "/cnb/health"
@@ -2501,6 +4340,131 @@ class WebUI:
         except Exception as exc:  # noqa: BLE001 — 网络/超时/拒绝统一收敛
             return {"ok": False,
                     "error": f"{type(exc).__name__}: {exc}".split(": ")[-1][:200]}
+
+    # ── CNB hosted launch (FarStars console one-click start) ──
+    # 星轨控制台「一键拉起 CNB」：在 WebUI 进程内托管启动中枢（cortex）或
+    # 节点（node）总线服务（start_bus 非阻塞），并提供停止 / 实例清单。
+    # 监听地址仅允许回环（与总线本机定位一致，拒绝把总线开到公网）。
+
+    def cnb_launch(self, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """启动一个 CNB 中枢或节点（托管在 WebUI 进程内）。
+
+        data 字段：role("cortex"/"node")、node_id、kind、host、port、
+        parent、level、heartbeat、desc。返回实例信息（含 base_url）。
+        """
+        data = dict(data or {})
+        role = str(data.get("role") or "cortex").strip().lower()
+        if role not in ("cortex", "node"):
+            return {"ok": False, "error": f"unknown role: {role!r} (use cortex / node)"}
+        host = str(data.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return {"ok": False,
+                    "error": "host must be loopback (127.0.0.1 / localhost)"}
+
+        def _int(v: Any, default: int, lo: int, hi: int) -> int:
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                return default
+            return max(lo, min(n, hi))
+
+        node_id = str(data.get("node_id") or "").strip()
+        desc = str(data.get("desc") or "FarStars console start")
+        meta = {"desc": desc, "engine": "webui"}
+        if role == "cortex":
+            node_id = node_id or "cortex"
+            port = _int(data.get("port"), 17800, 1, 65535)
+            from norpagent.cnb.cortex import Cortex
+
+            with self._lock:
+                if node_id in self._cnb_hosted:
+                    return {"ok": False, "error": f"node_id already hosted: {node_id}"}
+                if any(v.get("port") == port for v in self._cnb_hosted.values()):
+                    return {"ok": False, "error": f"port already hosted: {port}"}
+            try:
+                inst = Cortex(node_id=node_id, host=host, port=port, meta=meta)
+                inst.start()
+            except Exception as exc:  # noqa: BLE001 — 端口占用 / 启动失败如实报错
+                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            entry = {
+                "role": "cortex", "node_id": node_id, "kind": "cortex",
+                "host": host, "port": port, "base_url": getattr(inst, "base_url", f"http://{host}:{port}"),
+                "level": 0, "parent": "", "started_at": time.time(), "desc": desc,
+            }
+            with self._lock:
+                self._cnb_hosted[node_id] = {"instance": inst, **entry}
+            return {"ok": True, "instance": dict(entry)}
+
+        # role == "node"
+        node_id = node_id or ("node-" + os.urandom(4).hex())
+        port = _int(data.get("port"), 17801, 1, 65535)
+        kind = str(data.get("kind") or "agent").strip() or "agent"
+        parent = str(data.get("parent") or "http://127.0.0.1:17800").strip()
+        level = _int(data.get("level"), 3, 1, 63)
+        try:
+            heartbeat = float(data.get("heartbeat") or 5.0)
+        except (TypeError, ValueError):
+            heartbeat = 5.0
+        heartbeat = max(0.5, min(heartbeat, 3600.0))
+        from norpagent.cnb.node import NervousNode
+
+        with self._lock:
+            if node_id in self._cnb_hosted:
+                return {"ok": False, "error": f"node_id already hosted: {node_id}"}
+            if any(v.get("port") == port for v in self._cnb_hosted.values()):
+                return {"ok": False, "error": f"port already hosted: {port}"}
+        try:
+            inst = NervousNode(node_id=node_id, kind=kind, level=level,
+                               parent_url=parent, host=host, port=port,
+                               meta=meta, heartbeat_interval=heartbeat)
+            inst.start()
+        except Exception as exc:  # noqa: BLE001 — 端口占用 / 启动失败如实报错
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        entry = {
+            "role": "node", "node_id": node_id, "kind": kind,
+            "host": host, "port": port, "base_url": getattr(inst, "base_url", f"http://{host}:{port}"),
+            "level": level, "parent": parent, "started_at": time.time(),
+            "heartbeat": heartbeat, "desc": desc,
+        }
+        with self._lock:
+            self._cnb_hosted[node_id] = {"instance": inst, **entry}
+        return {"ok": True, "instance": dict(entry)}
+
+    def cnb_stop(self, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """停止托管中的 CNB 实例（node_id 省略 = 停止全部）。"""
+        data = dict(data or {})
+        node_id = str(data.get("node_id") or "").strip()
+        with self._lock:
+            if node_id:
+                entry = self._cnb_hosted.pop(node_id, None)
+                entries = [entry] if entry else []
+            else:
+                entries = list(self._cnb_hosted.values())
+                self._cnb_hosted.clear()
+        if not entries:
+            return {"ok": False, "error": f"not hosted: {node_id or '(all)'}"}
+        # 停止顺序：先子后父——按等级从高到低停（level 越大 = 越深的下级），
+        # 中枢（level 0）最后停。若反过来先停中枢，子节点注销会打到已关闭
+        # 的父端口（WinError 10061 连接被拒），既刺眼又掩盖真实故障。
+        # 单个指定 node_id 时 entries 只有一项，此排序无副作用。
+        entries.sort(key=lambda e: int(e.get("level") or 0), reverse=True)
+        stopped: List[str] = []
+        for entry in entries:
+            try:
+                entry["instance"].stop()
+                stopped.append(str(entry.get("node_id") or ""))
+            except Exception:  # noqa: BLE001 — 单个停止失败不阻塞其余
+                pass
+        return {"ok": True, "stopped": stopped, "count": len(stopped)}
+
+    def cnb_instances(self) -> Dict[str, Any]:
+        """本 WebUI 托管的 CNB 实例清单（不含内部对象，仅展示字段）。"""
+        with self._lock:
+            rows = [
+                {k: v for k, v in entry.items() if k != "instance"}
+                for entry in self._cnb_hosted.values()
+            ]
+        return {"ok": True, "instances": rows}
 
     # ── filesystem browsing (the browser host's "directory/file picker") ──
 
@@ -2574,6 +4538,28 @@ class WebUI:
         result["files"] = files
         return result
 
+    def make_fs_dir(self, parent: str = "", name: str = "") -> Dict[str, Any]:
+        """Create a subdirectory under ``parent`` (the picker's "New Folder").
+
+        Pure local-UI capability: 127.0.0.1 only; creates a single new folder
+        from a plain name (no path separators / drive colons — prevents
+        traversal). Returns the new absolute path on success.
+        """
+        name = (name or "").strip()
+        if not name or name in (".", "..") or any(
+                c in name for c in ("/", "\\", ":", "\x00")):
+            return {"ok": False, "error": "invalid folder name"}
+        base = os.path.abspath(os.path.expanduser(
+            (parent or "").strip() or (os.path.expanduser("~") or "")))
+        target = os.path.join(base, name)
+        try:
+            os.makedirs(target, exist_ok=False)
+        except FileExistsError:
+            return {"ok": False, "error": "folder already exists"}
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "path": target}
+
     def read_fs_file(self, path: str) -> Dict[str, Any]:
         """Read a local text file (the companion capability of the browser host's pick_file)."""
         p = os.path.abspath(os.path.expanduser(path or ""))
@@ -2592,6 +4578,136 @@ class WebUI:
     _IMAGE_EXTS = {
         "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff", "tif",
     }
+    _AUDIO_EXTS = {
+        "mp3", "wav", "m4a", "flac", "aac", "ogg", "opus", "weba", "amr",
+    }
+    _VIDEO_EXTS = {
+        "mp4", "m4v", "webm", "mov", "avi", "mkv", "flv", "wmv",
+    }
+    # per-modality attachment size caps for native passthrough (bytes)
+    _MM_MAX_BYTES = {
+        "image": 10 * 1024 * 1024,
+        "audio": 20 * 1024 * 1024,
+        "video": 32 * 1024 * 1024,
+    }
+
+    def _prepare_chat_attachments(
+        self, raw: Any
+    ) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
+        """Route and convert chat attachments before the task executes.
+
+        Per-modality routing (native passthrough): each attachment goes either
+
+        - ``direct``: kept as a native multimodal part (base64 data passed to
+          the model — image_url / input_audio / video_url); or
+        - ``service``: sent to the configured external service (vision / audio /
+          video URL) and merged into the prompt as text.
+
+        Text-ish files (upload or pasted content) are decoded and kept as
+        ``route="service"`` text attachments so the model reads the whole body
+        while the visible user message stays clean; their length is capped by the
+        ``attachment_text_max_chars`` / ``attachment_text_unlimited`` settings.
+        Returns ``(extra_text, media)`` or None when there is nothing to do:
+        ``extra_text`` is appended to the prompt; ``media`` holds direct-route
+        attachments for the model (may be empty).
+        """
+        if not isinstance(raw, list) or not raw:
+            return None
+        with self._lock:
+            cfg = dict(self._config)
+        extra_parts: List[str] = []
+        media: List[Dict[str, Any]] = []
+        timeout = float(cfg.get("api_request_timeout") or 180)
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "file")
+            mime = str(item.get("type") or item.get("mime") or "")
+            data = str(item.get("data") or "")
+            if data.strip().startswith("data:"):
+                head, _, rest = data.partition(",")
+                data = rest
+                if not mime and head.startswith("data:"):
+                    mime = head[5:].split(";")[0]
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if mime.startswith("image/") or ext in self._IMAGE_EXTS:
+                kind = "image"
+            elif mime.startswith("audio/") or ext in self._AUDIO_EXTS:
+                kind = "audio"
+            elif mime.startswith("video/") or ext in self._VIDEO_EXTS:
+                kind = "video"
+            else:
+                kind = "text"
+            try:
+                raw_len = len(base64.b64decode(data)) if data else 0
+            except Exception:  # noqa: BLE001
+                raw_len = 0
+            if kind == "text":
+                try:
+                    text = base64.b64decode(data).decode("utf-8")
+                except Exception:  # noqa: BLE001 — binary or non-utf8: note, no raw bytes
+                    text = "(binary file, not included)"
+                # Text files are kept as attachments (route="service") instead of
+                # being inlined into the prompt: the model still reads the content
+                # through the multimodal text part, but the user message content
+                # stays clean, so the file body is never shown in the chat bubble
+                # or persisted as the visible message text.
+                #
+                # Length cap (2026-09-13): the old hard-coded `text[:20000]` silently
+                # truncated any upload / paste longer than 20000 characters (the model
+                # only ever "read" that prefix). It is now driven by settings:
+                #   * attachment_text_unlimited = True  → whole body, no cap;
+                #   * otherwise attachment_text_max_chars (512~2147483647, 0 = no cap).
+                raw_limit = cfg.get("attachment_text_max_chars")
+                if raw_limit is None:
+                    raw_limit = _DEFAULT_TEXT_ATTACHMENT_MAX
+                try:
+                    text_limit = int(raw_limit)
+                except (TypeError, ValueError):
+                    text_limit = _DEFAULT_TEXT_ATTACHMENT_MAX
+                if cfg.get("attachment_text_unlimited") or text_limit <= 0:
+                    kept_text = text
+                else:
+                    kept_text = text[:text_limit]
+                media.append({
+                    "kind": "text", "name": name, "mime": mime or "text/plain",
+                    "ext": ext, "route": "service", "text": kept_text,
+                })
+                continue
+            limit = self._MM_MAX_BYTES.get(kind, _MAX_UPLOAD_FILE)
+            if raw_len > limit:
+                extra_parts.append(
+                    f"[{name}] skipped: {kind} exceeds the "
+                    f"{limit // (1024 * 1024)}MB limit"
+                )
+                continue
+            route = str(cfg.get(f"mm_{kind}_route") or "direct").strip().lower()
+            if route == "service":
+                try:
+                    mm = self._mm()
+                    if kind == "image":
+                        desc = mm.describe_image(
+                            data, ext, mime or "image/png",
+                            str(cfg.get("vision_service_url") or ""), "",
+                            timeout=timeout,
+                            api_key=str(cfg.get("vision_service_api_key") or ""),
+                        )
+                    else:
+                        desc = mm.media_describe(
+                            kind, data, ext, mime or f"{kind}/*",
+                            str(cfg.get(f"{kind}_service_url") or ""), "",
+                            api_key=str(cfg.get(f"{kind}_service_api_key") or ""),
+                            timeout=timeout,
+                        )
+                    extra_parts.append(f"[{kind}: {name}]\n{desc}")
+                except Exception as exc:  # noqa: BLE001 — the task proceeds with a note
+                    extra_parts.append(f"[{kind}: {name}] service failed: {exc}")
+            else:
+                media.append({
+                    "kind": kind, "name": name, "mime": mime, "ext": ext,
+                    "route": "direct", "data": data,
+                })
+        return "\n\n".join(p for p in extra_parts if p), media
 
     def upload_files(self, files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Decode frontend dataURL files: text → content; images → base64 (vision).
@@ -2610,15 +4726,19 @@ class WebUI:
                 if "," in data:
                     data = data.split(",", 1)[1]
                 raw = base64.b64decode(data)
-                if len(raw) > _MAX_UPLOAD_FILE:
-                    out.append({"name": name, "type": ftype,
-                                "error": "file too large (max 10MB)"})
-                    continue
                 ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
                 is_image = ftype.startswith("image/") or ext in self._IMAGE_EXTS
-                if is_image:
-                    out.append({"name": name, "type": ftype or "image/png",
-                                "kind": "image", "data": data})
+                is_video = ftype.startswith("video/") or ext in self._VIDEO_EXTS
+                limit = _MAX_VIDEO_UPLOAD_FILE if is_video else _MAX_UPLOAD_FILE
+                if len(raw) > limit:
+                    out.append({"name": name, "type": ftype,
+                                "error": f"file too large (max {limit // (1024 * 1024)}MB)"})
+                    continue
+                if is_image or is_video:
+                    out.append({"name": name,
+                                "type": ftype or ("image/png" if is_image else "video/mp4"),
+                                "kind": "image" if is_image else "video",
+                                "data": data})
                     continue
                 try:
                     text = raw.decode("utf-8")
@@ -2650,14 +4770,14 @@ class WebUI:
             cfg = dict(self._config)
         if not cfg.get("vision_enabled"):
             return {"ok": False,
-                    "error": "视觉 API 未启用（设置 → 视觉 API → 启用视觉 API）"}
+                    "error": "Vision API is not enabled (Settings → Vision API → Enable vision API)"}
         service_url = str(cfg.get("vision_service_url") or "").strip()
         if not service_url:
-            return {"ok": False, "error": "未配置视觉服务地址（设置 → 视觉 API）"}
+            return {"ok": False, "error": "vision service URL is not configured (Settings → Vision API)"}
         images = data.get("images")
         if not isinstance(images, list) or not images:
             return {"ok": False, "error": "images must be a non-empty list"}
-        prompt = str(data.get("prompt") or "").strip() or "请详细描述这张图片的内容。"
+        prompt = str(data.get("prompt") or "").strip() or "Please describe the content of this image in detail."
         mm = self._mm()
         out: List[Dict[str, Any]] = []
         for img in images:
@@ -2671,6 +4791,7 @@ class WebUI:
                 desc = mm.describe_image(
                     payload, ext, ftype, service_url, prompt,
                     timeout=float(cfg.get("api_request_timeout") or 180),
+                    api_key=str(cfg.get("vision_service_api_key") or ""),
                 )
                 out.append({"name": name, "description": desc})
             except Exception as exc:  # noqa: BLE001
@@ -2688,7 +4809,7 @@ class WebUI:
         with self._lock:
             cfg = dict(self._config)
         if not cfg.get("tts_enabled", True):
-            return {"ok": False, "error": "语音朗读未启用（设置 → 声音）"}
+            return {"ok": False, "error": "voice playback is not enabled (Settings → Sound)"}
         text = str(data.get("text") or "").strip()
         if not text:
             return {"ok": False, "error": "text is empty"}
@@ -2710,7 +4831,7 @@ class WebUI:
                 timeout=float(cfg.get("api_request_timeout") or 180),
             )
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"TTS 失败: {exc}"}
+            return {"ok": False, "error": f"TTS failed: {exc}"}
         return {
             "ok": True,
             "audio_base64": base64.b64encode(audio).decode("ascii"),
@@ -2735,7 +4856,7 @@ class WebUI:
                 payload = payload.split(",", 1)[1]
             audio = base64.b64decode(payload)
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"audio base64 解码失败: {exc}"}
+            return {"ok": False, "error": f"audio base64 decode failed: {exc}"}
         if len(audio) > _MAX_UPLOAD_FILE:
             return {"ok": False, "error": "audio too large (max 10MB)"}
         mime = str(data.get("mime") or "audio/wav")
@@ -2750,9 +4871,9 @@ class WebUI:
                 timeout=float(cfg.get("api_request_timeout") or 180),
             )
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"STT 失败: {exc}"}
+            return {"ok": False, "error": f"STT failed: {exc}"}
         if not text.strip():
-            return {"ok": False, "error": "没有识别到语音内容"}
+            return {"ok": False, "error": "no speech content recognized"}
         return {"ok": True, "text": text.strip()}
 
     def beep_notify(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -2760,7 +4881,7 @@ class WebUI:
         with self._lock:
             cfg = dict(self._config)
         if not cfg.get("sound_notify_enabled", True):
-            return {"ok": False, "error": "提示音未启用"}
+            return {"ok": False, "error": "sound effects are not enabled"}
         mm = self._mm()
         audio = mm.beep_wav()
         return {"ok": True, "audio_base64": base64.b64encode(audio).decode("ascii"),
@@ -2814,7 +4935,7 @@ class WebUI:
             # remote model list (the cache of the last "fetch model list") and FE frontend modules
             self._scan_fe_modules()
             with self._lock:
-                # filter retired model names (deepseek-chat / deepseek-reasoner and other historical caches)
+                # drop retired model names (adapter-owned list; see filter_remote_models)
                 remote = filter_remote_models(self._config.get("remote_models"))
                 fe_mods = [dict(v) for v in self._frontend_modules.values()]
             groups = snap.get("groups") or {}
@@ -3291,6 +5412,11 @@ class WebUI:
 
     def shutdown(self) -> None:
         """Stop the HTTP service and disconnect all subscribers (idempotent; callable across threads)."""
+        # hosted CNB instances (FarStars console one-click launch): stop with the service
+        try:
+            self.cnb_stop({})
+        except Exception:  # noqa: BLE001 — best effort
+            pass
         with self._lock:
             if self._closed:
                 return

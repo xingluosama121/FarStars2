@@ -38,10 +38,13 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import inspect
 import json
 import os
+import re
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -51,8 +54,13 @@ from norpagent.security.approval import ApprovalPolicy
 from norpagent.security.network_policy import NetworkPolicy
 from norpagent.security.signature import SignatureResult, SignatureStatus, SignatureVerifier
 
-# aligned with the existing application's 15 hooks (same event names; see kernel/events.py)
-HOOK_NAMES = [
+# ── plugin hook surface ─────────────────────────────────────────────
+# LEGACY (16): hook names aligned with the existing application (same event
+#   names; legacy argument signatures preserved by the bridge).
+# NATIVE (29): the kernel's complete 9-layer hook surface — plugins may define
+#   any of these names; the 13 native-only hooks use the payload-derived
+#   argument mapping (business arguments first, PluginContext last).
+LEGACY_HOOK_NAMES = [
     "on_agent_init",
     "on_agent_shutdown",
     "on_task_start",
@@ -71,7 +79,50 @@ HOOK_NAMES = [
     "on_usage_update",
 ]
 
-_MUTATING_HOOKS = {"before_step", "before_tool_call", "after_tool_call"}
+# the kernel's full standard hook surface (9 layers / 29 hooks; see hooks/standard.py)
+NATIVE_HOOK_NAMES = [
+    "on_agent_init",
+    "on_agent_shutdown",
+    "on_task_start",
+    "on_task_done",
+    "on_task_error",
+    "on_task_stopped",
+    "on_task_timeout",
+    "before_input",
+    "after_input",
+    "on_user_input_required",
+    "before_session_create",
+    "after_session_create",
+    "before_message_append",
+    "after_message_append",
+    "before_build_messages",
+    "after_build_messages",
+    "before_step",
+    "after_step",
+    "before_model_call",
+    "after_model_call",
+    "on_reasoning",
+    "on_content",
+    "on_event",
+    "on_usage_update",
+    "before_tool_call",
+    "after_tool_call",
+    "on_tool_error",
+    "before_result",
+    "after_result",
+]
+
+# external modules / the host child process detect plugin hooks through this name
+HOOK_NAMES = NATIVE_HOOK_NAMES
+
+# every hook that can rewrite the data flow through return values
+_MUTATING_HOOKS = {
+    "before_step", "before_tool_call", "after_tool_call",
+    "before_input", "before_session_create", "before_message_append",
+    "before_build_messages", "after_build_messages",
+    "before_model_call", "after_model_call",
+    "before_result", "after_result",
+}
 
 # plugin load pipeline hooks (dynamic hooks: auto-registered via registry.hooks;
 # part of the hook system's "custom hook" capability; PluginSystem installs a
@@ -126,9 +177,57 @@ DANGEROUS_IMPORTS_FOR_BLOCK = {
 }
 
 
+class PluginLogger:
+    """Per-plugin logger handed to plugins as ``ctx.logger`` / ``api.logger``.
+
+    Writes to stdout and, best-effort, to a per-plugin log file under the host
+    log directory (config ``plugin_log_dir``; default ``~/.norpagent/plugin_logs``).
+    Never raises into plugin code.
+    """
+
+    def __init__(self, plugin_name: str, log_dir: str = "") -> None:
+        self._name = plugin_name
+        self._log_dir = log_dir
+        self._path = ""
+        if log_dir:
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", plugin_name) or "plugin"
+            self._path = os.path.join(log_dir, safe + ".log")
+
+    def _emit(self, level: str, msg: Any) -> None:
+        try:
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"[{ts}] [{level.upper()}] [{self._name}] {msg}"
+            print(line)
+            if self._path:
+                os.makedirs(self._log_dir, exist_ok=True)
+                with open(self._path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+        except Exception:
+            pass
+
+    def debug(self, msg: Any) -> None:
+        self._emit("debug", msg)
+
+    def info(self, msg: Any) -> None:
+        self._emit("info", msg)
+
+    def warn(self, msg: Any) -> None:
+        self._emit("warn", msg)
+
+    def error(self, msg: Any) -> None:
+        self._emit("error", msg)
+
+
 @dataclass
 class PluginContext:
-    """Context passed to external plugin hooks / execute (aligned with the existing application's PluginContext)."""
+    """Context passed to external plugin hooks / execute.
+
+    Aligned with the existing application's PluginContext and extended with
+    ``storage`` (per-plugin state store that survives across hooks/tools) and
+    ``logger`` (per-plugin logger) — both are part of the compatibility
+    contract, plugins written against the legacy format rely on them.
+    """
 
     plugin_name: str = ""
     project_root: str = ""
@@ -136,6 +235,9 @@ class PluginContext:
     config: Dict[str, Any] = field(default_factory=dict)
     current_step: int = 0
     total_usage: Dict[str, Any] = field(default_factory=dict)
+    storage: Dict[str, Any] = field(default_factory=dict)
+    logger: Any = None
+    api: Any = None
 
 
 @dataclass
@@ -153,9 +255,17 @@ class PluginInfo:
     hook_names: List[str] = field(default_factory=list)
     signature_status: str = ""
     trusted: bool = False
+    warnings: List[str] = field(default_factory=list)
     approval_hints: Dict[str, dict] = field(default_factory=dict)
     audit_issues: List[dict] = field(default_factory=list)
+    # ── isolation / capability / diagnostics surface (2026-09-11 plugin overhaul) ──
+    isolation: str = "inproc"                      # actual runtime mode: inproc / process
+    capabilities: List[str] = field(default_factory=list)   # declared capability surface (setup API gates)
+    requires: Dict[str, Any] = field(default_factory=dict)  # dependency declarations (requires / min_norpagent)
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)  # bounded runtime failure records
+    counts: Dict[str, int] = field(default_factory=dict)    # hook / tool call counters
     module: Any = None
+    api: Any = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -170,8 +280,14 @@ class PluginInfo:
             "hook_names": list(self.hook_names),
             "signature_status": self.signature_status,
             "trusted": self.trusted,
+            "warnings": list(self.warnings),
             "approval_hints": dict(self.approval_hints),
             "audit_issues": list(self.audit_issues),
+            "isolation": self.isolation,
+            "capabilities": list(self.capabilities),
+            "requires": dict(self.requires),
+            "diagnostics": list(self.diagnostics[-20:]),
+            "counts": dict(self.counts),
         }
 
 
@@ -276,6 +392,7 @@ class _LegacyToolAdapter:
                 error="no_execute",
             )
         plugin_ctx = self._loader.plugin_context(self._plugin_name, ctx)
+        self._loader.bump_count(self._plugin_name, f"tool:{self.name}")
         try:
             output = self._execute_fn(self.name, args or {}, plugin_ctx)
             if isinstance(output, ToolResult):
@@ -289,33 +406,69 @@ class _LegacyToolAdapter:
             )
 
 
-# event payload → legacy-format hook argument conversion table
-# value = which keys to take from AgentEvent.payload, passed to the hook in order (ctx appended at the end)
+# event payload → plugin hook argument conversion table.
+# value = the payload keys taken (in order); PluginContext is appended last.
+# The 16 legacy hooks keep the existing application's signature convention; the
+# 13 native-only hooks follow the same "business arguments first" style
+# (derived from the kernel hook payload keys, see hooks/standard.py payload_keys).
 _HOOK_ARG_KEYS: Dict[str, Tuple[str, ...]] = {
+    # ── legacy 16 (existing-application plugin signatures; full compatibility) ──
     "on_agent_init": (),
     "on_agent_shutdown": (),
     "on_task_start": ("user_input",),
     "on_task_done": ("content",),
     "on_task_error": ("error",),
-    "on_task_stopped": ("reason",),
+    "on_task_stopped": (),            # legacy signature is (context); a 2+ positional function gets (reason, context)
     "on_task_timeout": ("timeout",),
     "before_step": ("step", "messages"),
-    "after_step": ("step", "content", "tool_calls"),
+    "after_step": ("step", "reasoning", "content", "tool_calls"),
     "before_tool_call": ("tool_name", "args"),
     "after_tool_call": ("tool_name", "args"),
     "on_user_input_required": ("question",),
     "on_reasoning": ("content",),
     "on_content": ("content",),
     "on_event": ("event_type", "data"),
-    "on_usage_update": ("total",),
+    "on_usage_update": (),            # converted below (legacy usage dict, both key styles)
+    # ── native-only 13 (the kernel's remaining 9-layer hook surface) ──
+    "before_input": ("user_input", "session_id", "params"),
+    "after_input": ("user_input", "session_id"),
+    "before_session_create": ("session_id", "title", "params"),
+    "after_session_create": ("session_id", "title"),
+    "before_message_append": ("session_id", "message"),
+    "after_message_append": ("session_id", "message"),
+    "before_build_messages": ("system_prompt", "session_id", "step", "tool_names"),
+    "after_build_messages": ("messages", "system_prompt", "step"),
+    "before_model_call": ("step", "messages", "tool_schemas", "params"),
+    "after_model_call": ("step", "output"),
+    "on_tool_error": ("tool_name", "error", "args"),
+    "before_result": ("result",),
+    "after_result": ("result",),
 }
 
 
-def _build_hook_args(hook_name: str, payload: Dict[str, Any]) -> List[Any]:
-    """Build the positional argument list from an event payload per the legacy hook signature convention.
+def _positional_capacity(fn: Callable) -> Optional[int]:
+    """Max positional arguments *fn* accepts (excluding *args); None when unknown.
 
-    Legacy signature: business arguments first, PluginContext last (appended by the caller).
-    Fully consistent with the existing application's plugin_system dispatch logic.
+    A function declaring *args returns a large sentinel (accepts everything).
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    count = 0
+    for param in sig.parameters.values():
+        if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+            count += 1
+        elif param.kind == param.VAR_POSITIONAL:
+            return 10 ** 6
+    return count
+
+
+def _build_hook_args(hook_name: str, payload: Dict[str, Any]) -> List[Any]:
+    """Build the positional argument list from an event payload (PluginContext appended by the caller).
+
+    Legacy signature: business arguments first, PluginContext last — fully
+    consistent with the existing application's plugin_system dispatch logic.
     """
     keys = _HOOK_ARG_KEYS.get(hook_name, ())
     args: List[Any] = [payload.get(k) for k in keys]
@@ -323,17 +476,27 @@ def _build_hook_args(hook_name: str, payload: Dict[str, Any]) -> List[Any]:
         # legacy format: (tool_name, args, result, ctx)
         args.append(str(payload.get("result") or ""))
     elif hook_name == "on_task_done":
-        # legacy format: (summary, final_reply, ctx)
+        # legacy format: (summary, final_reply, ctx); the kernel reports one
+        # content value, so both positional slots carry it
         args.append(payload.get("content") or "")
     elif hook_name == "after_step":
         # legacy format: (step, reasoning, content, tool_calls, ctx)
+        tool_calls = payload.get("tool_calls")
+        if isinstance(tool_calls, int):
+            tool_calls = []  # older kernel payloads carried only the count
         args = [
             payload.get("step", 0),
-            payload.get("content", ""),
-            payload.get("tool_calls") or [],
+            payload.get("reasoning", "") or "",
+            payload.get("content", "") or "",
+            tool_calls or [],
         ]
     elif hook_name == "on_usage_update":
+        # both key styles are provided: legacy (input_tokens / output_tokens /
+        # tool_call_tokens) and kernel (input / output / total)
         args = [{
+            "input_tokens": payload.get("input", 0),
+            "output_tokens": payload.get("output", 0),
+            "tool_call_tokens": 0,
             "input": payload.get("input", 0),
             "output": payload.get("output", 0),
             "total": payload.get("total", 0),
@@ -341,25 +504,100 @@ def _build_hook_args(hook_name: str, payload: Dict[str, Any]) -> List[Any]:
     return args
 
 
+def _hook_args_for_callable(hook_name: str, payload: Dict[str, Any],
+                            fn: Callable) -> List[Any]:
+    """Build the positional argument list for a concrete hook *fn*.
+
+    Compatibility shims on top of ``_build_hook_args``:
+
+    - ``on_task_stopped``: the legacy signature is ``(context)``; a function
+      accepting two or more positional arguments is treated as the extended
+      form ``(reason, context)`` — both styles are supported.
+    """
+    if hook_name == "on_task_stopped":
+        capacity = _positional_capacity(fn)
+        if capacity is None:
+            return []
+        return [payload.get("reason")] if capacity >= 2 else []
+    return _build_hook_args(hook_name, payload)
+
+
+# ── pass-through normalization (legacy compatibility) ────────────────
+# A mutating hook returning its own input unchanged (the legacy "return
+# messages / return args / return result" idiom) is treated as "no rewrite"
+# (None): otherwise it would occupy the bus's first-non-None slot and shadow
+# later subscribers' rewrites. Keys map to the payload values to compare.
+_PASSTHROUGH_COMPARE: Dict[str, Callable[[Dict[str, Any]], Tuple[Any, ...]]] = {
+    "before_step": lambda p: (p.get("messages"),),
+    "before_tool_call": lambda p: (p.get("args"),),
+    "after_tool_call": lambda p: (str(p.get("result") or ""),),
+    "before_input": lambda p: (p.get("user_input"),),
+    "before_session_create": lambda p: (p.get("title"),),
+    "before_message_append": lambda p: (p.get("message"),),
+    "before_build_messages": lambda p: (p.get("system_prompt"),),
+    "after_build_messages": lambda p: (p.get("messages"),),
+    "before_result": lambda p: (p.get("result"),),
+    "after_result": lambda p: (p.get("result"),),
+}
+
+
+def _normalize_mutating_result(hook_name: str, payload: Dict[str, Any],
+                               result: Any) -> Any:
+    """Legacy pass-through normalization for mutating-hook return values."""
+    if result is None or hook_name not in _PASSTHROUGH_COMPARE:
+        return result
+    try:
+        candidates = _PASSTHROUGH_COMPARE[hook_name](payload)
+    except Exception:  # noqa: BLE001
+        return result
+    for candidate in candidates:
+        if result is candidate:
+            return None
+        try:
+            if result == candidate:
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+    return result
+
+
+def _version_tuple(version: str) -> Tuple[int, ...]:
+    """Parse a dotted version into a comparable tuple ("2.0.1" -> (2, 0, 1))."""
+    parts: List[int] = []
+    for chunk in str(version or "").split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
 def _wrap_hook(hook_name: str, fn: Callable, loader: "PluginLoader",
                plugin_name: str) -> Callable:
     """Wrap a legacy hook function into an EventBus subscriber (receiving an AgentEvent).
 
-    Legacy signature convention: business arguments first, PluginContext last;
-    return values of mutating hooks (before_step / before_tool_call /
-    after_tool_call) pass through to the kernel via EventBus.intercept; return
-    values of other hooks are ignored.
+    Signature convention: business arguments first, PluginContext last; return
+    values of mutating hooks pass through to the kernel via EventBus.intercept
+    (first non-None wins; pass-through returns are normalized to None so they do
+    not shadow later subscribers); return values of observation hooks are
+    ignored. Hook failures are reported through the loader diagnostics channel —
+    never silently swallowed.
     """
 
     def listener(event: Any) -> Any:
         payload = getattr(event, "payload", {}) or {}
-        args = _build_hook_args(hook_name, payload)
-        ctx = loader.plugin_context(plugin_name, payload.get("context"))
-        args.append(ctx)
         try:
-            return fn(*args)
-        except Exception:
+            args = _hook_args_for_callable(hook_name, payload, fn)
+            ctx = loader.plugin_context(plugin_name, payload.get("context"))
+            args.append(ctx)
+        except Exception as exc:  # noqa: BLE001 — argument building must never break the bus
+            loader.report_hook_failure(plugin_name, hook_name, exc)
             return None
+        loader.bump_count(plugin_name, f"hook:{hook_name}")
+        try:
+            result = fn(*args)
+        except Exception as exc:  # noqa: BLE001 — plugin errors must never break the main loop
+            loader.report_hook_failure(plugin_name, hook_name, exc)
+            return None
+        return _normalize_mutating_result(hook_name, payload, result)
 
     return listener
 
@@ -375,8 +613,12 @@ class _LegacyPluginAdapter:
         self.version = info.version
         self.publisher = info.publisher
         self.description = info.description
+        self._tools_cache: Optional[List[Tool]] = None
+        self._hooks_cache: Optional[Dict[str, Callable]] = None
 
     def get_tools(self) -> List[Tool]:
+        if self._tools_cache is not None:
+            return list(self._tools_cache)
         tools: List[Tool] = []
         raw_tools = getattr(self.module, "TOOLS", None) or []
         execute_fn = getattr(self.module, "execute", None)
@@ -389,14 +631,21 @@ class _LegacyPluginAdapter:
                 tools.append(_LegacyToolAdapter(
                     tname, tool_def, self.info.name, execute_fn, self.loader,
                 ))
+        self._tools_cache = list(tools)
         return tools
 
     def get_hooks(self) -> Dict[str, Callable]:
+        # cached: every call returns the same listener objects, so
+        # EventBus.unsubscribe can actually remove them on unload / hot reload
+        # (2026-09-11 fix: rebuilding wrappers per call made unload a no-op).
+        if self._hooks_cache is not None:
+            return dict(self._hooks_cache)
         hooks: Dict[str, Callable] = {}
         for hook_name in HOOK_NAMES:
             fn = getattr(self.module, hook_name, None)
             if callable(fn):
                 hooks[hook_name] = _wrap_hook(hook_name, fn, self.loader, self.info.name)
+        self._hooks_cache = dict(hooks)
         return hooks
 
     def execute(self, tool_name: str, args: Dict[str, Any], ctx: Any) -> Optional[str]:
@@ -469,8 +718,12 @@ class _RemotePluginAdapter:
         self._hook_names = hook_names
         self._manager = manager
         self._loader = loader
+        self._tools_cache: Optional[List[Tool]] = None
+        self._hooks_cache: Optional[Dict[str, Callable]] = None
 
     def get_tools(self) -> List[Tool]:
+        if self._tools_cache is not None:
+            return list(self._tools_cache)
         tools: List[Tool] = []
         for tool_def in self._tool_schemas:
             func = tool_def.get("function", {}) if isinstance(tool_def, dict) else {}
@@ -479,37 +732,48 @@ class _RemotePluginAdapter:
                 tools.append(_RemoteToolAdapter(
                     tname, tool_def, self.name, self._manager, self._loader,
                 ))
+        self._tools_cache = list(tools)
         return tools
 
     def get_hooks(self) -> Dict[str, Callable]:
         """Hook bridge: event → argument list → host child fire_hook RPC.
 
-        Mutating hooks' return values pass through to the kernel via
-        EventBus.intercept; fire_hook executes in a daemon thread with a bounded
-        wait (HOOK_TIMEOUT) and returns None on timeout abandonment — plugin hooks
-        never stall the main loop.
+        Cached (same listener objects returned on every call, so unload can
+        unsubscribe them). Mutating hooks' return values pass through to the
+        kernel via EventBus.intercept; fire_hook executes in a daemon thread with
+        a bounded wait (HOOK_TIMEOUT) and returns None on timeout abandonment —
+        plugin hooks never stall the main loop.
         """
+        if self._hooks_cache is not None:
+            return dict(self._hooks_cache)
         loader = self._loader
         manager = self._manager
         plugin_name = self.name
 
-        def bridge(hook_name: str, fn_self: "_RemotePluginAdapter" = None):
+        def bridge(hook_name: str):
             def listener(event: Any) -> Any:
                 payload = getattr(event, "payload", {}) or {}
+                # remote path: full-information args; the host child trims them to
+                # the plugin function's positional capacity (on_task_stopped)
                 args = _build_hook_args(hook_name, payload)
+                if hook_name == "on_task_stopped":
+                    args = [payload.get("reason")]
                 plugin_ctx = loader.plugin_context(
                     plugin_name, payload.get("context")
                 )
-                return manager.fire_hook(
+                loader.bump_count(plugin_name, f"hook:{hook_name}")
+                result = manager.fire_hook(
                     plugin_name, hook_name, args,
                     _plugin_ctx_dict(plugin_ctx),
                 )
+                return _normalize_mutating_result(hook_name, payload, result)
 
             return listener
 
         hooks: Dict[str, Callable] = {}
         for hook_name in self._hook_names:
             hooks[hook_name] = bridge(hook_name)
+        self._hooks_cache = dict(hooks)
         return hooks
 
     def execute(self, tool_name: str, args: Dict[str, Any], ctx: Any) -> Optional[str]:
@@ -521,6 +785,359 @@ class _RemotePluginAdapter:
             return None if output is None else str(output)
         except Exception:
             return None
+
+
+# ── setup(api) registration facade (2026-09-11 plugin overhaul) ──
+
+
+class PluginCapabilityError(RuntimeError):
+    """Raised when a plugin calls a setup API beyond its declared capability surface."""
+
+
+def _default_tool_schema(name: str, description: str) -> Dict[str, Any]:
+    """Minimal OpenAI function schema for dynamically registered tools."""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description or f"Plugin tool {name}",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+class _FunctionTool:
+    """Tool adapter for handlers registered dynamically via ``api.register_tool``.
+
+    Handler signature: ``handler(args)`` or ``handler(args, plugin_ctx)`` — the
+    two-argument form is detected from the function signature. Return values:
+    str / ToolResult / None (None becomes an empty successful result).
+    """
+
+    def __init__(self, name: str, schema: Dict[str, Any], handler: Callable,
+                 loader: "PluginLoader", plugin_name: str) -> None:
+        self.name = name
+        self._schema = schema
+        self._handler = handler
+        self._loader = loader
+        self._plugin_name = plugin_name
+
+    def schema(self) -> Dict[str, Any]:
+        return self._schema
+
+    def run(self, args: Dict[str, Any], ctx: Any) -> ToolResult:
+        plugin_ctx = self._loader.plugin_context(self._plugin_name, ctx)
+        self._loader.bump_count(self._plugin_name, f"tool:{self.name}")
+        try:
+            capacity = _positional_capacity(self._handler)
+            if capacity is not None and capacity >= 2:
+                output = self._handler(args or {}, plugin_ctx)
+            else:
+                output = self._handler(args or {})
+        except Exception as exc:  # noqa: BLE001 — plugin errors become failed ToolResults
+            return ToolResult(
+                output=f"plugin tool execution error: {type(exc).__name__}: {exc}",
+                success=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        if isinstance(output, ToolResult):
+            return output
+        return ToolResult(output=str(output))
+
+
+class PluginAPI:
+    """Registration facade handed to a plugin's ``setup(api)`` (in-process plugins).
+
+    Everything a plugin registers through this object is attributed to the plugin:
+    bus subscriptions / custom slots / services are undone on unload; tool /
+    component / model / session / sandbox / scheduler / UI / hook registrations
+    use the framework's name-overwrite semantics (a same-named registration
+    replaces the previous one).
+
+    Capability gates: ``PLUGIN_CAPABILITIES`` (list) or ``manifest.capabilities``
+    declares the surface; absent declarations grant the base set
+    (tools / hooks / events). Undeclared advanced capabilities raise
+    :class:`PluginCapabilityError` at registration time. ``"*"`` / ``"all"``
+    declares everything; the host may further restrict via the
+    ``plugin_capabilities`` config key.
+
+    Supported capability names: tools / hooks / events / slots / components /
+    models / sessions / sandboxes / schedulers / uis / services / pages / cli /
+    settings.
+    """
+
+    _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
+
+    def __init__(self, loader: "PluginLoader", info: PluginInfo, module: Any,
+                 registry: Any) -> None:
+        self._loader = loader
+        self._info = info
+        self._module = module
+        self._registry = registry
+        self.name = info.name
+        self.package_dir = os.path.dirname(os.path.abspath(info.path)) if info.path else ""
+        self.config = dict(loader.config)
+        ctx = loader.plugin_context(info.name)
+        self.logger = ctx.logger
+        ctx.api = self
+        self._subscriptions: List[Tuple[str, Callable]] = []
+        self._slots: List[str] = []
+        self._services: List[str] = []
+        self._commands: List[str] = []
+        self._tools: List[str] = []
+        self._components: List[Tuple[str, str]] = []
+
+    # ── gate ─────────────────────────────────────────────
+
+    def _require(self, capability: str) -> None:
+        if not self._loader.allows_capability(self._info, capability):
+            raise PluginCapabilityError(
+                f"plugin {self.name!r} did not declare the {capability!r} capability "
+                f"(add it to PLUGIN_CAPABILITIES / manifest.capabilities)"
+            )
+
+    # ── tools ────────────────────────────────────────────
+
+    def register_tool(self, name: str, handler: Callable, *,
+                      schema: Optional[Dict[str, Any]] = None,
+                      description: str = "") -> None:
+        """Register a dynamic tool with a direct handler (beyond the static TOOLS list)."""
+        self._require("tools")
+        if not name or not callable(handler):
+            raise ValueError("register_tool requires a name and a callable handler")
+        if schema is None:
+            schema = _default_tool_schema(name, description)
+        elif isinstance(schema, dict) and "function" not in schema:
+            schema = {"type": "function", "function": schema}
+        self._registry.register_tool(name, _FunctionTool(
+            name, schema, handler, self._loader, self.name,
+        ))
+        if name not in self._info.tools:
+            self._info.tools.append(name)
+        if name not in self._tools:
+            self._tools.append(name)
+
+    # ── slots / components / models / sessions / sandboxes / schedulers / uis ──
+
+    def register_slot(self, spec: Any) -> None:
+        """Register a custom architecture slot (a SlotSpec instance or a field dict)."""
+        self._require("slots")
+        from norpagent.arch.slots import SlotSpec, register_slot
+        if isinstance(spec, dict):
+            spec = SlotSpec(**spec)
+        register_slot(spec)
+        self._slots.append(spec.name)
+
+    def unregister_slot(self, name: str) -> None:
+        self._require("slots")
+        from norpagent.arch.slots import unregister_slot
+        unregister_slot(name)
+        if name in self._slots:
+            self._slots.remove(name)
+
+    def register_component(self, kind: str, name: str, factory: Callable) -> None:
+        """Register a generic component (kind + name + factory)."""
+        self._require("components")
+        self._registry.register_component(kind, name, factory)
+        if (kind, name) not in self._components:
+            self._components.append((kind, name))
+
+    def register_model(self, name: str, provider: Any) -> None:
+        self._require("models")
+        self._registry.register_model(name, provider)
+
+    def register_session(self, name: str, factory: Callable) -> None:
+        self._require("sessions")
+        self._registry.register_session(name, factory)
+
+    def register_sandbox(self, name: str, factory: Callable) -> None:
+        self._require("sandboxes")
+        self._registry.register_sandbox(name, factory)
+
+    def register_scheduler(self, name: str, factory: Callable) -> None:
+        self._require("schedulers")
+        self._registry.register_scheduler(name, factory)
+
+    def register_ui(self, name: str, adapter: Any) -> None:
+        self._require("uis")
+        self._registry.register_ui(name, adapter)
+
+    # ── hooks / events ───────────────────────────────────
+
+    def define_hook(self, name: str, *, mutating: bool = False,
+                    description: str = "") -> None:
+        """Define a custom hook on the engine hook system (dynamic layer when unnamed elsewhere)."""
+        self._require("hooks")
+        self._registry.hooks.define_hook(
+            name, mutating=mutating, description=description,
+        )
+
+    def subscribe(self, event: str, fn: Callable) -> None:
+        """Subscribe to any bus event (standard hooks / custom hooks / custom events)."""
+        self._require("events")
+        self._registry.bus.subscribe(fn, event)
+        self._subscriptions.append((event, fn))
+
+    def emit(self, event: str, **payload: Any) -> None:
+        """Publish an event on the engine bus."""
+        self._require("events")
+        self._registry.bus.emit(event, **payload)
+
+    # ── services ─────────────────────────────────────────
+
+    def provide(self, name: str, obj: Any) -> None:
+        """Provide a service object (plugin-to-plugin / plugin-to-host communication)."""
+        self._require("services")
+        self._registry.register_service(name, obj)
+        self._services.append(name)
+
+    def get(self, name: str, default: Any = None) -> Any:
+        """Resolve a service registered by this or another plugin / the host."""
+        self._require("services")
+        return self._registry.resolve_service(name, default)
+
+    # ── pages / cli / settings ───────────────────────────
+
+    def mount_page(self, page: str, html: Any) -> bool:
+        """Mount an HTML page onto the Web UI ("front" / "flow" / "farstars").
+
+        When no Web frontend is attached yet (plugins loaded before the engine
+        starts), the request is queued on the registry and consumed by the Web
+        frontend at attach time. Returns whether the mount applied immediately.
+        """
+        self._require("pages")
+        frontend = self._find_web_frontend()
+        if frontend is not None:
+            frontend.mount_page(page, html)
+            return True
+        pending = getattr(self._registry, "_pending_page_mounts", None)
+        if pending is None:
+            pending = {}
+            setattr(self._registry, "_pending_page_mounts", pending)
+        pending[page] = html
+        return False
+
+    def register_cli_command(self, name: str, handler: Callable, *,
+                             help: str = "") -> None:
+        """Register a CLI command (listed by ``norpagent plugins commands``)."""
+        self._require("cli")
+        if not name or not callable(handler):
+            raise ValueError("register_cli_command requires a name and a callable handler")
+        self._registry.register_command(name, handler, help)
+        self._commands.append(name)
+
+    def register_settings(self, schema: Dict[str, Any]) -> None:
+        """Declare a settings schema for this plugin (stored for the Web plugin panel)."""
+        self._require("settings")
+        store = getattr(self._registry, "_plugin_settings_schemas", None)
+        if store is None:
+            store = {}
+            setattr(self._registry, "_plugin_settings_schemas", store)
+        store[self.name] = dict(schema or {})
+
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        """Read a persisted plugin setting (stored under ~/.norpagent/plugin_settings)."""
+        data = self._read_settings()
+        return data.get(key, default)
+
+    def set_setting(self, key: str, value: Any) -> None:
+        """Persist a plugin setting (host-side storage; plugins never touch the file)."""
+        data = self._read_settings()
+        data[key] = value
+        self._write_settings(data)
+
+    # ── teardown ─────────────────────────────────────────
+
+    def teardown(self) -> None:
+        """Undo the registrations done through this API (best effort; never raises).
+
+        Cleans bus subscriptions / custom slots / services / commands / dynamic
+        tools / components. Model / session / sandbox / scheduler / UI
+        registrations follow the framework's name-overwrite semantics and are
+        not removed (documented).
+        """
+        for event, fn in list(self._subscriptions):
+            try:
+                self._registry.bus.unsubscribe(fn, event)
+            except Exception:  # noqa: BLE001
+                pass
+        self._subscriptions.clear()
+        for slot_name in list(self._slots):
+            try:
+                from norpagent.arch.slots import unregister_slot
+                unregister_slot(slot_name)
+            except Exception:  # noqa: BLE001
+                pass
+        self._slots.clear()
+        for svc in list(self._services):
+            try:
+                self._registry.remove_service(svc)
+            except Exception:  # noqa: BLE001
+                pass
+        self._services.clear()
+        for cname in list(self._commands):
+            try:
+                self._registry.remove_command(cname)
+            except Exception:  # noqa: BLE001
+                pass
+        self._commands.clear()
+        for tname in list(self._tools):
+            try:
+                self._registry.unregister_tool(tname)
+            except Exception:  # noqa: BLE001
+                pass
+        self._tools.clear()
+        for kind, cname in list(self._components):
+            try:
+                self._registry.unregister_component(kind, cname)
+            except Exception:  # noqa: BLE001
+                pass
+        self._components.clear()
+
+    # ── internals ────────────────────────────────────────
+
+    def _find_web_frontend(self) -> Any:
+        try:
+            from norpagent.runtime import current as _current_engine
+            engine = _current_engine()
+        except Exception:  # noqa: BLE001
+            engine = None
+        if engine is None:
+            return None
+        frontend = getattr(engine, "frontend", None)
+        if frontend is not None and hasattr(frontend, "mount_page"):
+            return frontend
+        return None
+
+    def _settings_path(self) -> str:
+        safe = self._SAFE_NAME.sub("_", self.name) or "plugin"
+        return os.path.join(
+            os.path.expanduser("~"), ".norpagent", "plugin_settings", safe + ".json",
+        )
+
+    def _read_settings(self) -> Dict[str, Any]:
+        path = self._settings_path()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_settings(self, data: Dict[str, Any]) -> None:
+        path = self._settings_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
 
 # ── loader ────────────────────────────────────────────────
@@ -562,6 +1179,15 @@ class PluginLoader:
         self.signature_verifier = SignatureVerifier(config)
         self.network_policy = NetworkPolicy(config)
         self.approval = ApprovalPolicy(config)
+        # ── host policy / diagnostics (2026-09-11 plugin overhaul) ──
+        self.plugin_log_dir = str(config.get("plugin_log_dir") or
+                                  os.path.join(os.path.expanduser("~"),
+                                               ".norpagent", "plugin_logs"))
+        self.disabled_plugins: Set[str] = {
+            str(n) for n in (config.get("plugin_disabled") or []) if str(n).strip()
+        }
+        self.host_capabilities = config.get("plugin_capabilities")
+        self._reported_hook_errors: Dict[Tuple[str, str, str], int] = {}
         self.plugins: List[PluginInfo] = []
         self._lock = threading.Lock()
         self._contexts: Dict[str, PluginContext] = {}
@@ -591,6 +1217,52 @@ class PluginLoader:
             return str(veto)
         except Exception:
             return None
+
+    # ── diagnostics / counters (never raise into the bus) ──
+
+    def _find_info(self, plugin_name: str) -> Optional[PluginInfo]:
+        for info in self.plugins:
+            if info.name == plugin_name:
+                return info
+        return None
+
+    def report_hook_failure(self, plugin_name: str, hook_name: str,
+                            exc: Exception) -> None:
+        """Report a plugin hook failure: counted, printed once per error kind,
+        recorded into PluginInfo.diagnostics (bounded). Never raises.
+
+        Replaces the old silent ``except: return None`` swallow — plugin errors
+        are now visible (stdout + diagnostics + PluginInfo).
+        """
+        try:
+            key = (plugin_name, hook_name, type(exc).__name__)
+            count = self._reported_hook_errors.get(key, 0) + 1
+            self._reported_hook_errors[key] = count
+            if count == 1:
+                message = (f"[plugin] hook {hook_name!r} of {plugin_name!r} failed: "
+                           f"{type(exc).__name__}: {exc}")
+                print(message)
+            info = self._find_info(plugin_name)
+            if info is not None:
+                info.diagnostics.append({
+                    "hook": hook_name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "count": count,
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                if len(info.diagnostics) > 50:
+                    del info.diagnostics[:-50]
+        except Exception:  # noqa: BLE001 — diagnostics must never break the pipeline
+            pass
+
+    def bump_count(self, plugin_name: str, key: str) -> None:
+        """Increment a per-plugin call counter (hook: / tool: prefixes)."""
+        try:
+            info = self._find_info(plugin_name)
+            if info is not None:
+                info.counts[key] = info.counts.get(key, 0) + 1
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── process-isolation management ─────────────────────
 
@@ -658,7 +1330,12 @@ class PluginLoader:
             return list(self.plugins)
 
     def plugin_context(self, plugin_name: str, run_ctx: Any = None) -> PluginContext:
-        """Build (or fetch from cache) the plugin context."""
+        """Build (or fetch from cache) the plugin context.
+
+        The context carries the full compatibility surface: config snapshot,
+        ``storage`` (per-plugin state store that survives across hooks / tools)
+        and ``logger`` (per-plugin logger writing to stdout + plugin_log_dir).
+        """
         if plugin_name not in self._contexts:
             workspace = ""
             if run_ctx is not None:
@@ -669,6 +1346,8 @@ class PluginLoader:
                 project_root=workspace,
                 app_dir=os.path.expanduser("~"),
                 config=dict(self.config),
+                storage={},
+                logger=PluginLogger(plugin_name, self.plugin_log_dir),
             )
         ctx = self._contexts[plugin_name]
         if run_ctx is not None:
@@ -693,6 +1372,13 @@ class PluginLoader:
     def _load_from_file(self, registry: Any, name: str, path: str,
                         manifest: Optional[dict]) -> None:
         info = PluginInfo(name=name, path=path)
+
+        # host-level disable list: the plugin is listed (with its status) but not loaded
+        if name in self.disabled_plugins:
+            info.enabled = False
+            info.error = "disabled by host configuration (plugin_disabled)"
+            self.plugins.append(info)
+            return
 
         veto = self._veto("before_plugin_load", name=name, path=path)
         if veto is not None:
@@ -721,6 +1407,20 @@ class PluginLoader:
             )
             self.plugins.append(info)
             return
+
+        # R-020（2026-09-09 裁决）：未签名插件**仅警告**、默认不阻止加载。
+        # 默认策略下 unsigned / untrusted / unavailable 一律放行但留警告
+        # （info.warnings 随 /api/plugins 与 CLI 输出可见）；高安全档
+        # （signature_required，上一分支）是显式收紧，不是默认。
+        if not sig.is_trusted:
+            warn = (
+                f"plugin {name!r} is {sig.status or 'unsigned'} "
+                f"(signature not trusted, reason: {sig.reason or 'n/a'}); "
+                f"loading is allowed by default — add a signature or a trusted "
+                f"key when ready (R-020: warn only, never block by default)"
+            )
+            info.warnings.append(warn)
+            print(f"[plugin] warning: {warn}")
 
         # ── 2. trust tiering: trusted signatures get relaxed audit ──
         effective_audit = "warn" if sig.is_trusted else self.auditor.audit_level
@@ -756,6 +1456,7 @@ class PluginLoader:
 
         # ── 5. isolation decision: process isolation goes to the host child process, never into the main process ──
         isolation = self._decide_isolation(path, manifest)
+        info.isolation = isolation
         if isolation == "process":
             self._load_remote(registry, info, path, manifest)
             return
@@ -769,6 +1470,41 @@ class PluginLoader:
 
         # ── 7. read metadata and interfaces ──
         self._fill_metadata(info, module, manifest)
+
+        # host-level disable list (second check: PLUGIN_NAME may differ from the file name)
+        if info.name in self.disabled_plugins:
+            info.enabled = False
+            info.error = "disabled by host configuration (plugin_disabled)"
+            self.plugins.append(info)
+            return
+
+        # ── 7.5 declarations: capability surface / dependencies / minimum version ──
+        self._apply_declarations(info, module, manifest)
+        problem = self._check_requirements(info)
+        if problem:
+            info.enabled = False
+            info.error = problem
+            self.plugins.append(info)
+            return
+
+        # ── 7.6 setup(api): the registration facade (tools / slots / components /
+        #        models / hooks / events / services / pages / cli / settings).
+        #        A setup() failure rejects the plugin and rolls back the
+        #        registrations it already made (atomic-by-convention).
+        if callable(getattr(module, "setup", None)):
+            plugin_api = PluginAPI(self, info, module, registry)
+            try:
+                module.setup(plugin_api)
+                info.api = plugin_api
+            except Exception as exc:  # noqa: BLE001 — a failed setup rejects the plugin
+                try:
+                    plugin_api.teardown()
+                except Exception:  # noqa: BLE001
+                    pass
+                info.enabled = False
+                info.error = f"setup() failed: {type(exc).__name__}: {exc}"
+                self.plugins.append(info)
+                return
 
         # ── 8. adapt and register into the Registry ──
         veto = self._veto(
@@ -788,6 +1524,9 @@ class PluginLoader:
             "after_plugin_register", name=info.name,
             enabled=info.enabled, tools=info.tools, isolation="inproc",
         )
+
+        # ── 9. on_load lifecycle (best effort: failures are recorded, not fatal) ──
+        self._run_lifecycle(info, module, "on_load")
 
     def _load_remote(self, registry: Any, info: PluginInfo, path: str,
                      manifest: Optional[dict]) -> None:
@@ -811,6 +1550,24 @@ class PluginLoader:
         header_name = meta.get("name") or info.name
         if isinstance(header_name, str) and header_name.strip():
             info.name = header_name.strip()
+        info.isolation = "process"
+
+        # host-level disable list (second check)
+        if info.name in self.disabled_plugins:
+            info.enabled = False
+            info.error = "disabled by host configuration (plugin_disabled)"
+            self.plugins.append(info)
+            return
+
+        # process-isolated plugins run entirely in the child process: the setup(api)
+        # registration facade is not offered there (recorded as a warning, not an error)
+        if meta.get("has_setup"):
+            warn = (f"plugin {info.name!r} defines setup() but runs under process "
+                    f"isolation; setup registration is skipped (use ISOLATION=inproc "
+                    f"or the tool/hook surface instead)")
+            info.warnings.append(warn)
+            print(f"[plugin] warning: {warn}")
+
         if manifest:
             info.version = manifest.get("version", meta.get("version", info.version))
             info.publisher = manifest.get(
@@ -861,13 +1618,113 @@ class PluginLoader:
             enabled=info.enabled, tools=info.tools, isolation="process",
         )
 
+        # ── on_load lifecycle (relayed into the host child; best effort) ──
+        try:
+            manager = self.isolation_manager()
+            manager.fire_hook(info.name, "on_load", [],
+                              self._base_ctx_dict(info.name))
+            self.bump_count(info.name, "lifecycle:on_load")
+        except Exception as exc:  # noqa: BLE001 — lifecycle failure does not reject the plugin
+            self.report_hook_failure(info.name, "on_load", exc)
+
     def _base_ctx_dict(self, plugin_name: str) -> Dict[str, Any]:
         return {
             "plugin_name": plugin_name,
             "project_root": "",
             "app_dir": os.path.expanduser("~"),
             "config": dict(self.config),
+            "plugin_log_dir": self.plugin_log_dir,
         }
+
+    # ── declarations / capabilities / lifecycle (2026-09-11 plugin overhaul) ──
+
+    def allows_capability(self, info: PluginInfo, capability: str) -> bool:
+        """Whether *info* may use *capability* (declared surface + host policy).
+
+        Declarations come from PLUGIN_CAPABILITIES / manifest.capabilities; when
+        absent, the base set (tools / hooks / events) applies. "*" / "all"
+        declares everything. The host may further restrict via config
+        plugin_capabilities (None = no host restriction).
+        """
+        declared = set(info.capabilities or [])
+        if declared:
+            allowed = ("all" in declared) or ("*" in declared) or (capability in declared)
+        else:
+            allowed = capability in ("tools", "hooks", "events")
+        if allowed and self.host_capabilities is not None:
+            host_set = {str(x) for x in self.host_capabilities}
+            allowed = ("all" in host_set) or ("*" in host_set) or (capability in host_set)
+        return allowed
+
+    def _apply_declarations(self, info: PluginInfo, module: Any,
+                            manifest: Optional[dict]) -> None:
+        """Read capability / dependency declarations from the module + manifest."""
+        caps = getattr(module, "PLUGIN_CAPABILITIES", None)
+        if not isinstance(caps, (list, tuple)):
+            caps = (manifest or {}).get("capabilities")
+        if isinstance(caps, (list, tuple)):
+            info.capabilities = [str(c) for c in caps]
+        else:
+            info.capabilities = ["tools", "hooks", "events"]
+
+        requires: Dict[str, Any] = {}
+        req = getattr(module, "PLUGIN_REQUIRES", None)
+        if isinstance(req, (list, tuple)):
+            requires["plugins"] = [str(r) for r in req]
+        elif isinstance(req, dict):
+            requires.update(req)
+        min_ver = getattr(module, "PLUGIN_MIN_NORPAGENT", None)
+        if isinstance(min_ver, str) and min_ver.strip():
+            requires["min_norpagent"] = min_ver.strip()
+        if manifest:
+            m_req = manifest.get("requires")
+            if isinstance(m_req, (list, tuple)):
+                requires["plugins"] = [str(r) for r in m_req]
+            elif isinstance(m_req, dict):
+                requires.update(m_req)
+            m_min = manifest.get("min_norpagent")
+            if isinstance(m_min, str) and m_min.strip():
+                requires["min_norpagent"] = m_min.strip()
+        info.requires = requires
+
+    def _check_requirements(self, info: PluginInfo) -> Optional[str]:
+        """Validate dependency declarations; returns an error string when unmet."""
+        req = info.requires or {}
+        min_ver = req.get("min_norpagent")
+        if isinstance(min_ver, str) and min_ver.strip():
+            try:
+                import norpagent as _norp
+                current = str(getattr(_norp, "__version__", "") or "")
+            except Exception:  # noqa: BLE001
+                current = ""
+            if current and _version_tuple(current) < _version_tuple(min_ver):
+                return f"requires norpagent >= {min_ver.strip()} (current: {current})"
+        dep_plugins = req.get("plugins") or []
+        if isinstance(dep_plugins, (list, tuple)) and dep_plugins:
+            loaded = {p.name for p in self.plugins if p.enabled}
+            missing = [str(d) for d in dep_plugins if str(d) not in loaded]
+            if missing:
+                return f"missing plugin dependencies: {', '.join(missing)}"
+        return None
+
+    def _run_lifecycle(self, info: PluginInfo, module: Any,
+                       hook_name: str) -> None:
+        """Run an in-process plugin lifecycle function (on_load / on_unload).
+
+        Failures are recorded through the diagnostics channel and never reject
+        or break the pipeline.
+        """
+        fn = getattr(module, hook_name, None)
+        if not callable(fn):
+            return
+        ctx = self.plugin_context(info.name)
+        if info.api is not None:
+            ctx.api = info.api
+        try:
+            fn(ctx)
+            self.bump_count(info.name, f"lifecycle:{hook_name}")
+        except Exception as exc:  # noqa: BLE001 — lifecycle failure must not break the pipeline
+            self.report_hook_failure(info.name, hook_name, exc)
 
     def _fill_metadata(self, info: PluginInfo, module: Any,
                        manifest: Optional[dict]) -> None:
@@ -1029,25 +1886,68 @@ class PluginLoader:
         return None
 
     def unload(self, registry: Any, plugin_name: str) -> bool:
-        """Unload a single plugin (for hot-reload development)."""
-        mod_name = f"{PLUGIN_MODULE_PREFIX}{plugin_name}"
-        sys.modules.pop(mod_name, None)
+        """Unload a single plugin: hooks unsubscribe, tools are removed, lifecycle runs.
+
+        2026-09-11 clean hot reload: the plugin's hook subscriptions are really
+        removed (cached listener objects), its tools are deleted from the tool
+        table, setup(api) registrations are torn down (subscriptions / custom
+        slots / services), on_unload runs (in-process or relayed to the host
+        child), and the plugin module is dropped from sys.modules.
+        """
         with self._lock:
-            before = len(self.plugins)
+            info = next((p for p in self.plugins if p.name == plugin_name), None)
+        if info is None:
+            return False
+
+        # ── on_unload lifecycle first (the plugin is still alive) ──
+        if info.isolation == "process":
+            try:
+                manager = self.isolation_manager()
+                manager.fire_hook(info.name, "on_unload", [],
+                                  self._base_ctx_dict(info.name))
+                self.bump_count(info.name, "lifecycle:on_unload")
+            except Exception as exc:  # noqa: BLE001
+                self.report_hook_failure(info.name, "on_unload", exc)
+        elif info.module is not None:
+            self._run_lifecycle(info, info.module, "on_unload")
+
+        # ── setup-registration teardown (bus subscriptions / slots / services) ──
+        if info.api is not None:
+            try:
+                info.api.teardown()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ── unregister from the registry (hook subscriptions + plugin record) ──
+        try:
+            registry.unregister_plugin(info.name)
+        except Exception:  # noqa: BLE001 — a single plugin error must not block unloading
+            pass
+
+        # ── remove this plugin's tools ──
+        for tname in list(info.tools or []):
+            try:
+                registry.unregister_tool(tname)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ── module / context cleanup ──
+        sys.modules.pop(f"{PLUGIN_MODULE_PREFIX}{info.name}", None)
+        sys.modules.pop(f"{PLUGIN_MODULE_PREFIX}{plugin_name}", None)
+        with self._lock:
             self.plugins = [p for p in self.plugins if p.name != plugin_name]
             self._contexts.pop(plugin_name, None)
-        if len(self.plugins) == before:
-            return False
-        # note: tools/hooks stay in the Registry (since EventBus has no
-        # by-name unsubscribe, rebuilding the Registry is recommended in production).
+            self._contexts.pop(info.name, None)
         return True
 
     def reload(self, registry: Any, plugin_name: str) -> bool:
-        """Reload a single plugin (rediscover the same-named file → rerun the full security pipeline).
+        """Reload a single plugin: clean unload → full security pipeline again.
 
-        Note: the old instance's tools/hook subscriptions stay on the bus;
-        rebuilding the Registry is recommended in production; this method is for
-        dev-time hot reload.
+        2026-09-11: works for real now — unload removes hooks / tools /
+        registrations, then the same-named file re-enters the complete pipeline
+        (signature → audit → import restrictions → setup → register → on_load).
+        To pick up added / removed / renamed plugins use ``discover_and_load``
+        or the plugins slot remount (``np.remount(plugins=[...])``).
         """
         info = next((p for p in self.plugins if p.name == plugin_name), None)
         if info is None:
@@ -1061,7 +1961,20 @@ class PluginLoader:
         return True
 
     def shutdown(self) -> None:
-        """Release resources such as the process-isolation host child process."""
+        """Release resources: on_unload for every plugin + the process-isolation host child."""
+        for info in list(self.plugins):
+            if not info.enabled:
+                continue
+            try:
+                if info.isolation == "process":
+                    manager = self._isolation_manager
+                    if manager is not None:
+                        manager.fire_hook(info.name, "on_unload", [],
+                                          self._base_ctx_dict(info.name))
+                elif info.module is not None:
+                    self._run_lifecycle(info, info.module, "on_unload")
+            except Exception:  # noqa: BLE001
+                pass
         if self._isolation_manager is not None:
             try:
                 self._isolation_manager.shutdown()
@@ -1097,3 +2010,32 @@ def install_plugin_dirs(registry: Any, plugin_dirs: List[str],
     except Exception:  # noqa: BLE001
         pass
     return loader
+
+
+def install_plugin_file(registry: Any, path: str,
+                        config: Optional[dict] = None) -> "tuple[PluginLoader, Optional[PluginInfo]]":
+    """Load a **single plugin file** through the full security pipeline.
+
+    Programmatic hot-install entry (2026-09-11, used by evolution flows and
+    external orchestrators): the file enters exactly the same pipeline as
+    directory loading (signature → audit → permissions → isolation → import
+    restrictions → setup → register → on_load). Only this one file is loaded —
+    other files in the same directory are not touched.
+
+    Returns ``(loader, PluginInfo | None)``; check ``info.enabled`` / ``info.error``.
+    """
+    path = os.path.abspath(str(path or ""))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"plugin file not found: {path}")
+    directory = os.path.dirname(path)
+    loader = PluginLoader([directory], config)
+    name = os.path.splitext(os.path.basename(path))[0]
+    with loader._lock:  # same package: reuse the single-file pipeline step
+        loader._registry = registry
+        loader._load_from_file(registry, name, path, manifest=None)
+    try:
+        setattr(registry, "plugin_loader", loader)
+    except Exception:  # noqa: BLE001
+        pass
+    info = loader.plugins[0] if loader.plugins else None
+    return loader, info

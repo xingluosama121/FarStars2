@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-norpagent.cnb.cortex — 大脑皮层（最高级 norpagent 实例，神经树根节点）
+norpagent.cnb.cortex — 中枢（最高级 norpagent 实例，神经树根节点）
 
-大脑皮层是整棵神经树的根（level 0，无父节点），拥有：
+中枢是整棵神经树的根（level 0，无父节点），拥有：
 
 1. 全量拓扑：所有层级的注册消息沿树逐级上报，最终汇聚于此，
-   皮层持有任意层级任意单位原子的完整拓扑视图与总线地址。
+   中枢持有任意层级任意单位原子的完整拓扑视图与总线地址。
 
 2. 任意层级控制：通过中枢神经总线向任意节点下发指令
    - cmd.ping / cmd.exec / cmd.stop / cmd.reload
@@ -14,8 +14,8 @@ norpagent.cnb.cortex — 大脑皮层（最高级 norpagent 实例，神经树�
 
 3. 控制端点 /cnb/ctrl：供 CLI / REPL / 外部控制台调用（仅本机回环信任）。
 
-皮层自身不可被任何节点控制：下行指令要求发送方必须是接收方的祖先，
-皮层没有祖先，天然不受任何下级指令影响（低等级不允许改写高等级）。
+中枢自身不可被任何节点控制：下行指令要求发送方必须是接收方的祖先，
+中枢没有祖先，天然不受任何下级指令影响（低等级不允许改写高等级）。
 
 REPL 交互控制台命令：
   topo                 查看拓扑树
@@ -27,8 +27,8 @@ REPL 交互控制台命令：
   revoke <type> <target> <perm>    撤销权限
   set <type> <target> <json>       整体覆盖权限
   reports [n]          查看最近上报（默认 20 条）
-  audit [n]            查看皮层审计
-  perm_audit [n]       查看权限面审计（皮层权限操作 + 节点上行
+  audit [n]            查看中枢审计
+  perm_audit [n]       查看权限面审计（中枢权限操作 + 节点上行
                        perm.denied / perm.changed 汇聚）
   sync                 向全部后代广播拓扑
   help / quit
@@ -45,7 +45,7 @@ from .topology import NodeInfo
 
 
 class Cortex(NervousNode):
-    """大脑皮层：神经树根节点。"""
+    """中枢：神经树根节点。"""
 
     def __init__(self, node_id: str = "cortex",
                  host: str = protocol.DEFAULT_HOST,
@@ -55,7 +55,7 @@ class Cortex(NervousNode):
                  sweep_interval: float = 10.0,
                  dead_timeout: float = 30.0,
                  drop_grace: float = 90.0):
-        """皮层（神经树根）。
+        """中枢（神经树根）。
 
         Args:
             sweep_enabled: 是否启用失联清扫守护线程（测试可关闭/调小周期）。
@@ -84,7 +84,7 @@ class Cortex(NervousNode):
         self._sync_timer: Optional[threading.Timer] = None
         self._sync_pending = False
         self._sync_lock = threading.Lock()
-        # 权限面审计：皮层自身发出的权限操作（结构化记录），与节点上行
+        # 权限面审计：中枢自身发出的权限操作（结构化记录），与节点上行
         # 汇聚的 perm.denied / perm.changed 事件共同构成统一权限面视图。
         self._perm_audit: List[Dict] = []
         self._perm_audit_lock = threading.RLock()
@@ -101,7 +101,7 @@ class Cortex(NervousNode):
         self._subpoena_box_lock = threading.RLock()
         self.subpoena_ttl = 300.0                 # 隔离箱默认 TTL（秒）
 
-        # ── 行为基线分级阈值（皮层判定侧策略，可调）──
+        # ── 行为基线分级阈值（中枢判定侧策略，可调）──
         # 依据节点心跳上汇的聚合统计（审计异常率/任务失败率/心跳失败率）
         # 判定：黄 = 劣化（人工复核）、黑 = 疑似恶意（隔离处置）。
         self.behavior_thresholds: Dict[str, float] = {
@@ -130,7 +130,7 @@ class Cortex(NervousNode):
         self._bus = start_bus(self.host, self.port, ctx)
         self._running = True
         self._started_at = time.time()
-        self.audit("大脑皮层上线")
+        self.audit("中枢上线")
         if self.sweep_enabled and self.sweep_interval > 0:
             self._sweep_thread = threading.Thread(
                 target=self._sweep_loop, daemon=True,
@@ -146,7 +146,7 @@ class Cortex(NervousNode):
                 self._sync_timer.cancel()
                 self._sync_timer = None
             self._sync_pending = False
-        self.audit("大脑皮层下线")
+        self.audit("中枢下线")
 
     # ------------------------------------------------------------------
     # 失联清扫 + 救树（B3 崩溃路径 / B5 dead 检测接线）
@@ -157,7 +157,7 @@ class Cortex(NervousNode):
 
         - 失联超 drop_grace 的节点：判定真死，整支（含子树）注销。
         - 失联但在宽限期内：执行救树（_rescue_children）——把其直接子提升
-          挂到皮层下并通知改挂；真死子节点的改挂通知失败，保留在皮层下
+          挂到中枢下并通知改挂；真死子节点的改挂通知失败，保留在中枢下
           （dead），待超过宽限期后整支清除（递归每轮收敛一层）。
         注：中间层失联时其子树心跳断链，深层节点会集体显示 dead——这是
         「上报中断」而非「节点真死」；救树 + 宽限期正是为区分二者而设。
@@ -175,8 +175,8 @@ class Cortex(NervousNode):
         判定：sweep_dead 把超过 dead_timeout 未心跳的节点标记 dead（B5 接线）。
         处置（按失联节点的子孙结构分派）：
           - 有子且失联未超宽限期：救树（_rescue_children）——把其直接子提升
-            挂到皮层并下发 cmd.reroot，活子重新锚定后心跳续传；树逐层塌缩，
-            真死子（reroot 不可达）逐层上提到皮层后按叶子清除。
+            挂到中枢并下发 cmd.reroot，活子重新锚定后心跳续传；树逐层塌缩，
+            真死子（reroot 不可达）逐层上提到中枢后按叶子清除。
           - 有子但失联超宽限期：整支真死，级联注销。
           - 无子叶子且失联超宽限期：注销（宽限期是给「父断链导致上报中断」
             的活叶子留的窗口——其父被救后转发恢复，心跳即续上）。
@@ -228,7 +228,7 @@ class Cortex(NervousNode):
             self.audit(f"自动拓扑广播失败: {e}")
 
     # ------------------------------------------------------------------
-    # 控制 API（皮层 -> 任意层级任意节点）
+    # 控制 API（中枢 -> 任意层级任意节点）
     # ------------------------------------------------------------------
 
     def _node_url(self, node_id: str) -> Optional[str]:
@@ -241,14 +241,14 @@ class Cortex(NervousNode):
     def _require_node(self, node_id: str) -> NodeInfo:
         node = self.topology.get(node_id)
         if node is None:
-            raise ValueError(f"节点不存在于拓扑：{node_id}")
+            raise ValueError(f"node not present in topology: {node_id}")
         return node
 
     def ping(self, node_id: str) -> Dict:
         node = self._require_node(node_id)
         url = self._node_url(node_id)
         if not url:
-            return {"ok": False, "error": f"节点 {node_id} 未上报总线地址"}
+            return {"ok": False, "error": f"node {node_id} has not reported a bus address"}
         return self.send_downlink(node_id, url, "cmd.ping", {})
 
     def exec_cmd(self, node_id: str, action: str, args: Dict = None,
@@ -256,13 +256,13 @@ class Cortex(NervousNode):
         node = self._require_node(node_id)
         url = self._node_url(node_id)
         if not url:
-            return {"ok": False, "error": f"节点 {node_id} 未上报总线地址"}
+            return {"ok": False, "error": f"node {node_id} has not reported a bus address"}
         r = self.send_downlink(node_id, url, "cmd.exec", {
             "action": action, "args": args or {}, "perm": perm, "path": path,
         })
-        # 白盒：皮层发出的 exec 指令全程留痕（谁向谁执行了什么动作、
-        # 结果如何），与 perm/freeze/subpoena 的皮层审计视图对齐。
-        self.audit(f"皮层执行指令 exec -> {node_id} action={action} "
+        # 白盒：中枢发出的 exec 指令全程留痕（谁向谁执行了什么动作、
+        # 结果如何），与 perm/freeze/subpoena 的中枢审计视图对齐。
+        self.audit(f"中枢执行指令 exec -> {node_id} action={action} "
                    f"(ok={bool(r.get('ok'))})", action=action, node=node_id)
         return r
 
@@ -270,9 +270,9 @@ class Cortex(NervousNode):
         node = self._require_node(node_id)
         url = self._node_url(node_id)
         if not url:
-            return {"ok": False, "error": f"节点 {node_id} 未上报总线地址"}
+            return {"ok": False, "error": f"node {node_id} has not reported a bus address"}
         r = self.send_downlink(node_id, url, "cmd.stop", {})
-        self.audit(f"皮层下令停止 -> {node_id} (ok={bool(r.get('ok'))})",
+        self.audit(f"中枢下令停止 -> {node_id} (ok={bool(r.get('ok'))})",
                    node=node_id)
         return r
 
@@ -280,9 +280,9 @@ class Cortex(NervousNode):
         node = self._require_node(node_id)
         url = self._node_url(node_id)
         if not url:
-            return {"ok": False, "error": f"节点 {node_id} 未上报总线地址"}
+            return {"ok": False, "error": f"node {node_id} has not reported a bus address"}
         r = self.send_downlink(node_id, url, "cmd.reload", {})
-        self.audit(f"皮层下令重载 -> {node_id} (ok={bool(r.get('ok'))})",
+        self.audit(f"中枢下令重载 -> {node_id} (ok={bool(r.get('ok'))})",
                    node=node_id)
         return r
 
@@ -291,7 +291,7 @@ class Cortex(NervousNode):
     def _note_perm_op(self, op: str, target_type: str, target: str,
                       perm: str = None, allows: Dict = None,
                       results: List[Dict] = None):
-        """皮层自身发出的权限操作 -> 结构化权限面审计记录。"""
+        """中枢自身发出的权限操作 -> 结构化权限面审计记录。"""
         rec = {"ts": time.time(), "op": op, "target_type": target_type,
                "target": target, "perm": perm, "allows": allows,
                "results": list(results or []), "actor": self.node_id}
@@ -302,7 +302,7 @@ class Cortex(NervousNode):
         return rec
 
     def perm_audit(self, n: int = 50) -> List[Dict]:
-        """权限面审计视图：皮层发出的权限操作 + 节点上行汇聚的
+        """权限面审计视图：中枢发出的权限操作 + 节点上行汇聚的
         perm.denied / perm.changed 事件（统一视图）。
 
         每条记录含 ts / from（cortex 或节点 id）/ event / detail，
@@ -318,7 +318,7 @@ class Cortex(NervousNode):
                     "ts": r.get("ts"), "from": r.get("from"),
                     "event": p.get("event"), "detail": p.get("detail", ""),
                 })
-        # 2) 皮层自身权限操作（结构化记录）
+        # 2) 中枢自身权限操作（结构化记录）
         with self._perm_audit_lock:
             for rec in self._perm_audit:
                 rows.append({
@@ -337,10 +337,10 @@ class Cortex(NervousNode):
                    scope: Dict = None) -> Dict:
         """向目标授予操作权限。target_type: node_id / node_kind / *。"""
         if not protocol.is_valid_perm(perm):
-            return {"ok": False, "error": f"未知权限原子: {perm}"}
+            return {"ok": False, "error": f"unknown permission atom: {perm}"}
         results = self._dispatch_perm("cmd.perm.grant", target_type, target,
                                       perm, True, scope)
-        self.audit(f"皮层授予权限 {perm} -> {target_type}:{target}")
+        self.audit(f"中枢授予权限 {perm} -> {target_type}:{target}")
         self._note_perm_op("grant", target_type, target, perm=perm,
                            results=results)
         return {"ok": True, "results": results}
@@ -348,10 +348,10 @@ class Cortex(NervousNode):
     def perm_revoke(self, target_type: str, target: str, perm: str) -> Dict:
         """撤销目标的操作权限。"""
         if not protocol.is_valid_perm(perm):
-            return {"ok": False, "error": f"未知权限原子: {perm}"}
+            return {"ok": False, "error": f"unknown permission atom: {perm}"}
         results = self._dispatch_perm("cmd.perm.revoke", target_type, target,
                                       perm, False, None)
-        self.audit(f"皮层撤销权限 {perm} -> {target_type}:{target}")
+        self.audit(f"中枢撤销权限 {perm} -> {target_type}:{target}")
         self._note_perm_op("revoke", target_type, target, perm=perm,
                            results=results)
         return {"ok": True, "results": results}
@@ -360,7 +360,7 @@ class Cortex(NervousNode):
                  allows: Dict[str, bool]) -> Dict:
         """整体覆盖目标权限（白名单收紧模式）。"""
         results = self._dispatch_perm_set(target_type, target, allows)
-        self.audit(f"皮层整体设置权限 -> {target_type}:{target}: {allows}")
+        self.audit(f"中枢整体设置权限 -> {target_type}:{target}: {allows}")
         self._note_perm_op("set", target_type, target, allows=allows,
                            results=results)
         return {"ok": True, "results": results}
@@ -447,7 +447,7 @@ class Cortex(NervousNode):
         }
 
     # ------------------------------------------------------------------
-    # 冻结控制（皮层 -> 任意层级节点）
+    # 冻结控制（中枢 -> 任意层级节点）
     # ------------------------------------------------------------------
 
     def freeze_node(self, node_id: str, reason: str = "",
@@ -455,16 +455,16 @@ class Cortex(NervousNode):
         """签发冻结：节点拒新任务接单、进程/心跳保活取证（隔离冻结态）。
 
         语义：不杀不死、可审计可解除、不触发清扫判 dead（心跳照常且标记
-        frozen，皮层调度侧据此摘流量）。解除由 unfreeze_node（康复回树）
+        frozen，中枢调度侧据此摘流量）。解除由 unfreeze_node（康复回树）
         或销毁重建（复核未通过，杜绝带病复用）。
         """
         node = self._require_node(node_id)
         url = self._node_url(node_id)
         if not url:
-            return {"ok": False, "error": f"节点 {node_id} 未上报总线地址"}
+            return {"ok": False, "error": f"node {node_id} has not reported a bus address"}
         r = self.send_downlink(node_id, url, "cmd.freeze",
                                {"reason": reason, "source": source})
-        self.audit(f"皮层签发冻结：{node_id} reason={reason or '隔离处置'} "
+        self.audit(f"中枢签发冻结：{node_id} reason={reason or '隔离处置'} "
                    f"(ok={r.get('ok')})")
         self._note_perm_op("freeze", "node_id", node_id, perm=None,
                            results=[{"node": node_id, **r}])
@@ -477,10 +477,10 @@ class Cortex(NervousNode):
         node = self._require_node(node_id)
         url = self._node_url(node_id)
         if not url:
-            return {"ok": False, "error": f"节点 {node_id} 未上报总线地址"}
+            return {"ok": False, "error": f"node {node_id} has not reported a bus address"}
         r = self.send_downlink(node_id, url, "cmd.unfreeze",
                                {"reason": reason, "source": source})
-        self.audit(f"皮层解除冻结：{node_id} reason={reason or '复核通过'} "
+        self.audit(f"中枢解除冻结：{node_id} reason={reason or '复核通过'} "
                    f"(ok={r.get('ok')})")
         self._note_perm_op("unfreeze", "node_id", node_id, perm=None,
                            results=[{"node": node_id, **r}])
@@ -515,7 +515,7 @@ class Cortex(NervousNode):
                  summary_exhausted: bool = True,
                  actor: Optional[str] = None,
                  note: str = "") -> Dict:
-        """签发传票：强制命令目标节点把原始审计（非 2KB 摘要）直传皮层。
+        """签发传票：强制命令目标节点把原始审计（非 2KB 摘要）直传中枢。
 
         五道闸（防围栏反噬）：
           ① 判据前置：basis 必须是 SUBPOENA_BASIS 四类之一，且签发记录
@@ -530,7 +530,7 @@ class Cortex(NervousNode):
           ⑤ 签发即留痕：subpoena_audit() 全审计 + 「黑」级事件。
 
         Args:
-            actor: 实际签发人身份（默认本皮层 node_id）。CLI/上层控制台
+            actor: 实际签发人身份（默认本中枢 node_id）。CLI/上层控制台
                    传真实操作者（如人工批准者），审计「谁签发的」才完整。
 
         低层级冒用：节点端校验签发者 level==0（不可委派），非 level 0
@@ -539,12 +539,12 @@ class Cortex(NervousNode):
         # ① 判据前置
         if not protocol.is_valid_subpoena_basis(basis):
             return {"ok": False, "error":
-                    f"invalid basis: {basis}（四类判据: "
-                    f"{list(protocol.SUBPOENA_BASIS)}）"}
+                    f"invalid basis: {basis} (four bases: "
+                    f"{list(protocol.SUBPOENA_BASIS)})"}
         if not summary_exhausted:
             return {"ok": False, "error":
-                    "summary_exhausted=False：签发前须先穷尽摘要裁决 "
-                    "（2KB → 按需片段 → 仍无法定谳）并记录判据"}
+                    "summary_exhausted=False: before issuing, the summary adjudication must be exhausted "
+                    "(2KB -> on-demand fragments -> still undecided) and the basis recorded"}
         # ④ 容量分档
         try:
             tier_kb = int(tier_kb)
@@ -552,14 +552,14 @@ class Cortex(NervousNode):
             return {"ok": False, "error": f"invalid tier_kb: {tier_kb!r}"}
         if not protocol.is_valid_subpoena_tier(tier_kb):
             return {"ok": False, "error": f"invalid tier_kb: {tier_kb} "
-                    f"（容量档 {list(protocol.SUBPOENA_TIERS_KB)}KB）"}
+                    f"(capacity tiers {list(protocol.SUBPOENA_TIERS_KB)}KB)"}
         if tier_kb > 128 and not approved_by_human:
             return {"ok": False, "error":
-                    f"tier {tier_kb}KB > 128KB：需人工批准 "
+                    f"tier {tier_kb}KB > 128KB: human approval required "
                     "(approved_by_human=True)"}
         if tier_kb > protocol.SUBPOENA_MAX_KB:
             return {"ok": False, "error":
-                    f"tier {tier_kb}KB > 512KB：强制转人工终裁（传票尽头是人）"}
+                    f"tier {tier_kb}KB > 512KB: forced to human final ruling (a subpoena ends with a human)"}
         if scope not in ("audit", "reports", "both"):
             return {"ok": False, "error": f"invalid scope: {scope}"}
         # ⑤ 签发即留痕（先于取数，防最高权限滥用；黑级事件）
@@ -586,7 +586,7 @@ class Cortex(NervousNode):
         url = self._node_url(node_id)
         if not url:
             rec["error"] = "no url"
-            return {"ok": False, "error": f"节点 {node_id} 未上报总线地址",
+            return {"ok": False, "error": f"node {node_id} has not reported a bus address",
                     "subpoena_id": rec["subpoena_id"]}
         payload = {
             "basis": basis, "scope": scope, "tier_kb": tier_kb,
@@ -655,8 +655,8 @@ class Cortex(NervousNode):
             "truncated": envelope["truncated"],
             "forced_human": forced_human,
             "ttl": self.subpoena_ttl,
-            "message": "证据已入隔离取证箱（RAW/UNTRUSTED，一次性裁决，"
-                       "用后即毁；读取见 subpoena_box）",
+            "message": "evidence placed in the isolation evidence box (RAW/UNTRUSTED, one-shot adjudication, "
+                       "destroyed after use; see subpoena_box to read)",
         }
 
     def _purge_expired_boxes(self) -> int:
@@ -709,14 +709,14 @@ class Cortex(NervousNode):
         return {"ok": True, "destroyed": gone}
 
     # ------------------------------------------------------------------
-    # 行为基线分级视图（皮层消费节点心跳聚合统计）
+    # 行为基线分级视图（中枢消费节点心跳聚合统计）
     # ------------------------------------------------------------------
 
     def behavior_view(self) -> Dict:
         """全树行为基线分级：黄劣化（人工复核）/ 黑疑似恶意（隔离处置）。
 
         数据源：节点心跳上汇的 behavior 聚合统计（内核侧聚合，不上行
-        原始流）。分级为皮层判定侧策略（阈值 behavior_thresholds 可调），
+        原始流）。分级为中枢判定侧策略（阈值 behavior_thresholds 可调），
         统计口径与内核原始事件一致（心跳 reports 环内逐节点取最近一条）。
         """
         th = self.behavior_thresholds
@@ -796,7 +796,7 @@ class Cortex(NervousNode):
     # ------------------------------------------------------------------
 
     def on_ctrl(self, req: Dict) -> Dict:
-        """皮层控制端点处理。仅接受本机回环访问（bus 默认绑定 127.0.0.1）。"""
+        """中枢控制端点处理。仅接受本机回环访问（bus 默认绑定 127.0.0.1）。"""
         op = req.get("op", "")
         try:
             if op == "topo":
@@ -872,7 +872,7 @@ class Cortex(NervousNode):
                 # 行为基线分级视图（黄劣化/黑疑似恶意）
                 return self.behavior_view()
             if op == "config":
-                # 皮层只读配置（控制台展示：清扫参数 + 行为分级阈值 + 身份）
+                # 中枢只读配置（控制台展示：清扫参数 + 行为分级阈值 + 身份）
                 return {
                     "ok": True,
                     "node_id": self.node_id,
@@ -891,13 +891,13 @@ class Cortex(NervousNode):
                     "behavior_thresholds": dict(self.behavior_thresholds),
                 }
             if op == "set_thresholds":
-                # 皮层运行参数热调整（控制台真实操作；键白名单 + 范围校验 +
+                # 中枢运行参数热调整（控制台真实操作；键白名单 + 范围校验 +
                 # 审计留痕）。thresholds=行为分级阈值（0~1 比率）；
                 # sweep=清扫参数（秒，>0）。
                 th = req.get("thresholds") or {}
                 sweep = req.get("sweep") or {}
                 if not isinstance(th, dict) or not isinstance(sweep, dict):
-                    raise ValueError("thresholds/sweep 必须为对象")
+                    raise ValueError("thresholds/sweep must be objects")
                 allowed_th = {
                     "yellow_audit_anomaly_rate", "black_audit_anomaly_rate",
                     "yellow_task_fail_rate", "black_task_fail_rate",
@@ -907,30 +907,30 @@ class Cortex(NervousNode):
                 changed = []
                 for key, val in th.items():
                     if key not in allowed_th:
-                        raise ValueError(f"未知行为阈值键: {key}")
+                        raise ValueError(f"unknown behavior threshold key: {key}")
                     try:
                         val = float(val)
                     except (TypeError, ValueError) as exc:
-                        raise ValueError(f"非法阈值 {key}={val!r}") from exc
+                        raise ValueError(f"invalid threshold {key}={val!r}") from exc
                     if not (0.0 <= val <= 1.0):
-                        raise ValueError(f"阈值必须在 0~1 之间: {key}={val}")
+                        raise ValueError(f"threshold must be between 0 and 1: {key}={val}")
                     self.behavior_thresholds[key] = val
                     changed.append(f"thresholds.{key}={val}")
                 for key, val in sweep.items():
                     if key not in allowed_sweep:
-                        raise ValueError(f"未知清扫参数键: {key}")
+                        raise ValueError(f"unknown sweep parameter key: {key}")
                     try:
                         val = float(val)
                     except (TypeError, ValueError) as exc:
-                        raise ValueError(f"非法清扫参数 {key}={val!r}") from exc
+                        raise ValueError(f"invalid sweep parameter {key}={val!r}") from exc
                     if val <= 0:
-                        raise ValueError(f"清扫参数必须为正数: {key}={val}")
+                        raise ValueError(f"sweep parameter must be positive: {key}={val}")
                     setattr(self, key, val)
                     changed.append(f"sweep.{key}={val}")
                 if not changed:
-                    raise ValueError("无可变更键（白名单内未提供任何值）")
+                    raise ValueError("no changeable keys (no values provided within the whitelist)")
                 self.audit(
-                    "皮层运行参数更新（ctrl set_thresholds）",
+                    "中枢运行参数更新（ctrl set_thresholds）",
                     changed=", ".join(changed),
                 )
                 return {
@@ -958,7 +958,7 @@ class Cortex(NervousNode):
             if op == "perm_audit":
                 n = int(req.get("n", 50))
                 return {"ok": True, "audit": self.perm_audit(n)}
-            return {"ok": False, "error": f"未知控制操作: {op}"}
+            return {"ok": False, "error": f"unknown control operation: {op}"}
         except ValueError as e:
             return {"ok": False, "error": str(e)}
         except Exception as e:
@@ -969,17 +969,17 @@ class Cortex(NervousNode):
     # ------------------------------------------------------------------
 
     def repl(self):
-        """交互式皮层控制台。"""
+        """交互式中枢控制台。"""
         import sys
         print("=" * 60)
-        print(f"大脑皮层控制台 — {self.node_id} (level {self.level})")
-        print(f"总线端点: {self.base_url}  输入 help 查看命令")
+        print(f"Cortex console - {self.node_id} (level {self.level})")
+        print(f"Bus endpoint: {self.base_url}  type help for commands")
         print("=" * 60)
         while True:
             try:
                 line = input("cortex> ").strip()
             except (EOFError, KeyboardInterrupt):
-                print("\n皮层控制台退出")
+                print("\nCortex console exiting")
                 break
             if not line:
                 continue
@@ -988,18 +988,18 @@ class Cortex(NervousNode):
             args = parts[1:]
             try:
                 if cmd in ("quit", "exit", "q"):
-                    print("皮层控制台退出")
+                    print("Cortex console exiting")
                     break
                 elif cmd == "help" or cmd == "?":
                     self._repl_help()
                 elif cmd == "topo":
                     print(self.topology.render_ascii())
-                    print(f"(共 {self.topology.size()} 个节点)")
+                    print(f"({self.topology.size()} nodes total)")
                 elif cmd == "ping":
                     print(json.dumps(self.ping(args[0]), ensure_ascii=False, indent=2))
                 elif cmd == "exec":
                     if len(args) < 2:
-                        print("用法: exec <node_id> <action> [perm]")
+                        print("usage: exec <node_id> <action> [perm]")
                         continue
                     perm = args[2] if len(args) > 2 else "process_exec"
                     print(json.dumps(self.exec_cmd(args[0], args[1], perm=perm),
@@ -1010,19 +1010,19 @@ class Cortex(NervousNode):
                     print(json.dumps(self.reload_node(args[0]), ensure_ascii=False, indent=2))
                 elif cmd == "grant":
                     if len(args) < 3:
-                        print("用法: grant <node_id|node_kind|*> <target> <perm>")
+                        print("usage: grant <node_id|node_kind|*> <target> <perm>")
                         continue
                     print(json.dumps(self.perm_grant(args[0], args[1], args[2]),
                                      ensure_ascii=False, indent=2))
                 elif cmd == "revoke":
                     if len(args) < 3:
-                        print("用法: revoke <node_id|node_kind|*> <target> <perm>")
+                        print("usage: revoke <node_id|node_kind|*> <target> <perm>")
                         continue
                     print(json.dumps(self.perm_revoke(args[0], args[1], args[2]),
                                      ensure_ascii=False, indent=2))
                 elif cmd == "set":
                     if len(args) < 3:
-                        print("用法: set <node_id|node_kind|*> <target> <json>")
+                        print("usage: set <node_id|node_kind|*> <target> <json>")
                         continue
                     allows = json.loads(args[2])
                     print(json.dumps(self.perm_set(args[0], args[1], allows),
@@ -1043,7 +1043,7 @@ class Cortex(NervousNode):
                     # subpoena <node_id> <basis> [tier_kb] [approved]
                     # basis: confidence_low / vote_tie / evidence_conflict / human_named
                     if len(args) < 2:
-                        print("用法: subpoena <node_id> <basis> [tier_kb] "
+                        print("usage: subpoena <node_id> <basis> [tier_kb] "
                               "[approved]  (basis: confidence_low/vote_tie/"
                               "evidence_conflict/human_named)")
                         continue
@@ -1080,10 +1080,10 @@ class Cortex(NervousNode):
                 elif cmd == "behavior":
                     # 行为基线分级视图（黄劣化/黑疑似恶意）
                     r = self.behavior_view()
-                    print(f"行为基线分级（{r.get('count')} 个节点）：")
+                    print(f"Behavior baseline grading ({r.get('count')} nodes):")
                     for v in r.get("verdicts", []):
-                        marks = {"ok": "[OK]", "yellow": "[黄·复核]",
-                                 "black": "[黑·隔离]"}
+                        marks = {"ok": "[OK]", "yellow": "[YELLOW/review]",
+                                 "black": "[BLACK/isolate]"}
                         print(f"  {marks.get(v['level'], v['level'])} "
                               f"{v['node_id']} status={v.get('status')} "
                               f"frozen={v.get('frozen')} "
@@ -1095,7 +1095,7 @@ class Cortex(NervousNode):
                 elif cmd == "sweep":
                     self._sweep_once()
                     print(self.topology.render_ascii())
-                    print(f"(清扫完成，共 {self.topology.size()} 个节点)")
+                    print(f"(sweep complete; {self.topology.size()} nodes total)")
                 elif cmd == "reports":
                     n = int(args[0]) if args else 20
                     for r in self.get_reports()[-n:]:
@@ -1114,38 +1114,38 @@ class Cortex(NervousNode):
                         print(f"[{time.strftime('%H:%M:%S', time.localtime(a['ts']))}] "
                               f"{a.get('from')} {a.get('event')}  {a.get('detail', '')[:200]}")
                 else:
-                    print(f"未知命令: {cmd}（输入 help 查看帮助）")
+                    print(f"unknown command: {cmd} (type help for help)")
             except IndexError:
-                print("参数不足（输入 help 查看用法）")
+                print("insufficient arguments (type help for usage)")
             except Exception as e:
-                print(f"错误: {e}")
+                print(f"error: {e}")
 
     def _repl_help(self):
-        print("""命令：
-  topo                         查看拓扑树
-  ping <node_id>               探活指定节点
-  exec <node_id> <action> [perm]   下发执行指令
-  stop <node_id>               停止节点任务
-  reload <node_id>             重载节点配置
-  grant <type> <target> <perm> 授予权限（type: node_id / node_kind / *）
-  revoke <type> <target> <perm> 撤销权限
-  set <type> <target> <json>   整体覆盖权限，如: set node_kind bot '{"process_shell": false}'
-  freeze <node_id> [reason]    签发冻结（拒新任务、保活取证）
-  unfreeze <node_id> [reason]  解除冻结（复核后康复回树）
+        print("""Commands:
+  topo                         show the topology tree
+  ping <node_id>               probe a node
+  exec <node_id> <action> [perm]   dispatch an exec command
+  stop <node_id>               stop a node's task
+  reload <node_id>             reload a node's config
+  grant <type> <target> <perm> grant a permission (type: node_id / node_kind / *)
+  revoke <type> <target> <perm> revoke a permission
+  set <type> <target> <json>   overwrite permissions as a whole, e.g.: set node_kind bot '{"process_shell": false}'
+  freeze <node_id> [reason]    issue a freeze (reject new tasks, keep alive for forensics)
+  unfreeze <node_id> [reason]  lift the freeze (recover back into the tree after review)
   subpoena <node_id> <basis> [tier_kb] [approved]
-                               签发传票（level 0 专属）
+                               issue a subpoena (level 0 only)
                                basis: confidence_low/vote_tie/
                                evidence_conflict/human_named
-                               tier_kb: 64/128/256/512（>128 需 approved）
-  box [subpoena_id]            查看隔离取证箱（RAW/UNTRUSTED，不销毁）
-  box_read <subpoena_id>       读取取证包（读取即焚，用后即毁）
-  box_purge [subpoena_id]      销毁取证包
-  subpoena_audit [n]           传票签发记录（黑级事件）
-  behavior                     行为基线分级（黄劣化/黑疑似恶意）
-  sync                         向全部后代广播拓扑
-  sweep                        手动执行一次失联清扫 + 救树
-  reports [n]                  查看最近上报
-  audit [n]                    查看皮层审计
-  perm_audit [n]               查看权限面审计（皮层权限操作 + 节点上行
-                               perm.denied / perm.changed 汇聚）
-  help / quit                  帮助 / 退出""")
+                               tier_kb: 64/128/256/512 (>128 requires approved)
+  box [subpoena_id]            view the isolation evidence box (RAW/UNTRUSTED, not destroyed)
+  box_read <subpoena_id>       read the evidence package (burn after reading)
+  box_purge [subpoena_id]      destroy the evidence package
+  subpoena_audit [n]           subpoena issuance log (black-level events)
+  behavior                     behavior baseline grading (yellow degraded / black suspected malicious)
+  sync                         broadcast the topology to all descendants
+  sweep                        manually run one lost-node sweep + tree rescue
+  reports [n]                  view recent reports
+  audit [n]                    view cortex audit
+  perm_audit [n]               view the permission-plane audit (cortex permission ops + node uplink
+                               perm.denied / perm.changed aggregation)
+  help / quit                  help / quit""")

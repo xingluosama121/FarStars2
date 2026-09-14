@@ -1,6 +1,8 @@
 # NORP Agent Developer Manual
 
-> **Version**: 2.2.1 | **Brand**: FarStars (远星) | **License**: Copyright (c) 2026 xingluosama121, MIT Licensed
+> **Version**: 2.2.2 | **Brand**: FarStars (远星) | **License**: Copyright (c) 2026 xingluosama121, MIT Licensed
+>
+> **Repository**: https://github.com/xingluosama121/farstars2 | **PyPI**: https://pypi.org/project/norpagent/
 
 ---
 
@@ -22,7 +24,6 @@
 - [Chapter 14 Embedded and Ultra-High-Concurrency Deployment](#chapter-14-embedded-and-ultra-high-concurrency-deployment)
 - [Chapter 15 Work Rollback: Snapshots / Undo / Redo / Crash Rescue / Safe Mode](#chapter-15-work-rollback-snapshots--undo--redo--crash-rescue--safe-mode)
 - [Chapter 16 Library Integration Examples](#chapter-16-library-integration-examples)
-- [Chapter 17 Testing and Debugging](#chapter-17-testing-and-debugging)
 - [Chapter 18 Migration Guide](#chapter-18-migration-guide)
 - [Chapter 19 FAQ](#chapter-19-faq)
 - [Appendix A Architecture Slot Quick Reference](#appendix-a-architecture-slot-quick-reference)
@@ -600,9 +601,12 @@ npa.remount(model="myapp.model:create")      # replace a module file at runtime 
 ```
 
 Underlying chain: `npa.remount()` → `engine.remount()` → `ArchLayer.remount()`.
-Before re-resolving a string address, the **module cache and .pyc bytecode cache are
-invalidated**, so "edit the module file → remount" swaps in the changed code at runtime
-without restarting the process.
+**Only when the outermost value passed in is itself a string** are the **module cache
+and .pyc bytecode cache invalidated** before re-resolution; dict / list forms (even
+when their values are address strings) do not trigger invalidation (only the outermost
+`isinstance(value, str)` check invalidates the cache; it does not recurse into dict /
+list) — see 25.2.6. So "edit the module file → remount (**bare string address**)"
+swaps in the changed code at runtime without restarting the process.
 
 Replacement semantics grouped by slot:
 
@@ -3429,23 +3433,6 @@ lock contention.
 too slow; enlarge the buffer or inspect the consumers), `max_buffered` (peak buffer
 depth per connection).
 
-### 14.4 How to Verify
-
-In-library verification scripts (`test/`):
-
-```bash
-python test/_verify_embedded_concurrency.py   # 34 items: minimal assembly / lazy imports / e2e / concurrency correctness / throughput
-python test/_smoke_webui_09.py                # WebUI: lazy disk I/O / page cache / backpressure hot change / HTTP concurrency / SSE
-python test/_smoke_embedded.py                # embedded preset e2e
-```
-
-Coverage points: `install_core` component whitelist and blacklist,
-`import norpagent.builtin` does not pull sqlite3 / http.server, embedded defaults to
-headless + mock fallback, environment variables tighten the worker pool, EventBus
-copy-on-write concurrent subscribe/unsubscribe correctness, submit interrupt
-wakeup, SSE three policies and hot change, 40 concurrent HTTP, disconnect
-reclamation.
-
 ---
 
 ## Chapter 15 Work Rollback: Snapshots / Undo / Redo / Crash Rescue / Safe Mode
@@ -3842,25 +3829,6 @@ fe = npa.current().frontend
 
 ---
 
-## Chapter 17 Testing and Debugging
-
-```bash
-python tests/test_p1_smoke.py    # kernel/protocol smoke
-python tests/test_p2_smoke.py    # adapters/tools/sessions
-python tests/test_p3_smoke.py    # context/scheduler/sandbox/security/plugins/Web
-python tests/test_p4_smoke.py    # hooks/security/PTC/isolation
-python tests/test_p5_arch.py     # architecture layer/address functions/npa()/nasyncio
-```
-
-Debugging aids:
-
-```python
-eng = npa.current()
-print(eng.state)              # engine state
-print(eng.layer.describe())   # assembly manifest
-print(eng.last_result)        # most recent task result
-```
-
 ---
 
 ## Chapter 18 Migration Guide
@@ -4033,7 +4001,7 @@ assembly slots (session / sandbox / scheduler / ui / agent_runtime / preset /
 context_store / project_manager) trigger an AgentRuntime hot rebuild;
 frontend / async_loop stop the old and start the new; logger / storage /
 error_handler update immediately. String addresses invalidate the module cache
-and .pyc before remounting, so "edit the module file →
+and .pyc before remounting (see 25.2.6), so "edit the module file →
 npa.remount(model="myapp.model:create")" is hot reload. Repeatedly mounted
 architecture-level subscriptions are unsubscribed first then remounted, never
 stacking. See 3.7.
@@ -4713,23 +4681,6 @@ would be added alongside).
   is full tasks pile up indefinitely — no rejection policy, no task time budget
   (boundary and stuck-task fallback matrix in 4.6.4).
 
-### 23.5 How to Verify
-
-The repository ships a full set of specialized verification scripts
-(`test/_verify_*.py` / `test/_smoke_*.py`):
-
-| Script | Coverage |
-|---|---|
-| `_verify_install.py` / `_verify_wheel.py` | installation and packaging |
-| `_verify_js*.py` / `_verify_front.py` / `_verify_css_*` | frontend pages and assets |
-| `_e2e_webui.py` / `_e2e_shot.py` | WebUI end-to-end and screenshots |
-| `_verify_ppt_*.py` / `_pixel_check*.py` | presentations and pixel checks |
-| `_final_check.py` / `_verify_coverage.py` | overall regression and coverage audit |
-
-Performance-benchmark methodology suggestion: a fixed input set + a fixed tool set
-(the minimal preset), comparing output quality, step count and token consumption
-across models / component implementations (7.3 model benchmarks).
-
 ---
 
 ## Chapter 24 Rescue Mode: Low-Level Loop Control and Human Takeover
@@ -4802,8 +4753,8 @@ operate it directly from any script:
 3. **Select timeout ceiling**: `_run_once` clamps the select wait to 24 hours
    (`_MAX_SELECT_TIMEOUT`, the same value as CPython asyncio). Far-future timers
    (`sleep(1e18)`, distant `call_later`) make `select()` raise `OverflowError` on
-   Windows and crash the loop thread — a real defect found by the violent stress
-   suite (24.2.6) and fixed: the loop wakes every 24h to re-check the timer heap,
+    Windows and crash the loop thread — a real defect,
+    and fixed: the loop wakes every 24h to re-check the timer heap,
    and `abort_main()` still interrupts at any time.
 
 #### 24.2.2 Protocol-Level Control (NasyncioLoopRuntime)
@@ -4901,23 +4852,6 @@ When the loop thread is stuck in `select()` or a coroutine awaits too long:
    — the rescue fallback is daemon threads that die with the process, or
    `RescueToolEnvironment.call_tool(timeout=...)`'s hard timeout that abandons the
    worker thread.
-
-#### 24.2.6 Violent Stress Suite for the Loop Core (test/stress_nasyncio_core.py)
-
-A new 35-item violent stress suite covering "testway.txt selections + event-loop
-supplements":
-
-| Source | Items |
-|---|---|
-| testway.txt selections (B/C/D/E mappings) | cold start & readiness (B01), fast start/stop x200 (D10), lifecycle & resource release (B02/B24), 100/500/1000 concurrency (D02), 5000 batch (D08), 200k cross-thread storm (D05), timeout & inner cancel (B17/C02), exception isolation (C04), empty & extreme numeric input (D15/D16), deadlock rejection (C14), 500k-handle resource exhaustion (C17), 2000-deep recursion (D19), duplicate-callback storm (D27), memory baseline (D11), 60s mixed soak (D09), hard-stop latency (B15), watchdog interrupt (E06) |
-| supplements (not in the matrix) | 8-thread wakeup race, 1000-timer precision & shuffled registration order, 100k cancel storm, ready queue does not starve timers (fairness), single-thread binding, cross-thread Future completion, cross-thread Event wakeup, Lock/Condition contention, Task.cancel pierce (BaseException), executor result/exception relay, closed-loop rejection, idle loop does not busy-spin (select blocks), 1000 concurrent sleep timers, subprocess-cancel kills child (zombie protection) |
-
-Run: `python test/stress_nasyncio_core.py` (~2 minutes, including the 60s soak).
-
-**Real defect found and fixed by the suite**: `select()` timeout overflow
-(Windows `OverflowError: timestamp out of range`) — fixed by the
-`_MAX_SELECT_TIMEOUT` clamp (24.2.1 item 3). All other items are confirming
-passes of existing behavior (35 items / 110 assertions / 0 failures).
 
 ### 24.3 Operating Tools by Hand (Human Takeover)
 
@@ -5276,7 +5210,7 @@ scheduler / frontend / loop / generic component), the flow is exactly the same
 
 Hot reload is the natural extension of step 4: `npa.remount(session=
 "myapp.sessions:create")` re-resolves the address at runtime and **first
-invalidates the module cache and .pyc files** (3.7), so "edit the implementation
+invalidates the module cache and .pyc files** (3.7; see 25.2.6), so "edit the implementation
 code → remount" hot-updates it without restarting the process.
 
 ---
@@ -5455,7 +5389,9 @@ The complete set of Registry registration APIs (`norpagent.kernel.registry`):
 
 The tool set is a **component slot**; `npa.remount(tools=...)` takes effect at
 the next `run()` (the agent loop re-resolves tool schemas on every run). All
-three forms are hot-reloadable:
+three forms can be **hot-mounted (remounted)**; note, however, that
+**hot-reloading edited code (picking up the new code on disk) only works with a
+bare string address** — see below.
 
 ```python
 npa.remount(tools=["echo", "weather"])                    # registered-name list
@@ -5500,14 +5436,44 @@ failure. Therefore the assembler strictly resolves every "address-like string"
 silently"). **Strings that are not address-like (e.g. `"high"`, `"./dir"`)
 are unaffected and keep their literal semantics**.
 
-Another hot-reload detail: **address hot reload invalidates the module cache
-first**. `remount` runs `_invalidate_address_module` on string addresses —
-deletes the .pyc corresponding to `__cached__` and pops the `sys.modules`
-entry, so the next resolution re-imports from disk (3.7). Therefore "edit
-`myapp/weather_tool.py` → `npa.remount(tools={"weather":
-"myapp.weather_tool:create"})`" hot-updates the code. Note: **instance /
-registered-name forms do no module invalidation** (there is no address to
-invalidate); use the address form after editing code.
+Another hot-reload detail (**the easiest trap to fall into**): **only the
+"bare string address" form triggers module-cache invalidation**. The check in
+`remount` is `if isinstance(value, str): self._invalidate_address_module(value)`
+(`layer.py` L243) — it **looks only at whether the outermost value is a
+string**; it neither recurses into dict values nor iterates list elements.
+Comparison across forms:
+
+| Form passed in | Cache invalidated | Hot reload after editing code |
+|---|---|---|
+| `tools="myapp.weather_tool:create"` (bare string address) | yes | **yes** |
+| `tools={"weather": "myapp.weather_tool:create"}` (dict, value is an address) | no | **no** (hits the old module in `sys.modules`) |
+| `tools=["myapp.weather_tool:create"]` (list element is an address) | no | **no** |
+| `tools={"weather": WeatherTool()}` (instance) / `tools="weather"` (registered name) | no | no (no address to invalidate) |
+
+So when "editing `myapp/weather_tool.py` → wanting to hot-update the code",
+**you must use a bare string address**:
+
+```python
+# correct: triggers cache invalidation, picks up the new code on disk
+npa.remount(tools="myapp.weather_tool:create")
+
+# counter-example: mounts fine and raises nothing, but hits the old module in
+# sys.modules, so the edited code does not take effect
+npa.remount(tools={"weather": "myapp.weather_tool:create"})
+```
+
+`_invalidate_address_module` does two-step invalidation: deletes the .pyc
+corresponding to `__cached__` and pops the `sys.modules` entry, so the next
+resolution re-imports from disk (3.7). Note it only handles the module name in
+the address (the `;` sub-config and `:attr` are not part of the module path).
+
+**Submodules are not invalidated**: the invalidation step pops only the
+**exact module name** in the address (`sys.modules.pop(module_name, None)`,
+`layer.py` L288); it does not recurse into submodules. If the address points
+to a **package** while the implementation lives in an **already-imported
+submodule**, editing the submodule file and remounting will not reload it —
+point the address directly at the leaf module (e.g. `pkg.impl:create`, not
+`pkg:create`).
 
 Debugging tip: on a failed hot reload check the assembly manifest of
 `eng.layer.describe()` (3.5) and `reg.list_tools()` to confirm the name was
@@ -5637,7 +5603,7 @@ npa(model="my_http")
 npa(model="myapp.models.http_json:create;endpoint=http://127.0.0.1:8000/v1")
 npa(model=HttpJsonModel(endpoint="..."))
 
-# hot reload: swap model / config / code (the address form invalidates the module cache)
+# hot reload: swap model / config / code (the bare string address form invalidates the module cache)
 npa.remount(model="myapp.models.http_json:create;endpoint=http://127.0.0.1:9000/v1")
 ```
 
@@ -6309,7 +6275,7 @@ Exceptions and boundaries:
   such as `"high"`, `"./data"`, `"sqlite"` keep literal / name semantics.
 
 **The module cache is invalidated before hot reload**: `remount` deletes the
-.pyc for string addresses, pops `sys.modules`, then re-imports (3.7). Edit
+.pyc for string addresses, pops `sys.modules`, then re-imports (3.7; see 25.2.6). Edit
 code → remount and it takes effect; instance forms do no cache invalidation.
 To debug a failed hot reload use `layer.describe()` for the assembly manifest
 and the `AddressError` traceback to locate the address.
@@ -6721,12 +6687,15 @@ The simplest approach: use the `reg` produced by `build_registry(layer)` for
 programmatic assembly, and `npa()` slot parameters for declarative assembly.
 
 Module-cache invalidation on hot reload (section 3.7): `remount` first runs
-`_invalidate_address_module` on string addresses — it deletes the .pyc at
-`module.__cached__` and pops the `sys.modules` entry, so the next resolution
-re-imports from disk. Hence "edit `myapp/weather_tool.py` →
-`npa.remount(tools={"weather": "myapp.weather_tool:create"})`" hot-updates the
-code; **instance / registered-name forms have no address to invalidate — use
-the address form after editing code**.
+`_invalidate_address_module` **only when the outermost value is a bare string
+address** — it deletes the .pyc at `module.__cached__` and pops the
+`sys.modules` entry, so the next resolution re-imports from disk. So to
+hot-update code you must use a bare string address: "edit
+`myapp/weather_tool.py` → `npa.remount(tools="myapp.weather_tool:create")`";
+**dict / list forms whose values are addresses (e.g. `tools={"weather":
+"…:create"}`) do not trigger invalidation and will hit the old module in
+`sys.modules`, so the edited code does not take effect**; instance /
+registered-name forms have no address to invalidate. See 25.2.6 for details.
 
 Re-entrancy safety: `apply_slot_overrides` may run repeatedly against a
 running registry (every `npa.remount` calls it); before re-applying, it
@@ -7258,18 +7227,21 @@ layer.remount("model")                      # re-resolve with the current config
 layer.remount("model", None)                # clear the config, fall back to the default logic
 ```
 
-A string address passed to `remount` first runs two-step cache invalidation
-(`_invalidate_address_module`):
+`remount` first runs two-step cache invalidation (`_invalidate_address_module`)
+**only when the outermost value passed in is a string** (the `if isinstance(value,
+str)` check in `layer.py`; it does not recurse into dict / list):
 
 1. delete the module's bytecode cache (`module.__cached__`'s .pyc) — otherwise, if a
    same-size file is rewritten within the same second, importlib may judge the "cache
    is still fresh" and re-importing would fetch the old code;
 2. pop the `sys.modules` entry — the next resolution re-imports from disk.
 
-Thus the hot-reload closed loop "edit code → remount → new code takes effect" holds.
-Custom slots (registered via `register_slot`, 3.8) support remount too, resolving per
-the spec at registration time; after `replace=True` hot-replaces a spec, remount
-resolves per the new spec.
+Thus the hot-reload closed loop "edit code → remount (**bare string address**) → new
+code takes effect" holds; **dict / list forms whose values are addresses do not
+trigger invalidation** and will still hit the old module in `sys.modules` (see
+25.2.6). Custom slots (registered via `register_slot`, 3.8) support remount too,
+resolving per the spec at registration time; after `replace=True` hot-replaces a spec,
+remount resolves per the new spec.
 
 #### 27.4.7 Relationship with the Slot Table
 
@@ -7695,6 +7667,7 @@ finally:
 |---|---|---|
 | subscribed but never receive events | module-level APIs default to the **process default system**, which is a different bus than the engine's | pass `system=engine.registry` explicitly, or use `engine.registry.hooks` |
 | `remount(tools=...)` raises `AddressError` | the value looks like an address but cannot be resolved (red line) | check the module path and attribute; use a registered name or a valid instance |
+| old logic still runs after editing code + `remount` | you used a dict / list address value, which does not invalidate the module cache (only an outermost bare string does) | use a bare string address: `npa.remount(tools="myapp.weather_tool:create")` (25.2.6) |
 | `wait` never returns | wrong event name / timeout is 0 (means indefinite) | confirm with `subscriber_count` first; give an explicit timeout |
 | old logic still active after hot mount | the slot does not rebuild the AgentRuntime (`remount_rebuild_agent=False`) | check the slot spec (Appendix A); assembly-type custom slots must set it True |
 | the veto does not take effect | you used `emit` instead of mutating dispatch | mutating semantics require `intercept` (9.3) |
@@ -8190,7 +8163,6 @@ src/norpagent/cnb/           # implementation location since v1.0.7
 src/nervous_bus/             # compatibility shim since v1.0.7 (re-exports norpagent.cnb)
 ??? __init__.py      # symbol re-export + sys.modules submodule injection + version follows norpagent
 ??? cli.py / demo.py # physical thin files (python -m entries run through the file path)
-??? test_cnb.py / test_deep_tree.py / test_e2e.py   # self-tests (ship with the shim; commands unchanged)
 ```
 
 The transport layer (`bus.py`) is zero-dependency (stdlib only): each node runs a `ThreadingHTTPServer` as its bus access point and the client delivers via `urllib`. Bus endpoints:
@@ -8476,26 +8448,6 @@ Decision rules (B4 revision — pure time order):
 6. **Loopback by default**: binds `127.0.0.1`; cross-machine deployment needs an explicit host and a trusted network (TLS/signing recommended).
 7. **Cortex cannot be controlled from below**: the cortex (level 0) has no parent, so no downlink can pass the ancestor check — lower levels can never rewrite higher levels.
 
-### 30.11 Tests and Verification
-
-| Suite | Coverage | Result |
-|---|---|---|
-| `test_cnb.py` (60 items) | tree topology chain, level-by-level registration forwarding, layered levels, uplink read-only, downlink obedience, permission control (node_id/node_kind/*), privilege-escalation blocking (low->high / same-level / control fields / level forgery / parent forgery / kind spoofing / non-ancestor reporting), deregistration with **live-child rescue promotion**, topology broadcast, control endpoint | 52/52 pass |
-| `test_e2e.py` (13 items) | real multi-process (main.py entry: 1 cortex + 3 nodes), full CLI chain, execution denied after tightening, privilege-escalation blocking, heartbeat convergence | 13/13 pass |
-| `test/test_cnb_automount.py` (12 checks, new 2026-09) | ordinary engine `NORP_CNB_*` auto-mount (incl. the `NORP_CNB_MANAGED=1` skip switch); exec action whitelist (run_task/status/stop_task; missing-prompt / unknown-action rejections; task_done uplink); cmd.stop stops tasks and keeps the instance alive; cmd.reload env re-read + plugin hot-reload face; cmd.exec denied after perm tightening and restored after the grant; shutdown unmount; loop.submit_async deep cancellation | 12/12 pass (verified 2026-09-05) |
-| `test_deep_tree.py` (36 checks, new 2026-09-05) | 4-level chain (cortex->tech->rnd->dev): deep parent/child relations (B1), de-duplicated ancestor chains (B6), deep heartbeat/event/request convergence (B2), rescue after a middle layer exits normally (B3), rescue after a middle layer crashes (B3 crash / B5), time-ordered permission tightening and grants (B4), custom heartbeat status passthrough (B7), automatic broadcast on register (B8), auto re-registration after a rejected heartbeat (self-healing), dead-node grace-then-drop | 30/30 pass |
-| `test/test_cnb_kernel_actions.py` (32 checks, new v1.0.7) | B 11 multi-process + A 21 in-process kernel action surface (see the matrix in 30.16) | 32/32 green |
-| `test/test_cnb_tree_suite.py` (56 checks, new 2026-09-12 feedback round) | explicit neural-tree definitions: three sources (dict / JSON / PY), item-by-item required-parameter errors, port-style parents and `level:N` rotation, in-process assembly with diff reshape, file-watch reshape, auto-reconcile, multi-process process tree, np integration and error semantics, CLI | 56/56 green |
-
-```bash
-python -m nervous_bus.test_cnb
-python -m nervous_bus.test_e2e
-python -m nervous_bus.test_deep_tree     # deep-tree regression (4-level chain)
-python -m nervous_bus.demo               # in-process neural-tree demo
-python test/test_cnb_kernel_actions.py   # kernel action surface (needs PYTHONPATH=src)
-python test/test_cnb_tree_suite.py       # explicit neural-tree definition acceptance (needs PYTHONPATH=src)
-```
-
 ### 30.12 Integration Points with the norpagent Core (actual locations, v1.0.2+)
 
 | File | Change | Description |
@@ -8508,7 +8460,6 @@ python test/test_cnb_tree_suite.py       # explicit neural-tree definition accep
 | `norpagent/runtime/cnb.py` (forwarding layer) | re-exports `norpagent.cnb.engine` (`CnbAdapter` / `setup_cnb` / `KERNEL_ACTIONS` / legacy `EXEC_ACTIONS`) | `NorpEngine._setup_cnb()` keeps importing `setup_cnb` from this path (zero engine changes) |
 | `norpagent/cnb/engine.py` (new since v1.0.7) | `CnbAdapter`: env reading → NervousNode assembly → **14 kernel actions registered** (KERNEL_ACTIONS) → background mount (retries / degrade / unmount); heartbeat provider (engine_state / active_tasks / version / actions) | full implementation of 30.8 / 30.16; includes the `NORP_CNB_MANAGED` skip switch |
 | `norpagent/loops/nasyncio.py` | optional extension `submit_async` (`NasyncTaskHandle`, per-task cancellable handle) | the loop-layer foundation for task cancellation (the engine probes it with hasattr; degrades when missing) |
-| `nervous_bus/test_e2e.py` | ROOT resolution climbs to the repository root that contains `main.py` | `python -m nervous_bus.test_e2e` works under the v1.0.2+ src layout (since v1.0.7 through the shim onto `norpagent.cnb`) |
 
 Design boundaries (recorded honestly): this release is designed for **same-machine multi-instance** (loopback transport, no encryption); cross-machine deployment needs TLS and node signing. ① The auto-mount contract reads the `NORP_CNB_*` env vars only (config.json is not consulted); ② the `cmd.exec` action surface is a whitelist (`run_task` / `status` / `stop_task`) — unknown actions and missing prompts are rejected and audited; ③ cortex permission commands take effect immediately on the **CNB command surface** (the node permission table is checked before every `cmd.exec`); pushing cortex permissions into the **in-process tool-call chain** is a future `permission_cascade.PermissionCascade` integration (the `perm_changed` callback is already reserved); ④ kind / level / parent / port are immutable after registration (identity anti-forgery); `reload` only hot-updates runtime knobs and external plugins.
 
@@ -8540,7 +8491,7 @@ Handle surface (`EngineTaskHandle`): `cancel()` / `cancelled()` / `done()` / `wa
 
 ### 30.14 Deep-Tree Fix: Shallow-Self-Consistent, Deep-Broken Remediation (2026-09-05)
 
-**Background**: the official suites (test_cnb 51 + test_e2e 13 + automount 12) only covered ≤2-level flat scenarios (atoms mounted straight on the cortex) and never ≥3-level chained forwarding. An audit of a cortex → tech → rnd → dev four-level chain found 9 defects on the registration / uplink / link-loss paths, 3 of them high severity. This section records the fixes one by one (each is covered by the deep-tree regression suite, see 30.11).
+**Background**: an audit of a cortex → tech → rnd → dev four-level chain found 9 defects on the registration / uplink / link-loss paths, 3 of them high severity. This section records the fixes one by one.
 
 #### B1 (high) deep-registration collapse — `via` overwritten at every hop
 
@@ -8558,7 +8509,7 @@ Handle surface (`EngineTaskHandle`): `cancel()` / `cancelled()` / `done()` / `wa
 - Fix (`node.py _rescue_children` + `cortex.py` sweep thread):
   1. **Clean-exit path**: on `report.deregister(X)`, rescue first — promote each direct child of X **under this node** (`topology.set_parent`, maintaining children lists on both sides) and send **`cmd.reroot`** (new downlink: carries the new parent id / bus URL / grandparent chain) telling the child to re-parent; the child updates `parent_url` / `parent_node_id` / `_ancestors` and **re-registers immediately** (heartbeats and reports then go straight to the new parent). Only then is X deregistered (its children already moved; only X itself is removed). Every level of the chain runs the same logic, so the cortex converges to the authoritative view.
   2. **Crash path** (no deregister): the cortex gained a **lost-node sweep thread** (`Cortex(sweep_interval / dead_timeout / drop_grace)`, `_sweep_loop` finally calls the previously dead `sweep_dead`): no heartbeat beyond `dead_timeout` → marked dead; dead with children → rescue-promote; an entire branch past `drop_grace` → cascade-deregister; a dead leaf past `drop_grace` → deregister (the grace window protects live leaves whose report path broke because their parent died — once the parent is rescued and forwarding resumes, their heartbeats continue).
-  3. **Heartbeat self-healing**: any node whose heartbeat is rejected by its parent (parent restarted / cortex view rebuilt / misjudged by the sweep) re-registers automatically. test_deep_tree D07/D11/D12 verify: a crashed middle layer's live subtree is rescued and keeps reporting, a forgotten node re-attaches, and truly dead nodes are swept away.
+  3. **Heartbeat self-healing**: any node whose heartbeat is rejected by its parent (parent restarted / cortex view rebuilt / misjudged by the sweep) re-registers automatically: a crashed middle layer's live subtree is rescued and keeps reporting, a forgotten node re-attaches, and truly dead nodes are swept away.
 - Attached fixes: `topology.set_parent` used to append to the new parent's children **without removing the node from the old parent's children** (the old parent's cascade DFS then wrongly deleted already re-parented children) — it now maintains both sides; `Topology.register` raises an explicit `ValueError` when the parent is missing (previously a KeyError while maintaining children).
 
 #### B4 type-level revoke shadowed — permission decisions now pure time order
@@ -8590,7 +8541,6 @@ Handle surface (`EngineTaskHandle`): `cancel()` / `cancelled()` / `done()` / `wa
 
 **New downlink `cmd.reroot`** (registered in protocol.DOWNLINK_TYPES): reserved for parent-chain rescue — sent by an ancestor (typically the cortex) with payload `{parent_id, parent_url, ancestors}`; the receiving node updates its local parent pointer and ancestor chain, then re-registers immediately. It is still subject to the downlink ancestor check (non-ancestors are rejected).
 
-**Test defense**: new `src/nervous_bus/test_deep_tree.py` (30 checks on a 4-level chain): registration + crash + sweep + permission timing + heartbeat status + auto-broadcast are fully covered; test_cnb T48 (formerly "cascade deregistration") now asserts the "live child promoted by rescue" semantics.
 
 ### 30.15 Convergence Closure and Permission-Plane Audit (v1.0.6, 2026-09-05)
 
@@ -8603,7 +8553,6 @@ Handle surface (`EngineTaskHandle`): `cancel()` / `cancelled()` / `done()` / `wa
   1. **Prune**: cascade-deregister every local node absent from the snapshot (self excluded) — the convergence path after cortex sweep / deregistration;
   2. **Parent-pointer convergence**: when a snapshot node exists locally with a different parent, align via `topology.set_parent` to the cortex's authoritative view (level / kind tamper checks are kept as a defensive rejection);
   3. **Self-healing fallback**: transient gaps caused by pruning (in-flight registration uplinks, a slightly stale snapshot) recover through "heartbeat rejected → auto re-register"; live nodes are never lost.
-- Regression: `test_deep_tree` gains D13a–f — probe-x hangs directly under middle-layer rnd, is force-killed, the cortex sweep deregisters it, rnd's local topology prunes it, heartbeat `descendants` converge, and rnd's subtree view matches the cortex's (same id set). Suite 30→**36 all green**.
 
 #### Gap B: permission-plane audit uplink (kernel-side, converging on the cortex)
 
@@ -8612,9 +8561,8 @@ Handle surface (`EngineTaskHandle`): `cancel()` / `cancelled()` / `done()` / `wa
   1. **Node uplinks** (`node.py`): a `cmd.exec` rejected by the permission table uplinks `report.audit(event="perm.denied", detail={action, perm, path})`; a `cmd.perm.*` that takes effect uplinks `report.audit(event="perm.changed", detail={op, target_type, target, perm/allows, source})` (`_perm_uplink_audit`) and also records a local effect-audit line. Both climb hop by hop (middle layers record and forward, per the B2 semantics) and land in the cortex's reports ring.
   2. **Cortex records** (`cortex.py`): `_note_perm_op` writes the cortex's own grant/revoke/set into a structured permission-operation ring (500); `perm_audit(n)` merges cortex operations (`perm.op.*`) with uplinked node events (`perm.denied` / `perm.changed`) in reverse time order.
   3. **Read surface**: cortex REPL gains the `perm_audit [n]` command; the control endpoint gains `op=perm_audit` (`/cnb/ctrl`) — consumed directly by same-permission audit readers.
-- Regression: `test_cnb` gains T-A0~T-A6 — revoke + denial + grant sequences verify the cortex sees the uplinked `perm.denied` / `perm.changed`, a **deep node's denial is forwarded through a middle layer to the cortex**, and the `op=perm_audit` view contains both cortex operations and uplinked node events. Suite 52→**60 all green**.
 
-**Version**: norpagent **1.0.6**; the CNB protocol stays CNB/1.0 (semantic additions only: `cmd.topology.sync` snapshot-mirror convergence, and the `report.audit` permission-plane event convention). Full suites re-run: test_cnb 60 + test_deep_tree 36 + test_e2e 13 + automount 12 all green.
+**Version**: norpagent **1.0.6**; the CNB protocol stays CNB/1.0 (semantic additions only: `cmd.topology.sync` snapshot-mirror convergence, and the `report.audit` permission-plane event convention).
 
 ### 30.16 CNB Kernel Integration (v1.0.7): Internalized as a Kernel Submodule
 
@@ -8718,20 +8666,6 @@ full kernel engine by default** since v1.0.7:
 - unknown-action rejections and permission denials (`perm.denied`) keep uplinking
   as audits (Gap-B mechanism unchanged).
 
-#### 30.16.6 Test Matrix (verified 2026-09-05, all green)
-
-| Suite | Count | Notes |
-|---|---|---|
-| `python -m nervous_bus.test_cnb` | 60/60 | unit/integration (migration regression-free, through the shim) |
-| `python -m nervous_bus.test_deep_tree` | 36/36 | 4-level deep-tree regression |
-| `python -m nervous_bus.test_e2e` | 13/13 | real multi-process end-to-end (via main.py / norpagent.cnb.cli) |
-| `test/test_cnb_automount.py` | 12/12 | env auto-mount acceptance (four downlink surfaces + perm + managed) |
-| `test/test_cnb_kernel_actions.py` | A 21 + B 11 = 32/32 | v1.0.7 new: A in-process full action surface (snapshot/rollback/undo/redo/remount/stop_engine/heartbeat kernel state/task_started); B multi-process CLI default engines (engine=on, 15 actions, stop_engine process exit) |
-| `test/test_cnb_tree_suite.py` | 56/56 | **2026-09-12 feedback round**: explicit tree definitions (three sources / required-parameter validation / both assembly shapes / reshape / reconcile / np integration / CLI) |
-| `python -m nervous_bus.test_cnb_v200` | 44/44 | **v2.0.0 new**: task-molecule channel (mol six elements unchanged / acceptance receipt / mol_id threading), quarantine freeze (new-task rejection / alive forensics / never sweep-dead / recovery), behavior baselines (yellow→black escalation), subpoena evidence (tiers / volumes / isolation frame / read-to-burn / impersonation rejection / issuance audit) |
-
-Run: `PYTHONPATH=src python test/test_cnb_kernel_actions.py A` (or `B`).
-
 ---
 
 ### 30.17 Kernel Feature Extensions: Task-Molecule Channel / Quarantine Freeze / Behavior Baselines / Subpoena Evidence (v2.0.0 · FarStars 远星)
@@ -8772,9 +8706,6 @@ receipts traveling back up the tree.
   the kernel does not adjudicate); the cortex reports ring becomes the full
   mol lifecycle view.
 
-Verified (test matrix §30.11, `test_cnb_v200` S101~S109): the six elements
-round-trip deep-equal (no loss); task_done carries mol_id + acceptance; the
-audit trail is searchable by mol_id.
 
 #### 30.17.2 Quarantine Freeze (freeze / unfreeze)
 
@@ -8956,10 +8887,6 @@ norpagent exec --node norpbot-01 --action slot_describe \
 
 `CnbAdapter.bind_actions()` does both: direct kernel-action registration (source=kernel) + the complete-instance module mounted into the default slot `norpagent` (source=slot, fallback action surface — even a manual assembly without direct registration keeps the full instance operation surface); the heartbeat carries slot usage (`slots.count` / `slots.free`), so the cortex `reports` view shows each atom's slot usage and free capacity.
 
-#### 30.18.5 Verification
-
-`src/nervous_bus/test_cnb_slots.py` (51 checks), `test/test_cnb_kernel_actions.py` (32 checks) and the M4.5 violent mixed stress domain H (including the slot sub-domain) are all green.
-
 ---
 
 ### 30.19 Explicit Neural-Tree Definitions: No Preset Shape (2026-09-12 feedback round)
@@ -9042,10 +8969,6 @@ The `unbox` product entry supports it too: `norpagent unbox --cnb-tree tree.json
 - direct validation surfaces (`validate_cnb_config` / `np.remount`) keep their strict "explicit error" semantics for immediate handling;
 - the port rule is unchanged: no hard-wired default port (R-025); silent degradation is forbidden.
 
-#### 30.19.7 Verification
-
-`test/test_cnb_tree_suite.py` (56 checks): three sources, item-by-item required-parameter errors, three parent forms, in-process assembly with diff reshape, file-watch reshape, auto-reconcile, multi-process process trees, np integration and error semantics, CLI — all green; the CNB family and M4.5 re-run green.
-
 ## Chapter 31 Product Distribution: norpagent unbox
 
 ### 31.1 Purpose
@@ -9067,7 +8990,7 @@ The user's three-nots principle (R-007): no need to read the developer manual, n
 ```bash
 norpagent unbox                          # open-and-use in the browser (default port 8890)
 norpagent unbox --port 8891 --no-browser # custom port / do not open a browser
-norpagent unbox --smoke                  # self-check: assemble -> health check -> exit (CI/tests)
+norpagent unbox --smoke                  # self-check: assemble -> health check -> exit (CI)
 norpagent unbox --cnb --cnb-port 17811   # enable CNB explicitly (port required, R-025)
 norpagent unbox --cnb-parent http://127.0.0.1:17800 --cnb-port 17811
                                          # join an existing neural tree as a node
@@ -9134,7 +9057,7 @@ Flow: assemble -> Web health check (`/api/health`) -> (when CNB is enabled) tree
 - Tree node: waits for the engine mount status (`cnb_status == "mounted"`);
 - Neural tree (explicit definition): waits until `cnb_status` reaches `mounted`; `config-error` follows the "explicit error, never blocking startup" semantics and is reported honestly with the error text.
 
-The last line is `SMOKE OK` (exit 0) or `SMOKE FAILED` (exit 1); CI and tests can assert on it.
+The last line is `SMOKE OK` (exit 0) or `SMOKE FAILED` (exit 1); CI pipelines can assert on it.
 
 ### 31.6 Failure handling and rescue hints
 
@@ -9244,14 +9167,9 @@ One-click export / import in the frontend (settings panel): `/api/evolution/expo
 
 Evolution log (JSONL, default `~/.norpagent/evolution_log.jsonl`, override `NORPAGENT_EVOLUTION_LOG`) events: `hotswap.stage` / `hotswap.activate` / `hotswap.failed` / `hotswap.rollback` / `fspack.export` / `fspack.import` / `fspack.import.failed` / `fspack.bundle.export` / `fspack.bundle.import.ok` / `fspack.bundle.import.failed` / `evolution.command` and more.
 
-### 32.8 Verification
-
-- `test/test_evolution_suite.py` (49 checks) all green;
-- M4.5 violent mixed stress domain I (self-evolution: approvals / hot reload / packages / rhythm) all green.
-
 ### 32.9 Runtime Hardening: Health Checks, Auto-Revert and Sweeps (2026-09-12 feedback round)
 
-> Feedback question: will self-evolution break itself? The answer is not a promise but **layered defenses, each verifiable** (every mechanism below is covered by a suite).
+> Feedback question: will self-evolution break itself? The answer is not a promise but **layered defenses, each verifiable** (every mechanism below is verifiable).
 
 **Defense list (defense in depth)**:
 
@@ -9277,7 +9195,6 @@ board = evo.ProposalBoard()
 print(board.health_sweep())          # sweep all applied code proposals (also runs once at startup)
 ```
 
-Verification: `test/test_evo_hardening_suite.py` (19 checks: healthy pass / failure revert / custom revert / explicit failure without revert means / bad code refused / missing-file and tampered-original detection / sweep rollback + breaker / startup sweep / locked key refusal) green; the existing evolution suite (49) re-run green.
 
 ## Chapter 33 The Complete Plugin Development Guide
 
@@ -10017,23 +9934,17 @@ Replacement semantics shut the old adapter down first; mounting continues on a b
 - **Shared i18n** (`/assets/i18n.js`): one language set (`zh_CN / zh_TW / en`), one storage key (`np_lang`), API `get() / set(lang) / onChange(fn) / t(key) / register(dicts)`; legacy keys migrate automatically; the main frontend, the orbit console and the FLOW page share the state (including cross-tab storage sync).
 - **Chat & composer**: batch-clear / clear-all sessions (`POST /api/sessions/clear`); inline mode / model / workspace controls with a directory picker (`/api/fs/list`).
 
-### 34.9 Acceptance
-
-`test/test_v22_suite.py` (65 checks) green; the M4.5 suite extended (J16-J23 / K11-K14) and green; minimal kernel 147 / evolution 49 / CNB slots 51 / plugins 100 and the headless-browser frontend smoke all green; version numbers unified to 2.2.0.
-**2026-09-12 feedback round additions**: `test/test_cnb_tree_suite.py` (56 checks, explicit neural-tree definitions) and `test/test_evo_hardening_suite.py` (19 checks, evolution runtime hardening) all green; M4.5 219 / v2.2 65 / minimal kernel 147 / evolution 49 / CNB family (60 / 44 / 36 / 13 / 57 / 12 / 51 / 32) re-run green.
-
 ---
 
 ### 34.10 2026-09-12 Feedback-Round Additions (version policy / nasyncio / hardening / tree definitions)
 
 | Item | Location | Note |
 |---|---|---|
-| version policy | this manual's header + all active documents | active documents use the current release as the code baseline (that chapter was written at **2.2.0**; the present baseline is **2.2.1**); historical revision numbers indicate their own era only; archived documents stay as-is |
+| version policy | this manual's header + all active documents | active documents use the current release as the code baseline (that chapter was written at **2.2.0**; the present baseline is **2.2.2**); historical revision numbers indicate their own era only; archived documents stay as-is |
 | asyncio and nasyncio coexist | §4.7 + Chapter 19 FAQ | the standard `asyncio` and the self-developed `norpagent.nasyncio` do not conflict and can coexist in one process (not depending on it means no takeover) |
 | evolution runtime hardening | §32.9; `evolution/hotswap.py` / `evolution/proposals.py` | `verify_active` / `activate(health=...)` auto-revert / `health_sweep` / `bootstrap` startup sweep |
 | explicit CNB tree definitions | §30.19; `cnb/tree.py`; `norpagent tree validate|show|up` | no preset shape; three sources; item-by-item required-parameter errors; both assembly shapes; remount reshape / watched reshape / auto-reconcile; npa startup config errors never block startup |
 
-Verification: `test/test_cnb_tree_suite.py` 56 and `test/test_evo_hardening_suite.py` 19 green; M4.5 219 / v2.2 65 / minimal kernel 147 / evolution 49 / CNB family (60 / 44 / 36 / 13 / 57 / 12 / 51 / 32) re-run green.
 
 ## Appendix D Glossary
 
@@ -10586,21 +10497,6 @@ Bus endpoints: `POST /cnb/msg` (message delivery), `GET /cnb/health` (health che
 
 Status: `engine.cnb_status` (`not-mounted` / `managed-skip` / `mounting` / `mounted` / `failed` / `stopped` / `config-error` — a config error is explicit, the tree is not loaded and the host keeps running); config / mount error details via `engine.cnb_error`; `engine.cnb` returns the adapter (`status` / `perm_summary`). Cortex downlink surface: `exec` (action whitelist `run_task` / `status` / `stop_task`), `stop`, `reload`, `perm.*` — landing semantics in the §30.8 callback table.
 
-### J.7 Test Commands
-
-```bash
-# verified green on 2026-09-05 (v2.0.0); nervous_bus is the compat shim (test files ship with it; commands unchanged)
-python -m nervous_bus.test_cnb        # 60 unit/integration self-tests (incl. permission-plane audit T-A0~T-A6)
-python -m nervous_bus.test_e2e        # 13 real multi-process end-to-end tests (ROOT auto-located)
-python -m nervous_bus.test_deep_tree  # 36 deep-tree regression checks (4-level chain: collapse / convergence / rescue / sweep / permission time-order / heartbeat self-heal / broadcast / cache convergence)
-python -m nervous_bus.test_cnb_v200 # 44 v2.0.0 new-capability acceptance checks (mol channel / quarantine freeze / behavior baselines / subpoena evidence)
-python -m nervous_bus.test_cnb_slots  # 51 checks: universal slot system (R-024 / R-025: up-to-64 boundary / action conflicts / transactionality / instance module)
-python -m nervous_bus.demo            # in-process neural-tree demo
-python test/test_cnb_automount.py     # 12 checks: engine NORP_CNB_* auto-mount acceptance smoke (needs PYTHONPATH=src)
-python test/test_cnb_kernel_actions.py  # 32 checks: kernel action surface A 21 + B 11 (v1.0.7 new; needs PYTHONPATH=src)
-python test/test_cnb_tree_suite.py     # 56 checks: explicit neural-tree definitions (2026-09-12 feedback round; needs PYTHONPATH=src)
-```
-
 ### J.8 v2.0.0 New Command Surface and Constants (FarStars 远星)
 
 ```bash
@@ -10633,7 +10529,7 @@ adjudication) / `SUBPOENA_ENVELOPE` (`RAW/UNTRUSTED`). Brand:
 
 ## Revision history
 
-> **Version policy (2026-09-12 feedback round)**: this manual and all active documents use the current release **2.2.1** as the code baseline; version numbers in the historical revision notes below indicate the baseline of their time only, not the present state; archived documents (old manuals, historical update excerpts) stay as-is.
+> **Version policy (2026-09-12 feedback round)**: this manual and all active documents use the current release **2.2.2** as the code baseline; version numbers in the historical revision notes below indicate the baseline of their time only, not the present state; archived documents (old manuals, historical update excerpts) stay as-is.
 >
 > **2026-09-12 v2.2.1 defect closure (R-032 / R-033)**: ① **`ask_user` tool restored (R-033)** — the built-in tool set now exposes `ask_user`, so the model itself can ask the user to clarify a requirement / choose an option / confirm a risky operation (previously this existed only as a UI-adapter and kernel approval-chain mechanism, and the active tool set was missing it); registered in the standard / ptc / longrun presets and in both assembly entries (`install_defaults` / `install_core`); ② **token counting includes raw text (R-032)** — when the endpoint returns no usage, the backend estimates input + output from the **raw text** (raw markdown / LaTeX source plus the prompt); previously only the rendered visible output was counted and input was missing, making the reported total systematically low. Estimated numbers carry an `estimated` flag and the UI marks them with a "≈"; when the endpoint reports usage, the server numbers still win. All active version numbers are unified to **2.2.1**.
 >
@@ -10646,20 +10542,20 @@ adjudication) / `SUBPOENA_ENVELOPE` (`RAW/UNTRUSTED`). Brand:
 > **2026-09-11 update (CNB universal slots / product entry `norpagent unbox` / self-evolution system)**: ① **CNB universal slots (R-024 / R-025 revision)** — each nervous-bus node offers up to **64 universal slots** over the bus (models / tools / plugins / custom modules); the norpagent complete instance is not abandoned — it is wrapped as the standard pluggable module `NorpAgentModule` (kind=`norpagent-instance`), pluggable / removable / describable / replaceable (see §30.18); ② **product-distribution entry `norpagent unbox` (R-006 / R-014 / R-007)** — one command starts the ready-to-use self-evolving user software: a single powerful agent + Web console + declarative profile; CNB is off by default and needs a manually configured port to enable (see Chapter 31); ③ **self-evolution system (R-004 / R-005 / R-010 ~ R-012 / R-017)** — settings source of truth (SQLite + JSON), per-item checkbox approvals, code hot reload (originals untouched, one-click rollback), .fspack packages / .zip bundles, evolution rhythm and direction (see Chapter 32); ④ version numbers unified to **2.0.1** (`pyproject.toml` / main package / CNB / recovery in sync).
 > **2026-09-05 v2.0.0 (FarStars brand naming + kernel feature extensions)**: the official marketing name is **FarStars (远星)** — the `norpagent` call convention and kernel name stay unchanged (import / PyPI package name remain `norpagent`; FarStars is a brand overlay only: `__brand_cn__="远星"` / `__brand_en__="FarStars"` / `__display_name__="FarStars（远星）· norpagent"`). Four new feature groups are added — see the new **§30.17**: ① **task-molecule channel** — `run_task`'s `task_params` is now a full structured-JSON carrier: the mol six elements (mol_id / objective / acceptance / context_capsule / depends_on / budget / model_tier) reach the absorbing atom unchanged (no field loss); new kernel action **`task_records`** (action surface 14 → 15) exposes the acceptance-receipt datapane (original task_params + completion status); mol_id threads through node audits and the `task_started` / `task_done` uplink events with `acceptance` echoed back to the cortex. ② **quarantine freeze** — new downlinks `cmd.freeze` / `cmd.unfreeze`: a frozen node rejects new tasks (order intake closed; only read-only evidence actions pass, `frozen.reject` audits uplink), stays alive for forensics (heartbeats keep running and carry `status=frozen`, so the cortex scheduler drains it), never triggers sweep-dead, is auditable and reversible (unfreeze = recovery back to the tree). ③ **behavior baselines (kernel-side aggregation)** — nodes accumulate heartbeat-loss / audit-anomaly / task-failure counters locally and uplink the aggregate inside every heartbeat (compressed uplink); the cortex `behavior_view` grades each node yellow (degraded, human review) / black (suspected malicious, quarantine) with adjustable thresholds. ④ **subpoena evidence** — level-0-only highest evidence privilege: the new `cmd.subpoena` downlink forces a middle layer to stream its raw local audit (not the 2KB summary) straight to the cortex; five gates (basis prerequisite / quarantine envelope RAW-UNTRUSTED with read-to-burn isolation box / fetch channel / capacity tiers 64-128-256-512KB with human approval above 128KB and forced human adjudication above 512KB / every issuance audited as a black-level event); lower-level impersonation is rejected node-side and audited uplink (`subpoena.forged`). Every active version number is unified to **2.0.0**.
 >
-> **2026-09-05 v1.0.7 (CNB kernel integration)**: (1) **Structure** — the whole nervous-bus implementation moves into the kernel submodule `norpagent.cnb/` (protocol / topology / permissions / bus / node / cortex / cli / demo + a new `engine` binding layer); the version merges into norpagent (no separate version); `import norpagent` makes CNB ready (top-level `norpagent.cnb` plus `CnbAdapter` / `setup_cnb` / `KERNEL_ACTIONS`). The old standalone package name `nervous_bus` stays as a **compatibility shim** (re-export + sys.modules submodule injection + physical thin cli/demo files) — scripts / commands / tests from 1.0.6 and earlier keep working unchanged. (2) **Capability surface** — `NervousNode` gains an exec **action registry** (`register_action` / `unregister_action` / `list_actions`); cortex `cmd.exec` actions route to registered handlers first, legacy `on("exec")` callbacks fall back, and unknown actions are rejected node-side (`ok=False` + top-level `error`; contract upgrade). The engine binding layer registers the NorpEngine public API as a **14-action kernel surface**: task (`run_task`/`status`/`stop_task`), state (`engine_state`/`inspect`), snapshot (`snapshot`/`rollback`/`undo`/`redo`/`list_snapshots`/`mark_good`), ops (`remount`/`reload_plugins`/`stop_engine`). `cmd.stop` (stops tasks, instance stays running) and `cmd.reload` (env re-read + plugin hot reload) keep their semantics. (3) **Runtime** — `norpagent cortex/node` (and `main.py --norp-cortex/--norp-node`) now **assemble a full kernel engine by default**: every neural atom is a real task-capable norpagent instance (default minimal/mock, zero third-party deps; `--mode`/`--model` selectable; `--bare` returns to the plain nervous shell; the cortex = the top-level norpagent instance). `stop_engine` replies first, then stops the engine gracefully after 1s and deregisters the node; CLI processes exit naturally. (4) **Uplink** — heartbeats carry kernel state (`engine_state`/`active_tasks`/`version`/`actions`, visible in cortex `reports`); `task_started`/`task_done` events go uplink (full task lifecycle visible at the cortex). (5) `runtime/cnb.py` stays as a forwarding layer (engine.py untouched); `norpagent.cli` and `main.py` forward to the new path. (6) Tests: test_cnb 60 + test_deep_tree 36 + test_e2e 13 + automount 12/12 all green (migration regression-free), plus the new kernel-action acceptance `test/test_cnb_kernel_actions.py` (A in-process 21 + B multi-process 11 = 32/32). See §30.16. Every active version number is unified to **1.0.7**.
+> **2026-09-05 v1.0.7 (CNB kernel integration)**: (1) **Structure** — the whole nervous-bus implementation moves into the kernel submodule `norpagent.cnb/` (protocol / topology / permissions / bus / node / cortex / cli / demo + a new `engine` binding layer); the version merges into norpagent (no separate version); `import norpagent` makes CNB ready (top-level `norpagent.cnb` plus `CnbAdapter` / `setup_cnb` / `KERNEL_ACTIONS`). The old standalone package name `nervous_bus` stays as a **compatibility shim** (re-export + sys.modules submodule injection + physical thin cli/demo files) — scripts / commands / tests from 1.0.6 and earlier keep working unchanged. (2) **Capability surface** — `NervousNode` gains an exec **action registry** (`register_action` / `unregister_action` / `list_actions`); cortex `cmd.exec` actions route to registered handlers first, legacy `on("exec")` callbacks fall back, and unknown actions are rejected node-side (`ok=False` + top-level `error`; contract upgrade). The engine binding layer registers the NorpEngine public API as a **14-action kernel surface**: task (`run_task`/`status`/`stop_task`), state (`engine_state`/`inspect`), snapshot (`snapshot`/`rollback`/`undo`/`redo`/`list_snapshots`/`mark_good`), ops (`remount`/`reload_plugins`/`stop_engine`). `cmd.stop` (stops tasks, instance stays running) and `cmd.reload` (env re-read + plugin hot reload) keep their semantics. (3) **Runtime** — `norpagent cortex/node` (and `main.py --norp-cortex/--norp-node`) now **assemble a full kernel engine by default**: every neural atom is a real task-capable norpagent instance (default minimal/mock, zero third-party deps; `--mode`/`--model` selectable; `--bare` returns to the plain nervous shell; the cortex = the top-level norpagent instance). `stop_engine` replies first, then stops the engine gracefully after 1s and deregisters the node; CLI processes exit naturally. (4) **Uplink** — heartbeats carry kernel state (`engine_state`/`active_tasks`/`version`/`actions`, visible in cortex `reports`); `task_started`/`task_done` events go uplink (full task lifecycle visible at the cortex). (5) `runtime/cnb.py` stays as a forwarding layer (engine.py untouched); `norpagent.cli` and `main.py` forward to the new path. See §30.16. Every active version number is unified to **1.0.7**.
 >
-> **1.0.2 revision (CNB ships with the package)**: fixes the PyPI 1.0.1 package missing the Central Nervous Bus (CNB) — `nervous_bus/` moves from the repository root into `src/nervous_bus/` and is shipped with the package (`pip install norpagent==1.0.2` now includes CNB); the `norpagent` command gains the neural-tree subcommands `cortex / node / topo / ping / exec / stop / reload / perm / reports / audit / sync` (equivalent to `python -m nervous_bus.cli ...`; the legacy `--norp-cortex` / `--norp-node` spellings are forwarded automatically); running from the repository source is adapted by a src-path bootstrap at the top of `main.py` / `api.py`; every active version number is unified to 1.0.2 (`pyproject.toml`, `src/norpagent/__init__.py`, the recovery submodule `__version__`, the multimodal UA string, and the version-assertion test are all in sync).
+> **1.0.2 revision (CNB ships with the package)**: fixes the PyPI 1.0.1 package missing the Central Nervous Bus (CNB) — `nervous_bus/` moves from the repository root into `src/nervous_bus/` and is shipped with the package (`pip install norpagent==1.0.2` now includes CNB); the `norpagent` command gains the neural-tree subcommands `cortex / node / topo / ping / exec / stop / reload / perm / reports / audit / sync` (equivalent to `python -m nervous_bus.cli ...`; the legacy `--norp-cortex` / `--norp-node` spellings are forwarded automatically); running from the repository source is adapted by a src-path bootstrap at the top of `main.py` / `api.py`; every active version number is unified to 1.0.2 (`pyproject.toml`, `src/norpagent/__init__.py`, the recovery submodule `__version__`, the multimodal UA string are all in sync).
 >
-> **2026-09-05 deep-tree fix (CNB kernel B1–B9, audit-driven remediation)**: the kernel was "self-consistent on shallow trees, broken on deep trees" — the official suites only covered ≤2-level flat scenarios (atoms mounted straight on the cortex) and never ≥3-level chained forwarding; a five-level tree exposed hard defects on all three main paths (registration / uplink / link-loss): 9 issues, 3 high severity (B1 deep-registration collapse — forwarding overwrote `via` at every hop so the cortex re-parented deep nodes; B2 middle layers recorded heartbeat/events without forwarding, leaving the cortex blind to deep nodes; B3 a middle layer exiting made the cortex cascade-deregister a whole live subtree into orphans). All fixed: `via` now uses `setdefault` so the original direct parent survives the chain; uplinks converge hop by hop and upper-layer rejections are echoed back to drive deep self-healing; new rescue logic `_rescue_children` + the `cmd.reroot` re-parent command keep live subtrees alive; permission decisions are now pure time-order (a type-level revoke is no longer shadowed by an older node_id grant); the cortex's lost-node sweep thread is wired up (`sweep_dead` finally called: dead detection → rescue → grace-then-drop); hello ancestor chains are de-duplicated; heartbeats accept custom status fields; topology broadcasts auto-fire debounced after register/deregister/rescue. A dedicated 4-level deep-tree regression suite `nervous_bus/test_deep_tree.py` (30 checks) was added; all suites verify 52+13+30+12. See §30.14. Every active version number is unified to **1.0.4** (`pyproject.toml`, `src/norpagent/__init__.py`, the recovery submodule `__version__`, the multimodal UA string, and the version-assertion test are all in sync).
-> **2026-09-05 v1.0.6 increment (deep-tree convergence closure + permission-plane audit, verified on a running tree)**: ① **Gap A** — after the cortex's sweep had deregistered a lost leaf and auto-broadcast, receivers still did not converge, because `cmd.topology.sync` was add-only: the cortex audit showed `deregister: probe-x` → `topology broadcast: 11 ok`, yet middle-layer rnd's heartbeat `descendants` still listed probe-x for 150s+ (verified live). `cmd.topology.sync` is now an **authoritative snapshot mirror**: prune (cascade-deregister local nodes absent from the snapshot, self excluded) + parent-pointer convergence (align to the cortex view via `set_parent`); transient gaps self-heal through "heartbeat rejected → auto re-register". Deep-tree suite 30→**36** (new D13a–f). ② **Gap B** — exec permission denials and perm changes now uplink `report.audit` (`perm.denied` / `perm.changed`) hop by hop to the cortex; the cortex keeps structured permission-operation records and exposes a merged view `perm_audit(n)` (REPL `perm_audit` + ctrl `op=perm_audit`) for same-permission audit reads. test_cnb 52→**60** (new T-A0~T-A6, incl. a deep node's denial forwarded through a middle layer). See §30.15. Every active version number is unified to **1.0.6**.
-> **2026-09 revision (CNB env auto-mount + task-level cancellation + manual alignment)**: ① **P0-1 landed** — ordinary norpagent instances (np()/GUI/embedded) read the `NORP_CNB_*` env vars at assembly time and auto-mount as nervous-tree nodes (new `norpagent/runtime/cnb.py`: CnbAdapter + background mount thread + registration retry + degrade-to-plain-instance on failure; `NORP_CNB_MANAGED=1` skips kernel mounting so an upper layer can build its own node — no double mounting; the shutdown path unmounts); the four cortex downlink callbacks now land on real engine control points: `exec` (action whitelist `run_task` / `status` / `stop_task`; missing-prompt and unknown-action requests are rejected; audit receipts; `report.event` task_done uplinks), `stop` (`stop_all_tasks()` stops every in-flight session task while the instance stays RUNNING), `reload` (re-reads the CNB env config and hot-reloads external plugins through the remount machinery), `perm_changed` (permission summary recorded and audited; the permission table is enforced before every cmd.exec). ② **P2-1 task-level cancellation** — the loop layer gains the optional `submit_async` extension (`NasyncTaskHandle`, deep per-task cancel, still covered by Ctrl+C / engine-stop full cancellation), and the engine gains `submit_async` / `cancel_task` / `stop_all_tasks` / `active_tasks` / `forget_task`. ③ **P1-1/P2-2 alignment** — `--help` now shows the CNB subcommands; §30.8/§30.12/Appendix J are rewritten to the real implementation locations (`runtime/engine.py` + `runtime/cnb.py`; the fictional `api.py AgentAPI._setup_cnb()` and config.json key claims are removed — the contract is env vars only). ④ `nervous_bus.test_e2e` now climbs to the repository root that contains `main.py` (`python -m nervous_bus.test_e2e` works again under the v1.0.2 src/ layout; 13/13). ⑤ new acceptance smoke `test/test_cnb_automount.py` (12 checks, 12/12 verified on 2026-09-05).
+> **2026-09-05 deep-tree fix (CNB kernel B1–B9, audit-driven remediation)**: the kernel was "self-consistent on shallow trees, broken on deep trees" — the official suites only covered ≤2-level flat scenarios (atoms mounted straight on the cortex) and never ≥3-level chained forwarding; a five-level tree exposed hard defects on all three main paths (registration / uplink / link-loss): 9 issues, 3 high severity (B1 deep-registration collapse — forwarding overwrote `via` at every hop so the cortex re-parented deep nodes; B2 middle layers recorded heartbeat/events without forwarding, leaving the cortex blind to deep nodes; B3 a middle layer exiting made the cortex cascade-deregister a whole live subtree into orphans). All fixed: `via` now uses `setdefault` so the original direct parent survives the chain; uplinks converge hop by hop and upper-layer rejections are echoed back to drive deep self-healing; new rescue logic `_rescue_children` + the `cmd.reroot` re-parent command keep live subtrees alive; permission decisions are now pure time-order (a type-level revoke is no longer shadowed by an older node_id grant); the cortex's lost-node sweep thread is wired up (`sweep_dead` finally called: dead detection → rescue → grace-then-drop); hello ancestor chains are de-duplicated; heartbeats accept custom status fields; topology broadcasts auto-fire debounced after register/deregister/rescue. See §30.14. Every active version number is unified to **1.0.4** (`pyproject.toml`, `src/norpagent/__init__.py`, the recovery submodule `__version__`, the multimodal UA string are all in sync).
+> **2026-09-05 v1.0.6 increment (deep-tree convergence closure + permission-plane audit, verified on a running tree)**: ① **Gap A** — after the cortex's sweep had deregistered a lost leaf and auto-broadcast, receivers still did not converge, because `cmd.topology.sync` was add-only: the cortex audit showed `deregister: probe-x` → `topology broadcast: 11 ok`, yet middle-layer rnd's heartbeat `descendants` still listed probe-x for 150s+ (verified live). `cmd.topology.sync` is now an **authoritative snapshot mirror**: prune (cascade-deregister local nodes absent from the snapshot, self excluded) + parent-pointer convergence (align to the cortex view via `set_parent`); transient gaps self-heal through "heartbeat rejected → auto re-register". ② **Gap B** — exec permission denials and perm changes now uplink `report.audit` (`perm.denied` / `perm.changed`) hop by hop to the cortex; the cortex keeps structured permission-operation records and exposes a merged view `perm_audit(n)` (REPL `perm_audit` + ctrl `op=perm_audit`) for same-permission audit reads. See §30.15. Every active version number is unified to **1.0.6**.
+> **2026-09 revision (CNB env auto-mount + task-level cancellation + manual alignment)**: ① **P0-1 landed** — ordinary norpagent instances (np()/GUI/embedded) read the `NORP_CNB_*` env vars at assembly time and auto-mount as nervous-tree nodes (new `norpagent/runtime/cnb.py`: CnbAdapter + background mount thread + registration retry + degrade-to-plain-instance on failure; `NORP_CNB_MANAGED=1` skips kernel mounting so an upper layer can build its own node — no double mounting; the shutdown path unmounts); the four cortex downlink callbacks now land on real engine control points: `exec` (action whitelist `run_task` / `status` / `stop_task`; missing-prompt and unknown-action requests are rejected; audit receipts; `report.event` task_done uplinks), `stop` (`stop_all_tasks()` stops every in-flight session task while the instance stays RUNNING), `reload` (re-reads the CNB env config and hot-reloads external plugins through the remount machinery), `perm_changed` (permission summary recorded and audited; the permission table is enforced before every cmd.exec). ② **P2-1 task-level cancellation** — the loop layer gains the optional `submit_async` extension (`NasyncTaskHandle`, deep per-task cancel, still covered by Ctrl+C / engine-stop full cancellation), and the engine gains `submit_async` / `cancel_task` / `stop_all_tasks` / `active_tasks` / `forget_task`. ③ **P1-1/P2-2 alignment** — `--help` now shows the CNB subcommands; §30.8/§30.12/Appendix J are rewritten to the real implementation locations (`runtime/engine.py` + `runtime/cnb.py`; the fictional `api.py AgentAPI._setup_cnb()` and config.json key claims are removed — the contract is env vars only).
 >
-> **1.0.1 revision (version milestone)**: the 0.9.x line concludes and the project enters the **1.0.x series** — all active version numbers are unified to 1.0.1 (`pyproject.toml`, `src/norpagent/__init__.py`, the recovery submodule `__version__`, the multimodal UA string, and the version-assertion test are all in sync); the 1.0 series carries every capability delivered so far: multimodal (vision + sound), the Central Nervous Bus (CNB) multi-instance neural tree, rescue mode, 29 hooks, and the plugin system.
+> **1.0.1 revision (version milestone)**: the 0.9.x line concludes and the project enters the **1.0.x series** — all active version numbers are unified to 1.0.1 (`pyproject.toml`, `src/norpagent/__init__.py`, the recovery submodule `__version__`, the multimodal UA string are all in sync); the 1.0 series carries every capability delivered so far: multimodal (vision + sound), the Central Nervous Bus (CNB) multi-instance neural tree, rescue mode, 29 hooks, and the plugin system.
 > **0.9.9 revision (multimodal)**: new **Chapter 29 "Multimodal: Vision and Sound"** and **Appendix I "Multimodal Configuration and API Quick Reference"** — vision: upload / paste / drag images, the backend `/api/vision` endpoint has an external vision service describe them, and the description flows into the conversation; sound: speech output (TTS) and speech input (STT) are **fully implemented on the backend** (Windows SAPI / macOS say / Linux espeak-ng offline, or configurable OpenAI-compatible services), the notification tone is generated by the backend, the browser only captures and plays — nothing depends on browser-native speech APIs; `/api/upload` now supports images; `tts_service_api_key` / `stt_service_api_key` are stored DPAPI-encrypted like `api_key`.
-> **2026-08 Central Nervous Bus (CNB) multi-instance upgrade**: new **Chapter 30 "Central Nervous Bus: Multi-Instance and the Neural Tree"** and **Appendix J "Central Nervous Bus Quick Reference"** — the cortex (the highest norpagent instance) controls the operation permissions of any atom at any level through the Central Nervous Bus; lower levels may only report upward through the bus and can never control upper levels; the neural tree is a tree-shaped topology chain; lower levels obey higher-level commands unconditionally and are forbidden to rewrite higher levels — they may only report back. The full `nervous_bus/` module set (protocol layer / tree topology / neural permission table / zero-dependency transport / node / cortex / CLI) passes 51 unit+integration tests and 13 real multi-process end-to-end tests; `main.py` gains the GUI-less `--norp-cortex` / `--norp-node` multi-instance entry (bypassing the single-instance lock), and `api.py` lets a GUI instance join the neural tree as a node.
-> 2026-08 revision: Chapter 27 minimal kernel in depth (EventBus / the slot connector ArchLayer / the Registry / the address resolver: data structures, APIs, internals and a startup + hot-mount collaboration walkthrough) | Chapter 26 registration flow in detail (the Registry's 9 namespaces / four value forms and string semantics / the full npa() assembly pipeline / three registration timings and hot reload / slot registration vs component registration / validation and error handling / a checklist) | Chapter 25 developer practice (module / slot / plugin / tool development in depth; slot development contract incl. the hot-reload red line: dict key-value pairs must be valid modules; architecture overview and the minimal main async-loop core) | Chapter 24 rescue mode (low-level loop control + human takeover) | kernel fix: select timeout clamp (found by the stress suite; far timers crashed the loop on Windows) | new 35-item violent stress suite for the minimal async-loop core (test/stress_nasyncio_core.py) | 15.6 human-rescue manual tool takeover API (v0.9.3; operate all tools by hand when the model is down: tools / tool-call / manual / serve) | 3.9 task-level slot injection (submit(slot_overrides=...)) | 3.7 in-flight task races of assembly-slot hot rebuilds and the drain recommendation | 4.6.4 daemon worker-pool queue semantics and the stuck-task fallback matrix | 23.1 EventBus benchmark baseline and lock-contention boundary
+> **2026-08 Central Nervous Bus (CNB) multi-instance upgrade**: new **Chapter 30 "Central Nervous Bus: Multi-Instance and the Neural Tree"** and **Appendix J "Central Nervous Bus Quick Reference"** — the cortex (the highest norpagent instance) controls the operation permissions of any atom at any level through the Central Nervous Bus; lower levels may only report upward through the bus and can never control upper levels; the neural tree is a tree-shaped topology chain; lower levels obey higher-level commands unconditionally and are forbidden to rewrite higher levels — they may only report back. The full `nervous_bus/` module set (protocol layer / tree topology / neural permission table / zero-dependency transport / node / cortex / CLI) `main.py` gains the GUI-less `--norp-cortex` / `--norp-node` multi-instance entry (bypassing the single-instance lock), and `api.py` lets a GUI instance join the neural tree as a node.
+> 2026-08 revision: Chapter 27 minimal kernel in depth (EventBus / the slot connector ArchLayer / the Registry / the address resolver: data structures, APIs, internals and a startup + hot-mount collaboration walkthrough) | Chapter 26 registration flow in detail (the Registry's 9 namespaces / four value forms and string semantics / the full npa() assembly pipeline / three registration timings and hot reload / slot registration vs component registration / validation and error handling / a checklist) | Chapter 25 developer practice (module / slot / plugin / tool development in depth; slot development contract incl. the hot-reload red line: dict key-value pairs must be valid modules; architecture overview and the minimal main async-loop core) | Chapter 24 rescue mode (low-level loop control + human takeover) | kernel fix: select timeout clamp (far timers crashed the loop on Windows) | 15.6 human-rescue manual tool takeover API (v0.9.3; operate all tools by hand when the model is down: tools / tool-call / manual / serve) | 3.9 task-level slot injection (submit(slot_overrides=...)) | 3.7 in-flight task races of assembly-slot hot rebuilds and the drain recommendation | 4.6.4 daemon worker-pool queue semantics and the stuck-task fallback matrix | 23.1 EventBus benchmark baseline and lock-contention boundary
 > **0.9.7 revision**: human rescue supports manual control of custom tools (`RescueToolEnvironment` gains `extra_tools` / `tools` / `plugin_dirs`; the CLI gains `--tools` / `--plugin-dirs`; the inventory and the operator page tag each tool with builtin / custom / plugin origin) | the general-purpose event bus (GeneralEventBus; the class stays `EventBus`) gains generic capabilities: `once` / `wait` / `emit_all` / `subscriber_count` / `has_listeners` / `clear` | Chapter 9 gains 9.8 "all 29 hooks, one by one (Python code)" | new Chapter 28 "External Python Script Integration: Hot Mounting and Hook Subscription" | new Appendix F (frontend-backend communication quick reference) / Appendix G (all commands quick reference) / Appendix H (all functions and structures quick reference) | Chapter 13 command-line entry expanded (console-frontend entry + rescue-mode commands) | terminology unified (EventBus is called the GeneralEventBus in this manual; code symbols unchanged)
 
 ---
 
-*NorpAgent Developer Manual · v2.2.1 · FarStars (远星) · Copyright (c) 2026 xingluosama121, MIT Licensed*
+*NorpAgent Developer Manual · v2.2.2 · FarStars (远星) · Copyright (c) 2026 xingluosama121, MIT Licensed*

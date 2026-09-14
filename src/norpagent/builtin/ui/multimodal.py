@@ -35,7 +35,7 @@ import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-_UA = "norpagent-multimodal/2.0.1 (FarStars)"
+_UA = "norpagent-multimodal/2.2.2 (FarStars)"
 
 
 class MultimodalError(Exception):
@@ -62,11 +62,11 @@ def _http_json(
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             raw = resp.read()
     except Exception as exc:  # noqa: BLE001
-        raise MultimodalError(f"HTTP 请求失败: {exc}") from exc
+        raise MultimodalError(f"HTTP request failed: {exc}") from exc
     try:
         return json.loads(raw.decode("utf-8"))
     except Exception as exc:  # noqa: BLE001
-        raise MultimodalError(f"响应不是合法 JSON: {raw[:200]!r}") from exc
+        raise MultimodalError(f"response is not valid JSON: {raw[:200]!r}") from exc
 
 
 def _http_bytes(
@@ -87,7 +87,7 @@ def _http_bytes(
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             return resp.read()
     except Exception as exc:  # noqa: BLE001
-        raise MultimodalError(f"HTTP 请求失败: {exc}") from exc
+        raise MultimodalError(f"HTTP request failed: {exc}") from exc
 
 
 def _multipart(
@@ -126,11 +126,11 @@ def _multipart(
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             raw = resp.read()
     except Exception as exc:  # noqa: BLE001
-        raise MultimodalError(f"HTTP 请求失败: {exc}") from exc
+        raise MultimodalError(f"HTTP request failed: {exc}") from exc
     try:
         return json.loads(raw.decode("utf-8"))
     except Exception as exc:  # noqa: BLE001
-        raise MultimodalError(f"响应不是合法 JSON: {raw[:200]!r}") from exc
+        raise MultimodalError(f"response is not valid JSON: {raw[:200]!r}") from exc
 
 
 # ── Vision: image understanding ──────────────────────────────────────────
@@ -142,17 +142,23 @@ def describe_image(
     service_url: str,
     prompt: str,
     timeout: float = 120.0,
+    api_key: str = "",
 ) -> str:
     """Send one image to the external vision service and return its text description.
 
     Protocol (compatible with the standalone vision.py): POST JSON to
     ``service_url`` with ``{image_base64, ext, mime, prompt}``; the service
     replies ``{"description": "..."}`` (``{"ok": true, "description": ...}`` and
-    ``{"text": ...}`` are also accepted).
+    ``{"text": ...}`` are also accepted). Optional ``api_key`` is sent as a
+    ``Bearer`` Authorization header (R-022: the vision configuration carries an
+    API key slot).
     """
     service_url = (service_url or "").strip()
     if not service_url:
-        raise MultimodalError("未配置视觉服务地址（设置 → 视觉 API）")
+        raise MultimodalError("vision service URL is not configured (Settings → Vision API)")
+    headers: Dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     body = _http_json(
         service_url,
         {
@@ -161,6 +167,7 @@ def describe_image(
             "mime": mime,
             "prompt": prompt,
         },
+        headers=headers,
         timeout=timeout,
     )
     if isinstance(body, dict):
@@ -172,7 +179,62 @@ def describe_image(
             val = body["data"].get("description") or body["data"].get("text")
             if isinstance(val, str) and val.strip():
                 return val.strip()
-    raise MultimodalError(f"视觉服务响应缺少描述字段: {str(body)[:200]}")
+    raise MultimodalError(f"vision service response is missing the description field: {str(body)[:200]}")
+
+
+def media_describe(
+    kind: str,
+    data_base64: str,
+    ext: str,
+    mime: str,
+    service_url: str,
+    prompt: str = "",
+    api_key: str = "",
+    timeout: float = 120.0,
+) -> str:
+    """Send an audio / video payload to an external media service, return its text.
+
+    Generalizes the vision protocol so each modality can route through an
+    external service (R-021: per-modality ``direct`` / ``service`` routing):
+
+    - request: POST JSON ``{"kind": "audio"|"video", "data_base64": ...,
+      "ext": ..., "mime": ..., "prompt": ...}``;
+    - response accepts ``description`` / ``text`` / ``transcript`` /
+      ``content`` / ``result`` (first non-empty wins; ``data`` sub-dict also
+      accepted), covering both speech transcription and non-speech audio
+      understanding (music / environment - R-022: audio is not limited to
+      speech) as well as video understanding;
+    - optional ``api_key`` is sent as a ``Bearer`` Authorization header.
+    """
+    service_url = (service_url or "").strip()
+    if not service_url:
+        raise MultimodalError("media service URL is not configured (Settings → Multimodal → audio/video service)")
+    headers: Dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    body = _http_json(
+        service_url,
+        {
+            "kind": kind,
+            "data_base64": data_base64,
+            "ext": ext,
+            "mime": mime,
+            "prompt": prompt,
+        },
+        headers=headers,
+        timeout=timeout,
+    )
+    if isinstance(body, dict):
+        for key in ("description", "text", "transcript", "content", "result"):
+            val = body.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        if body.get("ok") is True and isinstance(body.get("data"), dict):
+            for key in ("description", "text", "transcript"):
+                val = body["data"].get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    raise MultimodalError(f"media service response is missing the description field: {str(body)[:200]}")
 
 
 # ── TTS: text → speech ───────────────────────────────────────────────────
@@ -207,10 +269,10 @@ def _win_tts_wav(text: str, voice: str, rate: float, out_path: str) -> bool:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception as exc:  # noqa: BLE001
-        raise MultimodalError(f"Windows TTS 调用失败: {exc}") from exc
+        raise MultimodalError(f"Windows TTS call failed: {exc}") from exc
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise MultimodalError(f"Windows TTS 失败: {err or '未知错误'}")
+        raise MultimodalError(f"Windows TTS failed: {err or 'unknown error'}")
     return os.path.exists(out_path) and os.path.getsize(out_path) > 44
 
 
@@ -225,10 +287,10 @@ def _mac_tts_wav(text: str, voice: str, rate: float, out_path: str) -> bool:
     try:
         proc = subprocess.run(args, capture_output=True, timeout=60)
     except Exception as exc:  # noqa: BLE001
-        raise MultimodalError(f"macOS TTS 调用失败: {exc}") from exc
+        raise MultimodalError(f"macOS TTS call failed: {exc}") from exc
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise MultimodalError(f"macOS TTS 失败: {err or '未知错误'}")
+        raise MultimodalError(f"macOS TTS failed: {err or 'unknown error'}")
     return os.path.exists(out_path) and os.path.getsize(out_path) > 44
 
 
@@ -237,7 +299,7 @@ def _linux_tts_wav(text: str, voice: str, rate: float, out_path: str) -> bool:
     exe = shutil.which("espeak-ng") or shutil.which("espeak")
     if not exe:
         raise MultimodalError(
-            "未找到 espeak-ng / espeak，请安装（apt install espeak-ng）或配置 TTS 服务地址"
+            "espeak-ng / espeak not found; install it (apt install espeak-ng) or configure a TTS service URL"
         )
     args = [exe, "-w", out_path]
     if voice:
@@ -248,10 +310,10 @@ def _linux_tts_wav(text: str, voice: str, rate: float, out_path: str) -> bool:
     try:
         proc = subprocess.run(args, capture_output=True, timeout=60)
     except Exception as exc:  # noqa: BLE001
-        raise MultimodalError(f"Linux TTS 调用失败: {exc}") from exc
+        raise MultimodalError(f"Linux TTS call failed: {exc}") from exc
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise MultimodalError(f"Linux TTS 失败: {err or '未知错误'}")
+        raise MultimodalError(f"Linux TTS failed: {err or 'unknown error'}")
     return os.path.exists(out_path) and os.path.getsize(out_path) > 44
 
 
@@ -270,7 +332,7 @@ def text_to_speech(
     """
     text = (text or "").strip()
     if not text:
-        raise MultimodalError("没有可朗读的文本")
+        raise MultimodalError("no text to read aloud")
     service_url = (service_url or "").strip()
     if service_url:
         headers = {}
@@ -286,7 +348,7 @@ def text_to_speech(
             payload["speed"] = max(0.25, min(4.0, float(rate)))
         audio = _http_bytes(service_url, payload, headers=headers, timeout=timeout)
         if not audio:
-            raise MultimodalError("TTS 服务返回空音频")
+            raise MultimodalError("TTS service returned empty audio")
         return audio, "audio/wav"
 
     # OS-native path
@@ -335,12 +397,12 @@ def _win_stt_text(wav_path: str, language: str, timeout: float) -> str:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired:
-        raise MultimodalError("本地语音识别超时（录音过长或引擎无响应）") from None
+        raise MultimodalError("local speech recognition timed out (recording too long or engine unresponsive)") from None
     except Exception as exc:  # noqa: BLE001
-        raise MultimodalError(f"Windows 语音识别调用失败: {exc}") from exc
+        raise MultimodalError(f"Windows speech recognition call failed: {exc}") from exc
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise MultimodalError(f"Windows 语音识别失败: {err or '未知错误'}")
+        raise MultimodalError(f"Windows speech recognition failed: {err or 'unknown error'}")
     text = proc.stdout.decode("utf-8", errors="replace").strip()
     return text
 
@@ -360,7 +422,7 @@ def speech_to_text(
     Windows local SAPI recognizer (WAV input).
     """
     if not audio:
-        raise MultimodalError("没有收到音频数据")
+        raise MultimodalError("no audio data received")
     service_url = (service_url or "").strip()
     if service_url:
         headers = {}
@@ -384,13 +446,13 @@ def speech_to_text(
             text = body.get("text")
             if isinstance(text, str) and text.strip():
                 return text.strip()
-        raise MultimodalError(f"STT 服务响应缺少文本: {str(body)[:200]}")
+        raise MultimodalError(f"STT service response is missing text: {str(body)[:200]}")
 
     # OS-native path
     if not sys.platform.startswith("win"):
         raise MultimodalError(
-            "当前平台没有本地语音识别引擎，请在设置中配置 STT 服务地址"
-            "（OpenAI 兼容 /audio/transcriptions）"
+            "no local speech recognition engine on this platform; configure an "
+            "STT service URL in Settings (OpenAI-compatible /audio/transcriptions)"
         )
     with tempfile.TemporaryDirectory(prefix="norp_stt_") as tmp:
         wav = os.path.join(tmp, "in.wav")

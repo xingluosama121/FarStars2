@@ -10,6 +10,8 @@ Usage::
     norpagent --mode standard --ui web --port 8787 # web UI (HTTP + SSE)
     norpagent --mode standard --plugin-dir ./my_plugins   # load external plugins
     norpagent --safe-mode                                 # safe mode: load only the minimal kernel
+    norpagent unbox                                # one-click product distribution (R-006):
+                                                   # ready-to-use self-evolving user software
     norpagent plugin-sign --gen                    # generate a plugin signing key pair
     norpagent plugin-sign my_plugin.py --key <private key hex>
 
@@ -53,7 +55,7 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from norpagent.builtin import install_defaults
 from norpagent.kernel.agent import AgentRuntime
@@ -73,6 +75,8 @@ _CNB_SUBCOMMANDS = frozenset({
     "freeze", "unfreeze",
     "subpoena", "subpoena_box", "subpoena_purge", "subpoena_audit",
     "behavior",
+    # 2026-09-12 反馈轮：tree（神经树显式定义 validate / show / up）
+    "tree",
 })
 
 
@@ -188,8 +192,18 @@ def _make_runtime(
 
 
 def _run_web(reg: Registry, mode: str, args: Any, prompt: Optional[str]) -> int:
-    """Web UI mode: start the HTTP + SSE service (front.html); tasks submitted via /chat."""
+    """Web UI mode: start the HTTP + SSE service (front.html); tasks submitted via /chat.
+
+    2026-09-12 round 9: the runner now wires the same hot-apply / rollback
+    pipeline as WebFrontend (config apply: saved model+key, web-search toggle,
+    tool set, mode switch; recovery handler for the snapshot panel; quit
+    callback). Previously these handlers were missing on CLI-launched instances
+    — the saved API key never reached the model provider ("No API key found"),
+    composer/settings toggles silently did nothing, and the snapshot panel
+    reported "work rollback not mounted".
+    """
     from norpagent.builtin.ui.web import WebUI
+    from norpagent.frontends.web import WebFrontend
 
     # safe mode: do not read the WebUI settings file (a bad config may be the very
     # cause of startup failure). config_path="" = disable disk read/write (None uses the default path).
@@ -209,16 +223,214 @@ def _run_web(reg: Registry, mode: str, args: Any, prompt: Optional[str]) -> int:
             components=dict(preset.components),
         )
     agent = AgentRuntime(reg, preset, ui=ui)
-    gate = threading.Lock()
+    gate = threading.RLock()          # rebuild / config-apply mutual exclusion
+    holder = {"agent": agent}
+
+    class _TaskScope:
+        """Shared scope: any number of chat tasks may run concurrently."""
+
+        def __init__(self, g: "_ConcurrencyGate") -> None:
+            self._g = g
+
+        def __enter__(self):
+            with self._g._cond:
+                while self._g._writer:
+                    self._g._cond.wait()
+                self._g._readers += 1
+            return self
+
+        def __exit__(self, *exc):
+            with self._g._cond:
+                self._g._readers -= 1
+                if self._g._readers <= 0:
+                    self._g._cond.notify_all()
+            return False
+
+    class _ExclusiveScope:
+        """Exclusive scope: a runtime rebuild waits for in-flight tasks to drain."""
+
+        def __init__(self, g: "_ConcurrencyGate") -> None:
+            self._g = g
+
+        def __enter__(self):
+            with self._g._cond:
+                while self._g._writer or self._g._readers > 0:
+                    self._g._cond.wait()
+                self._g._writer = True
+            return self
+
+        def __exit__(self, *exc):
+            with self._g._cond:
+                self._g._writer = False
+                self._g._cond.notify_all()
+            return False
+
+    class _ConcurrencyGate:
+        """Reader-writer gate (2026-09-13): chat tasks share, rebuild is exclusive.
+
+        Replaces the previous single global lock that serialised *every* session
+        ("one session generating blocks all others"). Different sessions now run
+        in parallel; the same session is still serialised by its own per-session
+        lock (below).
+        """
+
+        def __init__(self) -> None:
+            self._cond = threading.Condition()
+            self._readers = 0
+            self._writer = False
+
+        def task_scope(self) -> "_TaskScope":
+            return _TaskScope(self)
+
+        def exclusive(self) -> "_ExclusiveScope":
+            return _ExclusiveScope(self)
+
+    cgate = _ConcurrencyGate()
+
+    # per-session locks: same session serialised, different sessions concurrent
+    _sess_locks: Dict[str, threading.Lock] = {}
+    _sess_locks_guard = threading.Lock()
+
+    def _session_lock(sid: Optional[str]) -> threading.Lock:
+        key = str(sid or "__none__")
+        with _sess_locks_guard:
+            lk = _sess_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                _sess_locks[key] = lk
+            return lk
+
+    def _isolation_mode() -> str:
+        try:
+            mode = str(ui._config.get("session_isolation") or "per_session")
+        except Exception:  # noqa: BLE001
+            mode = "per_session"
+        return mode if mode in ("per_session", "isolated_instance") else "per_session"
+
+    def _run_isolated(base: Any, prompt_text: str, session_id: Optional[str],
+                      task_params: Optional[dict]) -> Any:
+        """Run one task on a one-off runtime instance (strongest isolation).
+
+        Shares the session manager / sandbox / scheduler / components so history
+        and memory persist, but does NOT subscribe its own UI listener — events
+        are published on the shared registry bus and delivered by the main
+        runtime's single listener (avoiding duplicate delivery).
+        """
+        child = AgentRuntime(
+            reg, base.preset,
+            session_manager=base.session_manager,
+            sandbox=base.sandbox,
+            scheduler=base.scheduler,
+            ui=None,
+            components=dict(getattr(base, "components", {}) or {}),
+        )
+        try:
+            return child.run(prompt_text, session_id=session_id,
+                             task_params=task_params)
+        finally:
+            try:
+                child.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _rebuild(preset_name: str):
+        new_preset = reg.resolve_preset(preset_name)
+        new_agent = AgentRuntime(reg, new_preset, ui=ui)
+        old = holder["agent"]
+        holder["agent"] = new_agent
+        try:
+            ui.attach_runtime(new_agent)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            old.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        return new_agent
+
+    class _CliEngine:
+        """Engine-shaped shim: exposes what the shared WebFrontend apply /
+        rollback methods read (agent / registry / params / remount / frontend)."""
+
+        registry = reg
+
+        @property
+        def agent(self):
+            return holder["agent"]
+
+        @property
+        def params(self):
+            return getattr(holder["agent"], "params", None) or {}
+
+        @property
+        def frontend(self):
+            import types as _types
+
+            return _types.SimpleNamespace(_ui=ui)
+
+        def remount(self, **slot_values):
+            preset_name = slot_values.get("preset")
+            if not preset_name:
+                raise ValueError("CLI web runner only supports preset remount")
+            # wait for in-flight tasks, then swap the runtime under the rebuild lock
+            with cgate.exclusive():
+                with gate:
+                    return _rebuild(str(preset_name))
+
+    class _CliHost:
+        """Host object reusing WebFrontend's config-apply / recovery methods."""
+
+        _apply_config = WebFrontend._apply_config
+        _handle_recovery = WebFrontend._handle_recovery
+        _apply_agent_tools = WebFrontend._apply_agent_tools
+        _apply_model_config = WebFrontend._apply_model_config
+        restore_startup_config = WebFrontend.restore_startup_config
+
+        def __init__(self) -> None:
+            self._engine = _CliEngine()
+            self._gate = gate
+            self._ui = ui
+            self._base_tools = list(getattr(preset, "tools", ()) or ())
+
+    host = _CliHost()
 
     def handler(prompt_text: str, session_id: Optional[str],
                 task_params: Optional[dict] = None):
-        with gate:  # tasks run serially on the same runtime
-            return agent.run(prompt_text, session_id=session_id,
-                             task_params=task_params)
+        """Execute one chat task with per-session isolation.
+
+        2026-09-13: different sessions run concurrently (shared runtime, one lock
+        per session); ``session_isolation=isolated_instance`` runs each task on a
+        one-off runtime instance instead. Rebuilds still wait for tasks to drain.
+        """
+        with _session_lock(session_id):
+            with cgate.task_scope():
+                mode = _isolation_mode()
+                base = holder["agent"]
+                if mode == "isolated_instance":
+                    return _run_isolated(base, prompt_text, session_id, task_params)
+                return base.run(prompt_text, session_id=session_id,
+                                task_params=task_params)
+
+    def _quit() -> None:
+        # ask the console loop to exit cleanly (input() raises KeyboardInterrupt)
+        try:
+            import _thread
+
+            _thread.interrupt_main()
+        except Exception:  # noqa: BLE001
+            pass
 
     ui.set_handler(handler)
+    ui.set_config_apply(host._apply_config)
+    ui.set_recovery_handler(host._handle_recovery)
+    ui.set_quit_callback(_quit)
+    ui.set_engine_state_fn(lambda: "running")
     ui.attach_runtime(agent)
+    try:
+        # saved model/key + persisted tool set, applied before serving requests
+        host.restore_startup_config()
+    except Exception:  # noqa: BLE001 — restore failure must not block startup
+        pass
     ui.start()
     print(f"[norpagent] frontend web listening on 127.0.0.1:{ui.port} (/exit to quit)")
     try:
@@ -242,7 +454,7 @@ def _run_web(reg: Registry, mode: str, args: Any, prompt: Optional[str]) -> int:
                 break
     finally:
         ui.shutdown()
-        agent.shutdown()
+        holder["agent"].shutdown()
     return 0
 
 
@@ -331,6 +543,136 @@ def _plugin_sign_cmd(args: Any) -> int:
     return 0
 
 
+_PLUGINS_HELP = """\
+usage: norpagent plugins <list|run> [options] [command args]
+
+  list                     show the plugin table (failed / disabled included)
+  run CMD [ARGS...]        execute a CLI command contributed by a plugin setup(api)
+
+options:
+  --plugin-dir DIR         plugin directory (repeatable, required)
+  --plugin-disabled NAME   skip a plugin by name (repeatable)
+  --plugin-isolation MODE  auto | inproc | process (default: auto)
+"""
+
+
+def _plugins_main(rest: List[str]) -> int:
+    """``norpagent plugins`` management entry: list the plugin table / run a plugin command.
+
+    Manual parsing (2026-09-11): keeps full control over command arguments
+    (``plugins run CMD --any-flag ...`` passes everything after CMD verbatim).
+
+    Grammar:
+        norpagent plugins list [--plugin-dir DIR]... [--plugin-disabled NAME]...
+                                [--plugin-isolation auto|inproc|process]
+        norpagent plugins run CMD [CMD-ARGS...] [--plugin-dir DIR]...
+    """
+    dirs: List[str] = []
+    disabled: List[str] = []
+    isolation = "auto"
+    positional: List[str] = []
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        if token == "--plugin-dir":
+            i += 1
+            if i < len(rest):
+                dirs.append(rest[i])
+        elif token.startswith("--plugin-dir="):
+            dirs.append(token.split("=", 1)[1])
+        elif token == "--plugin-disabled":
+            i += 1
+            if i < len(rest):
+                disabled.append(rest[i])
+        elif token.startswith("--plugin-disabled="):
+            disabled.append(token.split("=", 1)[1])
+        elif token == "--plugin-isolation":
+            i += 1
+            if i < len(rest):
+                isolation = rest[i]
+        elif token.startswith("--plugin-isolation="):
+            isolation = token.split("=", 1)[1]
+        elif token in ("-h", "--help"):
+            print(_PLUGINS_HELP)
+            return 0
+        else:
+            positional.append(token)
+        i += 1
+
+    action = positional[0] if positional else "list"
+    command_name = positional[1] if len(positional) > 1 else ""
+    cmdargs = positional[2:]
+    if action not in ("list", "run"):
+        print(f"[error] unknown action '{action}' (expected: list | run)", file=sys.stderr)
+        return 1
+    if not dirs:
+        print("[error] plugins requires --plugin-dir DIR (repeatable)", file=sys.stderr)
+        return 1
+
+    from norpagent.builtin import install_defaults
+    from norpagent.plugins import install_plugin_dirs
+
+    reg = Registry()
+    install_defaults(reg)
+    loader = install_plugin_dirs(reg, dirs, config={
+        "plugin_security_audit": "warn",
+        "plugin_security_import_restrict": "off",
+        "plugin_signature_verify": True,
+        "plugin_disabled": list(disabled),
+        "plugin_isolation": isolation,
+    })
+    try:
+        setattr(reg, "plugin_loader", loader)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if action == "list":
+        print(f"plugin directories: {', '.join(dirs)}")
+        if not loader.plugins:
+            print("  (no plugins found)")
+            return 0
+        for info in loader.plugins:
+            mark = "OK  " if info.enabled else "FAIL"
+            print(f"[{mark}] {info.name} v{info.version} "
+                  f"(signature: {info.signature_status or 'n/a'}, "
+                  f"isolation: {info.isolation}, tools: {len(info.tools)}, "
+                  f"hooks: {len(info.hook_names)})")
+            if not info.enabled and info.error:
+                print(f"        error: {info.error.splitlines()[0]}")
+            for warn in list(info.warnings)[:2]:
+                print(f"        warning: {warn[:160]}")
+        cmds = reg.list_commands()
+        if cmds:
+            print("\nplugin commands:")
+            for cname, help_text in cmds.items():
+                print(f"  {cname:<24} {help_text}")
+        return 0
+
+    # action == "run"
+    if not command_name:
+        print("[error] plugins run requires a command name", file=sys.stderr)
+        return 1
+    handler = reg.get_command(command_name)
+    if handler is None:
+        available = ", ".join(reg.list_commands()) or "(none)"
+        print(f"[error] no plugin command named '{command_name}'. Available: {available}",
+              file=sys.stderr)
+        return 1
+    try:
+        try:
+            result = handler(cmdargs)
+        except TypeError:
+            result = handler()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[error] command failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    if isinstance(result, int):
+        return result
+    if result:
+        print(result)
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     # ── 中枢神经总线（CNB）子命令转发 ──────────────────────────────
     # v1.0.7 起 CNB 内核集成：神经实现与引擎绑定层位于 norpagent.cnb 子模块
@@ -350,10 +692,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         from norpagent.cnb.cli import main as _cnb_cli_main
 
         return _cnb_cli_main(argv)
+    # 成品发行版入口（R-006）：norpagent unbox —— 一键拉起开箱即用用户软件。
+    # 入口本体位于独立入口模块 norpagent.farstars_app（架构书 §3.1 / O5）。
+    if argv and argv[0] == "unbox":
+        from norpagent.farstars_app.entry import main as _unbox_main
+
+        return _unbox_main(argv[1:])
+    # 插件管理子命令（2026-09-11）：norpagent plugins list / run —— 手动解析，
+    # 保证 `plugins run CMD [...]` 的参数原样透传（argparse REMAINDER 会吞噬选项）。
+    if argv and argv[0] == "plugins":
+        return _plugins_main(argv[1:])
+    # 设置事实源子命令（2026-09-12，架构书 §6.3 三通道之一）：norpagent settings ...
+    if argv and argv[0] == "settings":
+        from norpagent.settings_cli import main as _settings_main
+
+        return _settings_main(argv[1:])
     parser = argparse.ArgumentParser(
         prog="norpagent",
         description="norpagent Agent framework CLI",
         epilog=(
+            "entries:\n"
+            "  norpagent unbox                     one-click product distribution (R-006)\n"
+            "settings store CLI (three channels, one source):\n"
+            "  norpagent settings list|get|set|reset|export|import|audit|schema\n"
             "Central Nervous Bus (CNB) subcommands (kernel-integrated into "
             "norpagent.cnb since v1.0.7; cortex / node / topology control):\n"
             "  norpagent cortex --port 17800 [--repl]      start the brain cortex "
@@ -362,6 +723,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "--port PORT --level N    mount an atom under the parent\n"
             "  norpagent topo|ping|exec|stop|reload|perm|reports|audit|sync ...   "
             "cortex control commands\n"
+            "  norpagent tree validate|show|up --def <json|py|json-text>       "
+            "neural-tree definition (explicit shape; no preset tree)\n"
             "  v2.0.0 (FarStars): freeze|unfreeze (quarantine), behavior "
             "(baseline grading), subpoena|subpoena_box|subpoena_purge|"
             "subpoena_audit (evidence), exec actions incl. task_records "
@@ -381,8 +744,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--mode-file", "-f", help="creative mode: load a custom mode from a .py file (module-level PRESET)")
     parser.add_argument("--prompt", "-p", help="single-task input (defaults to the interactive REPL)")
     parser.add_argument("--model", help="override the preset's default model (must be registered, e.g. mock/openai_compat/anthropic)")
-    parser.add_argument("--model-name", help="remote model name (e.g. deepseek-v4-flash / claude-sonnet-4-5)")
-    parser.add_argument("--base-url", help="OpenAI-compatible service endpoint (e.g. https://api.deepseek.com/v1)")
+    parser.add_argument("--model-name", help="remote model name")
+    parser.add_argument("--base-url", help="OpenAI-compatible service endpoint (base URL)")
     parser.add_argument("--api-key", help="API key (defaults to the OPENAI_API_KEY / ANTHROPIC_API_KEY environment variables)")
     parser.add_argument("--session", help="session storage backend (memory/sqlite)")
     parser.add_argument("--call-timeout", type=float, default=None, help="hard timeout in seconds for a single model call (0=unlimited)")

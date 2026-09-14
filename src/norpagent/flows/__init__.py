@@ -1098,7 +1098,7 @@ class FlowRunner:
             if self._model_registered(model_name) else None
         params_override: Dict[str, Any] = {}
         if provider is None:
-            # remote model name (e.g. deepseek-v4-flash): automatically mount onto
+            # remote model name: automatically mount onto
             # the openai_compat adapter (same behavior as saving a remote model in settings)
             provider = self._fallback_provider(model_name)
             if provider is not None:

@@ -39,6 +39,7 @@ from norpagent.builtin.models.openai_compat import OpenAICompatProvider
 from norpagent.builtin.models.anthropic import AnthropicProvider
 from norpagent.builtin.tools import (
     EchoTool,
+    AskUserTool,
     GetTimeTool,
     RunPythonTool,
     FileReadTool,
@@ -136,6 +137,7 @@ def install_defaults(registry: Any) -> Any:
     registry.register_model("anthropic", AnthropicProvider())
     # tools (basic)
     registry.register_tool("echo", EchoTool())
+    registry.register_tool("ask_user", AskUserTool())
     registry.register_tool("get_time", GetTimeTool())
     registry.register_tool("run_python", RunPythonTool())
     # tools (files: workspace path safety constraints)
@@ -212,6 +214,7 @@ def install_core(registry: Any) -> Any:
     registry.register_model("mock", MockModelProvider())
     registry.register_model("openai_compat", OpenAICompatProvider())
     registry.register_tool("echo", EchoTool())
+    registry.register_tool("ask_user", AskUserTool())
     registry.register_tool("get_time", GetTimeTool())
     registry.register_tool("run_python", RunPythonTool())
     registry.register_tool("file_read", FileReadTool())
@@ -236,6 +239,7 @@ __all__ = [
     "OpenAICompatProvider",
     "AnthropicProvider",
     "EchoTool",
+    "AskUserTool",
     "GetTimeTool",
     "RunPythonTool",
     "FileReadTool",

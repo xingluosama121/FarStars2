@@ -65,7 +65,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from norpagent.recovery import capture, store
 
-__version__ = "2.0.1"
+__version__ = "2.2.2"
 
 # 品牌（v2.0.0 起正式宣传名）：远星 / FarStars——norpagent 调用方式与内核
 # 名称不变，FarStars 仅作品牌冠名（import / PyPI 包名保持 norpagent）。
@@ -260,26 +260,36 @@ def _restore_layer(engine: Any, data: Dict[str, Any]) -> List[str]:
         if capture.is_marker(value):
             skipped.append(key)
             continue
+        # slots captured redacted contain the "<redacted>" placeholder for secret
+        # keys; re-inject the live values so a rollback never wipes a real secret
+        # (api_key etc.) with the placeholder.
+        try:
+            current = layer.config.get(key) if layer is not None else None
+        except Exception:  # noqa: BLE001
+            current = None
+        value = capture.restore_redacted(value, current)
         # skip slots identical to the current config to avoid pointless component
         # rebuilds / frontend restarts (e.g. every undo restarting the HTTP listener).
         try:
-            current = layer.config.get(key) if layer is not None else None
-            if current is not None and capture.jsonable(current) == value:
+            if current is not None and capture.jsonable(current) == capture.jsonable(value):
                 continue
         except Exception:  # noqa: BLE001
             pass
         slots[key] = value
 
     web_keys = ("html", "flow_html")
+    current_params = dict(getattr(engine, "params", None) or {})
     params: Dict[str, Any] = {}
     for key, value in (data.get("params") or {}).items():
         if capture.is_marker(value):
             continue
         if key in web_keys:
-            slots[key] = value
+            slots[key] = capture.restore_redacted(
+                value, layer.config.get(key) if layer is not None else None)
         elif key in capture._WEB_PARAM_KEYS or key in (
                 "model_name", "base_url"):
-            params[key] = value
+            params[key] = capture.restore_redacted(
+                value, current_params.get(key))
 
     # update engine params (used by subsequent frontend attach / next run)
     if params:
@@ -300,16 +310,23 @@ def _restore_layer(engine: Any, data: Dict[str, Any]) -> List[str]:
 
 
 def _restore_webui_live(engine: Any, cfg: Optional[Dict[str, Any]]) -> None:
-    """Restore WebUI settings into the live UI (disk write + in-memory config + application)."""
+    """Restore WebUI settings into the live UI (disk write + in-memory config + application).
+
+    The snapshot's secrets are stored redacted; they are re-merged with the live
+    values before touching disk or the in-memory config so a rollback never
+    overwrites a real API key with the ``<redacted>`` placeholder.
+    """
     if not isinstance(cfg, dict):
         return
-    capture._write_webui_config(cfg)
+    merged = capture._write_webui_config(cfg)
+    if not isinstance(merged, dict):
+        merged = cfg
     frontend = getattr(engine, "frontend", None)
     ui = getattr(frontend, "_ui", None) if frontend is not None else None
     restore = getattr(ui, "restore_config", None)
     if callable(restore):
         try:
-            restore(cfg)
+            restore(merged)
         except Exception:  # noqa: BLE001
             pass
 

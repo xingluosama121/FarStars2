@@ -65,7 +65,14 @@ def launch(**kwargs: Any) -> NorpEngine:
     finishing), ``config`` (assigns slot values as a dict), ``safemode``
     ("on" = safe mode: loads only a minimal kernel — skips all plugins, forces
     the minimal preset, does not read the WebUI settings file; keeps core
-    fallback capabilities for repairs), ``snapshot_dir`` (snapshot storage
+    fallback capabilities for repairs), ``cnb`` (Central Nervous Bus explicit
+    enablement, R-023: default OFF — ``cnb=True`` / ``cnb={"cnb": True,
+    "node_id": ..., "parent": ..., "port": ...}`` opts in; ``cnb={"tree":
+    <definition>}`` starts an explicit-shape neural tree (no preset tree);
+    per R-025 a port must be configured explicitly; 2026-09-12 反馈轮: config
+    errors are reported explicitly without blocking startup — the instance
+    starts normally and the tree is simply not loaded (engine.cnb_error)),
+    ``snapshot_dir`` (snapshot storage
     directory, default ~/.norpagent/snapshots/), ``snapshots`` ("off" = disable
     auto snapshots, default "on"), ``snapshot_sessions`` ("on" = snapshot mode B,
     additionally packages session data files, default "off").
@@ -75,6 +82,19 @@ def launch(**kwargs: Any) -> NorpEngine:
     global _current
     prompt = kwargs.pop("prompt", None)
     config = kwargs.pop("config", None)
+    # CNB explicit enablement (R-023: CNB is OFF by default; np(cnb=...) opts in).
+    # Accepted: True / False / "on" / "off" / dict (see cnb.engine.apply_explicit_config).
+    cnb_explicit = kwargs.pop("cnb", None)
+    # R-023 / R-025 pre-flight — 2026-09-12 反馈轮（错误语义定稿）：CNB 配置
+    # 错误不再在此处抛出阻塞 np() 启动；交由 NorpEngine._setup_cnb 统一处置：
+    # 显式报错、不阻塞主线程启动、神经树不加载（engine.cnb_error 可查，
+    # cnb_status 显示 config-error）。这里仅做一次前哨校验，错误不在本层抛出。
+    from norpagent.cnb.engine import CnbConfigError, validate_cnb_config
+
+    try:
+        validate_cnb_config(cnb_explicit)
+    except CnbConfigError:
+        pass  # 显式报错与状态记录在 _setup_cnb（不阻塞主线程启动）
     # work-rollback (recovery) special keys
     safemode_raw = kwargs.pop("safemode", None)
     safemode_on = str(safemode_raw).strip().lower() in (
@@ -163,6 +183,13 @@ def launch(**kwargs: Any) -> NorpEngine:
         )
         if snapshot_sessions:
             engine._snapshot_sessions = True
+        if cnb_explicit is not None:
+            # R-023：CNB 显式启用配置挂到引擎，交给 NorpEngine._setup_cnb；
+            # 2026-09-12 反馈轮（错误语义）：配置错误（含缺端口、神经树
+            # 缺必要参数）显式报错但不阻塞启动——宿主照常运行、神经树不
+            # 加载；错误经 engine.cnb_error 可查（cnb_status=config-error）。
+            # 默认 None = 不启用（env 显式配置亦可启用，属显式通道）。
+            engine._cnb_explicit = cnb_explicit
         try:
             engine.start()
         except Exception as exc:  # noqa: BLE001 — startup failure: give self-rescue hints

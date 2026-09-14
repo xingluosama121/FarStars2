@@ -42,6 +42,11 @@ class Registry:
         # capability" go through here, letting the framework extend new component
         # kinds without touching the kernel.
         self._components: Dict[str, Dict[str, Callable[[], Any]]] = {}
+        # plugin extension surfaces (2026-09-11):
+        # - services: plugin-to-plugin / plugin-to-host communication objects
+        # - commands: CLI commands registered by plugins
+        self._services: Dict[str, Any] = {}
+        self._commands: Dict[str, Any] = {}
         # security context (installed by norpagent.safe()): AgentRuntime and the
         # plugin loader read the full security policy from it, enabling the
         # "security system as a whole plug" design.
@@ -140,6 +145,64 @@ class Registry:
                 pass
             self._plugins.pop(name, None)
 
+    def unregister_tool(self, name: str) -> bool:
+        """Remove a tool entry; returns whether an entry was removed.
+
+        Used by plugin unload / clean hot reload (2026-09-11). The tool table is
+        shared by name; a same-named tool registered later by another plugin stays
+        until its own owner unloads it (the unload path re-checks the current
+        registry entry against the plugin's recorded tool list).
+        """
+        with self._lock:
+            if name in self._tools:
+                del self._tools[name]
+                return True
+            return False
+
+    def register_service(self, name: str, obj: Any) -> None:
+        """Register a service object (plugin-to-plugin / plugin-to-host communication)."""
+        with self._lock:
+            self._services[name] = obj
+
+    def remove_service(self, name: str) -> bool:
+        """Remove a service registered earlier (plugin unload)."""
+        with self._lock:
+            if name in self._services:
+                del self._services[name]
+                return True
+            return False
+
+    def resolve_service(self, name: str, default: Any = None) -> Any:
+        """Resolve a registered service; returns ``default`` when absent."""
+        with self._lock:
+            return self._services.get(name, default)
+
+    def list_services(self) -> List[str]:
+        with self._lock:
+            return sorted(self._services)
+
+    def register_command(self, name: str, handler: Any, help: str = "") -> None:
+        """Register a CLI command contributed by a plugin (name -> handler)."""
+        with self._lock:
+            self._commands[name] = {"handler": handler, "help": str(help)}
+
+    def remove_command(self, name: str) -> bool:
+        """Remove a CLI command registered earlier (plugin unload)."""
+        with self._lock:
+            if name in self._commands:
+                del self._commands[name]
+                return True
+            return False
+
+    def get_command(self, name: str) -> Any:
+        with self._lock:
+            entry = self._commands.get(name)
+            return entry["handler"] if entry else None
+
+    def list_commands(self) -> Dict[str, str]:
+        with self._lock:
+            return {k: v.get("help", "") for k, v in sorted(self._commands.items())}
+
     def register_component(self, kind: str, name: str, factory: Callable[[], Any]) -> None:
         """Register a generic component: kind (e.g. context_store) + name + factory.
 
@@ -150,6 +213,15 @@ class Registry:
         """
         with self._lock:
             self._components.setdefault(kind, {})[name] = factory
+
+    def unregister_component(self, kind: str, name: str) -> bool:
+        """Remove a generic component entry (plugin setup teardown)."""
+        with self._lock:
+            bucket = self._components.get(kind)
+            if bucket and name in bucket:
+                del bucket[name]
+                return True
+            return False
 
     # ── resolution ────────────────────────────────────────
 

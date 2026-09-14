@@ -69,7 +69,7 @@ class _BusHandler(BaseHTTPRequestHandler):
         try:
             on_audit = self.server.node_ctx.get("on_audit")
             if on_audit is not None:
-                on_audit(f"总线拒绝消息: {reason}")
+                on_audit(f"bus rejected message: {reason}")
         except Exception:  # noqa: BLE001 — 审计失败不影响应答
             pass
 
@@ -87,25 +87,25 @@ class _BusHandler(BaseHTTPRequestHandler):
                 "proto": protocol.PROTO_VERSION,
             })
         elif path == "/cnb/reports":
-            # 查看本节点接收到的上报记录（皮层控制台 / CLI 用）
+            # 查看本节点接收到的上报记录（中枢控制台 / CLI 用）
             on_reports = self.server.node_ctx.get("on_reports")
             if on_reports is None:
-                self._note_reject("GET /cnb/reports 不受支持")
+                self._note_reject("GET /cnb/reports not supported")
                 self._send_json(404, {"ok": False, "error": "reports not supported"})
                 return
             try:
                 self._send_json(200, {"ok": True, "reports": on_reports()})
             except Exception as e:
-                self._note_reject(f"GET /cnb/reports 异常: {e}")
+                self._note_reject(f"GET /cnb/reports error: {e}")
                 self._send_json(500, {"ok": False, "error": f"reports error: {e}"})
         else:
-            self._note_reject(f"GET 未知路径 {self.path}")
+            self._note_reject(f"GET unknown path {self.path}")
             self._send_json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
         path = self.path.rstrip("/")
         if path not in ("/cnb/msg", "/cnb/ctrl"):
-            self._note_reject(f"POST 未知路径 {self.path}")
+            self._note_reject(f"POST unknown path {self.path}")
             self._send_json(404, {"ok": False, "error": "not found"})
             return
         try:
@@ -113,15 +113,15 @@ class _BusHandler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length) if length else b"{}"
             envelope = json.loads(raw.decode("utf-8"))
         except Exception as e:
-            self._note_reject(f"坏 JSON: {type(e).__name__}: {e}")
+            self._note_reject(f"bad JSON: {type(e).__name__}: {e}")
             self._send_json(400, {"ok": False, "error": f"bad json: {e}"})
             return
 
-        # 皮层控制端点：/cnb/ctrl（仅根节点/皮层提供；CLI 与 REPL 通过它指挥皮层）
+        # 中枢控制端点：/cnb/ctrl（仅根节点/中枢提供；CLI 与 REPL 通过它指挥中枢）
         if path == "/cnb/ctrl":
             on_ctrl = self.server.node_ctx.get("on_ctrl")
             if on_ctrl is None:
-                self._note_reject("POST /cnb/ctrl 不受支持")
+                self._note_reject("POST /cnb/ctrl not supported")
                 self._send_json(404, {"ok": False, "error": "ctrl not supported"})
                 return
             try:
@@ -129,13 +129,13 @@ class _BusHandler(BaseHTTPRequestHandler):
                 self._send_json(200, reply if isinstance(reply, dict) else {"ok": True})
                 return
             except Exception as e:
-                self._note_reject(f"ctrl 处理异常: {type(e).__name__}: {e}")
+                self._note_reject(f"ctrl handling error: {type(e).__name__}: {e}")
                 self._send_json(500, {"ok": False, "error": f"ctrl error: {e}"})
                 return
 
         handler: Optional[Callable] = self.server.node_ctx.get("on_message")
         if handler is None:
-            self._note_reject("无消息处理器")
+            self._note_reject("no message handler")
             self._send_json(500, {"ok": False, "error": "no message handler"})
             return
 
@@ -143,7 +143,7 @@ class _BusHandler(BaseHTTPRequestHandler):
             reply = handler(envelope)
             self._send_json(200, reply if isinstance(reply, dict) else {"ok": True})
         except Exception as e:
-            self._note_reject(f"消息处理异常: {type(e).__name__}: {e}")
+            self._note_reject(f"message handling error: {type(e).__name__}: {e}")
             self._send_json(500, {"ok": False, "error": f"handler error: {e}"})
 
 
@@ -178,7 +178,7 @@ class BusClient:
             return json.loads(resp.read().decode("utf-8"))
 
     def post_ctrl(self, base_url: str, req: Dict) -> Dict:
-        """调用皮层控制端点 /cnb/ctrl（拓扑/指令/权限/上报查询）。"""
+        """调用中枢控制端点 /cnb/ctrl（拓扑/指令/权限/上报查询）。"""
         url = base_url.rstrip("/") + "/cnb/ctrl"
         data = json.dumps(req, ensure_ascii=False).encode("utf-8")
         r = urllib.request.Request(

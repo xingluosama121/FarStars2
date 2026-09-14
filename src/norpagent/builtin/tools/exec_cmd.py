@@ -7,13 +7,23 @@ ctx.sandbox (Sandbox protocol): when the sandbox implementation is replaced
 tools nor presets need changes.
 
 The cwd parameter is also subject to workspace path safety constraints.
+When no cwd is given, the command runs inside the task workspace root (the
+same root the file tools use; the process cwd is only a last-resort fallback).
+
+2026-09-12 fix: previously the default cwd came from the sandbox / host
+process (e.g. the user home directory), which made relative paths resolve
+differently than in the file tools.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from norpagent.builtin.tools.pathsafe import PathSafetyError, resolve_safe_path
+from norpagent.builtin.tools.pathsafe import (
+    PathSafetyError,
+    resolve_safe_path,
+    workspace_root,
+)
 from norpagent.protocols.tool import Tool, ToolResult
 
 _MAX_TIMEOUT = 300.0
@@ -61,6 +71,17 @@ class ExecCmdTool:
                 cwd = str(resolve_safe_path(ctx, str(raw_cwd), must_exist=True))
             except PathSafetyError as exc:
                 return ToolResult(output=str(exc), success=False, error=str(exc))
+        else:
+            # default: run inside the task workspace root (the same root the
+            # file tools use) instead of the host process working directory —
+            # otherwise the same relative path resolves to different places in
+            # different tools (2026-09-12 fix). Fallback: the sandbox default.
+            try:
+                root = workspace_root(ctx)
+                if root.is_dir():
+                    cwd = str(root)
+            except Exception:  # noqa: BLE001 — keep the sandbox default on failure
+                cwd = None
 
         sandbox = getattr(ctx, "sandbox", None)
         if sandbox is None or not hasattr(sandbox, "run_shell"):

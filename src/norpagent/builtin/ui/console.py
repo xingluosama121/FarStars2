@@ -71,9 +71,12 @@ class ConsoleUI:
                 f"[usage] in={p.get('input')} out={p.get('output')} total={p.get('total')}"
             )
 
-    def ask_user(self, question: str, default: str = "") -> str:
+    def ask_user(self, question: str, default: str = "", kind: str = "") -> str:
         suffix = f" [{default}]" if default else ""
-        self._write(f"{question}{suffix}: ", end="")
+        # Approval is a binary decision: prompt with an explicit (y/n) hint so the
+        # console user knows exactly what to type (the web UI shows buttons instead).
+        hint = " (y/n)" if kind == "approval" else ""
+        self._write(f"{question}{suffix}{hint}: ", end="")
         try:
             answer = input().strip()
         except EOFError:

@@ -29,6 +29,8 @@ def build_standard_preset(model: str = "openai_compat") -> Preset:
         description="Standard mode: a fully featured general coding assistant (full tool set + persistence + long-run cooperation)",
         model=model,
         tools=[
+            # interaction (P0): let the model itself ask the user to clarify / confirm
+            "ask_user",
             # file operations (P2)
             "file_read",
             "file_write",

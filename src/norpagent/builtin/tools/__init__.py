@@ -13,6 +13,7 @@ P3: context_add / context_search / context_list / context_delete (context manage
 """
 
 from norpagent.builtin.tools.echo import EchoTool
+from norpagent.builtin.tools.ask_user import AskUserTool
 from norpagent.builtin.tools.clock import GetTimeTool
 from norpagent.builtin.tools.run_python import RunPythonTool
 from norpagent.builtin.tools.file_io import (
@@ -46,6 +47,7 @@ from norpagent.builtin.tools.task_tools import (
 
 __all__ = [
     "EchoTool",
+    "AskUserTool",
     "GetTimeTool",
     "RunPythonTool",
     "FileReadTool",

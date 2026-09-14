@@ -37,65 +37,87 @@ class BasicProjectManager:
         self.workspace_root = os.path.abspath(workspace_root or os.getcwd())
         self._lock = threading.RLock()
 
+    # ── root resolution ───────────────────────────────────
+
+    def _root(self, workspace_root: Optional[str] = None) -> str:
+        """Effective workspace root for one call.
+
+        A per-call ``workspace_root`` override wins over the instance root, so a
+        task that carries its own workspace (task params) is scanned and reported
+        consistently with the file tools (2026-09-12 fix).
+        """
+        if workspace_root:
+            return os.path.abspath(str(workspace_root))
+        return self.workspace_root
+
     # ── Metadata ──────────────────────────────────────────
 
     @property
     def meta_path(self) -> str:
-        return os.path.join(self.workspace_root, _META_DIR, _META_FILE)
+        return self.meta_path_for()
 
-    def init(self, name: str = "", description: str = "") -> Dict[str, Any]:
+    def meta_path_for(self, workspace_root: Optional[str] = None) -> str:
+        return os.path.join(self._root(workspace_root), _META_DIR, _META_FILE)
+
+    def init(self, name: str = "", description: str = "",
+             workspace_root: Optional[str] = None) -> Dict[str, Any]:
         """Initialize (or read) project metadata. Idempotent."""
+        root = self._root(workspace_root)
         with self._lock:
-            meta = self.load_meta()
+            meta = self.load_meta(workspace_root=root)
             if not meta:
                 meta = {
-                    "name": name or os.path.basename(self.workspace_root.rstrip(os.sep)),
+                    "name": name or os.path.basename(root.rstrip(os.sep)),
                     "description": description,
                     "created_at": time.time(),
                     "updated_at": time.time(),
                     "tasks_total": 0,
                     "tasks_success": 0,
                 }
-                self.save_meta(meta)
+                self.save_meta(meta, workspace_root=root)
             return meta
 
-    def load_meta(self) -> Dict[str, Any]:
+    def load_meta(self, workspace_root: Optional[str] = None) -> Dict[str, Any]:
         with self._lock:
             try:
-                with open(self.meta_path, "r", encoding="utf-8") as fh:
+                with open(self.meta_path_for(workspace_root), "r", encoding="utf-8") as fh:
                     data = json.load(fh)
                 return data if isinstance(data, dict) else {}
             except (OSError, json.JSONDecodeError):
                 return {}
 
-    def save_meta(self, meta: Dict[str, Any]) -> None:
+    def save_meta(self, meta: Dict[str, Any],
+                  workspace_root: Optional[str] = None) -> None:
         with self._lock:
             meta["updated_at"] = time.time()
-            path = self.meta_path
+            path = self.meta_path_for(workspace_root)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(meta, fh, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
 
-    def touch(self, task_id: str = "", success: bool = True) -> None:
+    def touch(self, task_id: str = "", success: bool = True,
+              workspace_root: Optional[str] = None) -> None:
         """Record one task activity (called by the runtime / tools during long-run task cooperation)."""
+        root = self._root(workspace_root)
         with self._lock:
-            meta = self.load_meta()
+            meta = self.load_meta(workspace_root=root)
             if not meta:
-                meta = self.init()
+                meta = self.init(workspace_root=root)
             meta["tasks_total"] = int(meta.get("tasks_total", 0)) + 1
             if success:
                 meta["tasks_success"] = int(meta.get("tasks_success", 0)) + 1
             meta["last_task_id"] = task_id or ""
-            self.save_meta(meta)
+            self.save_meta(meta, workspace_root=root)
 
     # ── Scanning ─────────────────────────────────────────
 
-    def scan(self, top_n: int = 10) -> Dict[str, Any]:
+    def scan(self, top_n: int = 10,
+             workspace_root: Optional[str] = None) -> Dict[str, Any]:
         """Scan the workspace: file count / total size / recently modified files / directory overview."""
         with self._lock:
-            root = self.workspace_root
+            root = self._root(workspace_root)
             total_files = 0
             total_bytes = 0
             by_ext: Dict[str, int] = {}
@@ -151,31 +173,33 @@ class BasicProjectManager:
 
     # ── git status ────────────────────────────────────────
 
-    def git_status(self) -> Optional[Dict[str, Any]]:
+    def git_status(self, workspace_root: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Read git status (None when the workspace is not a git repository)."""
+        root = self._root(workspace_root)
         with self._lock:
-            git_dir = os.path.join(self.workspace_root, ".git")
+            git_dir = os.path.join(root, ".git")
             if not os.path.isdir(git_dir):
                 return None
             out: Dict[str, Any] = {"is_repo": True}
-            branch = self._git(["rev-parse", "--abbrev-ref", "HEAD"])
+            branch = self._git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
             out["branch"] = branch.strip() if branch else ""
-            status = self._git(["status", "--porcelain"])
+            status = self._git(["status", "--porcelain"], cwd=root)
             lines = [l for l in (status or "").splitlines() if l.strip()]
             out["changes"] = len(lines)
             out["staged"] = sum(1 for l in lines if l[:2].strip() != "??" and l[0] != " ")
             out["untracked"] = sum(1 for l in lines if l.startswith("??"))
-            log = self._git(["log", "--oneline", "-5"])
+            log = self._git(["log", "--oneline", "-5"], cwd=root)
             out["recent_commits"] = [l.strip() for l in (log or "").splitlines() if l.strip()]
             return out
 
-    def _git(self, args: List[str], timeout: float = 5.0) -> str:
+    def _git(self, args: List[str], timeout: float = 5.0,
+             cwd: Optional[str] = None) -> str:
         import subprocess
 
         try:
             proc = subprocess.run(
                 ["git"] + args,
-                cwd=self.workspace_root,
+                cwd=self._root(cwd),
                 capture_output=True,
                 timeout=timeout,
             )
@@ -190,15 +214,20 @@ class BasicProjectManager:
         except Exception:
             return ""
 
-    def status(self) -> Dict[str, Any]:
-        """Summarize the project status (data source of the project_status tool)."""
+    def status(self, workspace_root: Optional[str] = None) -> Dict[str, Any]:
+        """Summarize the project status (data source of the project_status tool).
+
+        ``workspace_root`` overrides the instance root for this call, keeping the
+        report consistent with the task's effective workspace (2026-09-12 fix).
+        """
+        root = self._root(workspace_root)
         with self._lock:
-            meta = self.init()
-            scan = self.scan()
+            meta = self.init(workspace_root=root)
+            scan = self.scan(workspace_root=root)
             return {
                 "meta": meta,
                 "scan": scan,
-                "git": self.git_status(),
+                "git": self.git_status(workspace_root=root),
             }
 
     def close(self) -> None:

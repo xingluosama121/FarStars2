@@ -43,7 +43,7 @@ from norpagent import __version__ as __version__  # noqa: F401
 # 保证 python -m nervous_bus.cli / python -m nervous_bus.demo 的 runpy -m
 # 执行路径 100% 走文件（若在此注入同名模块，runpy 会报 loader 不匹配）。
 for _sub in ("protocol", "topology", "permissions", "bus",
-             "node", "cortex", "engine"):
+             "node", "cortex", "engine", "tree"):
     _mod = getattr(__import__("norpagent.cnb", fromlist=[_sub]), _sub, None)
     if _mod is not None:
         _sys.modules[f"{__name__}.{_sub}"] = _mod

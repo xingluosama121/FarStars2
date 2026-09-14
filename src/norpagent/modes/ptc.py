@@ -28,6 +28,8 @@ def build_ptc_preset(model: str = "openai_compat") -> Preset:
         model=model,
         tools=[
             "run_python",  # PTC execution core
+            # interaction: let the model itself ask the user to clarify / confirm
+            "ask_user",
             # orchestrated business tools (full P2 set + P3 context/project/task)
             "echo",
             "get_time",

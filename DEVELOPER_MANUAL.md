@@ -1,6 +1,8 @@
 # NORP Agent 开发手册
 
-> **版本**：2.2.1 ｜ **宣传名**：FarStars（远星）｜ **许可**：Copyright (c) 2026 xingluosama121, MIT Licensed
+> **版本**：2.2.2 ｜ **宣传名**：FarStars（远星）｜ **许可**：Copyright (c) 2026 xingluosama121, MIT Licensed
+>
+> **项目地址**：https://github.com/xingluosama121/farstars2 ｜ **PyPI**：https://pypi.org/project/norpagent/
 >
 > NORP Agent初版发布于2026年7月29日，在8月16日正式上线PyPI，定位为“智能体元框架”。
 
@@ -24,7 +26,6 @@
 - [第 14 章　嵌入式与超高并发部署](#第-14-章嵌入式与超高并发部署)
 - [第 15 章　工作回退：快照 / Undo / Redo / 崩溃救援 / 安全模式](#第-15-章工作回退快照-undo--redo--崩溃救援--安全模式)
 - [第 16 章　库集成示例](#第-16-章库集成示例)
-- [第 17 章　测试与调试](#第-17-章测试与调试)
 - [第 18 章　迁移指南](#第-18-章迁移指南)
 - [第 19 章　常见问题（FAQ）](#第-19-章常见问题faq)
 - [附录 A　架构槽位速查表](#附录-a架构槽位速查表)
@@ -571,9 +572,12 @@ npa.remount(model="myapp.model:create")      # 运行中替换模块文件（热
 ```
 
 底层链路：`npa.remount()` → `engine.remount()` → `ArchLayer.remount()`。
-字符串地址在重新解析前会**失效模块缓存与 .pyc 字节码缓存**，
-因此「修改模块文件 → remount」即可在运行中换上改动后的代码，
-无需重启进程。
+**仅当传入的最外层值本身是字符串**时，才会在重新解析前
+**失效模块缓存与 .pyc 字节码缓存**；dict / list 形态（哪怕其 value
+是地址字符串）不会触发失效（只有最外层的 `isinstance(value, str)`
+判断会失效缓存，不递归进 dict / list），详见 25.2.6。
+因此「修改模块文件 → remount（**裸字符串地址**）」即可在运行中
+换上改动后的代码，无需重启进程。
 
 替换语义按槽位分组：
 
@@ -3250,21 +3254,6 @@ socketserver 模型）；任务经 `WebFrontend._gate` 串行进入引擎，由
 `dropped_total`（累计背压丢弃——持续增长说明客户端过慢，应调大
 缓冲或排查消费端）、`max_buffered`（各连接缓冲深度峰值）。
 
-### 14.4 验证方式
-
-库内验证脚本（`test/`）：
-
-```bash
-python test/_verify_embedded_concurrency.py   # 34 项：极简装配/懒导入/e2e/并发正确性/吞吐
-python test/_smoke_webui_09.py                # WebUI：懒磁盘 I/O/页面缓存/背压热改变/HTTP 并发/SSE
-python test/_smoke_embedded.py                # embedded 预设 e2e
-```
-
-覆盖要点：`install_core` 组件白名单与黑名单、`import norpagent.builtin`
-不拉 sqlite3 / http.server、embedded 默认 headless + mock 回落、
-环境变量收紧工作池、EventBus 写时复制并发订阅/退订正确性、
-submit 中断唤醒、SSE 三策略与热改变、40 并发 HTTP、断连回收。
-
 ---
 
 ## 第 15 章　工作回退：快照 / Undo / Redo / 崩溃救援 / 安全模式
@@ -3627,25 +3616,6 @@ fe = npa.current().frontend
 
 ---
 
-## 第 17 章　测试与调试
-
-```bash
-python tests/test_p1_smoke.py    # 内核/协议冒烟
-python tests/test_p2_smoke.py    # 适配器/工具/会话
-python tests/test_p3_smoke.py    # 上下文/调度/沙箱/安全/插件/Web
-python tests/test_p4_smoke.py    # 钩子/安全/PTC/隔离
-python tests/test_p5_arch.py     # 架构层/地址函数/npa()/nasyncio
-```
-
-调试辅助：
-
-```python
-eng = npa.current()
-print(eng.state)              # 引擎状态
-print(eng.layer.describe())   # 装配清单
-print(eng.last_result)        # 最近任务结果
-```
-
 ---
 
 ## 第 18 章　迁移指南
@@ -3795,7 +3765,7 @@ deepseek-v4-flash / deepseek-v4-pro；旧名在提示列表、远端模型坞
 装配槽位（session / sandbox / scheduler / ui / agent_runtime /
 preset / context_store / project_manager）触发 AgentRuntime 热重建；
 frontend / async_loop 停旧启新；logger / storage / error_handler
-即时更新。字符串地址在重挂载前自动失效模块缓存与 .pyc，
+即时更新。字符串地址在重挂载前自动失效模块缓存与 .pyc（见 25.2.6），
 「改模块文件 → npa.remount(model="myapp.model:create")」即热重载。
 重复挂载的架构级订阅先退订再重挂，不叠加。详见第 3.7 节。
 
@@ -4397,20 +4367,6 @@ subscribe / remount）下写者持锁复制列表期间，emit 会被挡在锁�
 - 工作池：`_DaemonPool`（守护线程，进程退出不 join），`NORPAGENT_MAX_WORKERS` 环境变量调节（嵌入式可压到 1）；
 - 工作池队列**无界**：`put_nowait` 永不失败，池满时任务无限堆积、无拒绝策略、无任务时间预算（边界与卡死兜底矩阵见 4.6.4）。
 
-### 23.5 验证方式
-
-仓库自带全套专项验证脚本（`test/_verify_*.py` / `test/_smoke_*.py`）：
-
-| 脚本 | 覆盖 |
-|---|---|
-| `_verify_install.py` / `_verify_wheel.py` | 安装与打包 |
-| `_verify_js*.py` / `_verify_front.py` / `_verify_css_*` | 前端页面与资源 |
-| `_e2e_webui.py` / `_e2e_shot.py` | WebUI 端到端与截图 |
-| `_verify_ppt_*.py` / `_pixel_check*.py` | 演示文稿与像素校验 |
-| `_final_check.py` / `_verify_coverage.py` | 整体回归与覆盖核对 |
-
-性能基准方法建议：固定输入集 + 固定工具集（minimal 预设），对比不同模型 / 组件实现的输出质量、步数、token 消耗（第 7.3 节模型基准测试）。
-
 ---
 
 ## 第 24 章　救援模式：底层循环控制与人类接管
@@ -4475,7 +4431,7 @@ subscribe / remount）下写者持锁复制列表期间，emit 会被挡在锁�
 3. **select 超时上限**：`_run_once` 把 select 等待时间钳制在 24 小时以内
    （`_MAX_SELECT_TIMEOUT`，与 CPython asyncio 同值）。超远定时器
    （`sleep(1e18)`、远期 `call_later`）在 Windows 上会让 `select()` 抛
-   `OverflowError` 崩溃循环线程——这是暴力压测（24.2.6）发现的真实缺陷，
+   `OverflowError` 崩溃循环线程——这是真实缺陷，
    已修复：循环每睡 24h 醒来重查定时器堆，`abort_main()` 仍可随时打断。
 
 #### 24.2.2 LoopRuntime 协议级控制（NasyncioLoopRuntime）
@@ -4563,21 +4519,6 @@ loop.close()
 4. **不可回收任务**：工作池中卡死的任务（C 扩展阻塞 / 非沙箱 subprocess）
    无任务时间预算（4.6.4 如实说明）——救援兜底是 daemon 线程随进程退出，
    或通过 `RescueToolEnvironment.call_tool(timeout=...)` 的硬超时弃置线程。
-
-#### 24.2.6 循环内核暴力压测（test/stress_nasyncio_core.py）
-
-新增 35 项暴力压测，覆盖「testway.txt 选取 + 事件循环专项补充」两大部分：
-
-| 来源 | 压测项 |
-|---|---|
-| testway.txt 选取（B/C/D/E 类映射） | 冷启动就绪（B01）、快速启停 200 次（D10）、生命周期与资源释放（B02/B24）、100/500/1000 高并发（D02）、5000 批量（D08）、20 万跨线程提交风暴（D05）、超时与内层取消（B17/C02）、异常隔离（C04）、空输入与极端数值（D15/D16）、死锁拒绝（C14）、50 万 handle 资源耗尽（C17）、2000 层递归任务（D19）、重复回调风暴（D27）、内存基线（D11）、60s 混合 soak（D09）、强停延迟（B15）、看门狗 interrupt（E06） |
-| 专项补充（矩阵未覆盖） | 8 线程唤醒竞争、1000 定时器精度与乱序注册顺序、10 万取消风暴、ready 队列不饿死定时器（公平性）、单线程绑定、跨线程 Future 完成、跨线程 Event 唤醒、Lock/Condition 竞争、Task.cancel 穿透（BaseException）、executor 结果/异常回传、closed-loop 拒绝、空循环不忙转（select 阻塞）、1000 并发 sleep 定时器、子进程取消杀进程（zombie 保护） |
-
-运行：`python test/stress_nasyncio_core.py`（约 2 分钟，含 60s soak）。
-
-**压测发现并修复的真实缺陷**：`select()` 超时溢出（Windows `OverflowError:
-timestamp out of range`）——已通过 `_MAX_SELECT_TIMEOUT` 钳制修复（24.2.1
-第 3 条）。其余测试均为对既有实现的验证性通过（35 项 / 110 断言 / 0 失败）。
 
 ### 24.3 手动操作工具（人类接管）
 
@@ -4900,7 +4841,7 @@ if __name__ == "__main__":
 5. **接钩子**（可选）：在实现内经 registry 发布 / 订阅事件（第 9 章）。
 
 热重载是第 4 步的自然延伸：`npa.remount(session="myapp.sessions:create")`
-在运行中重新解析地址、**先失效模块缓存与 .pyc**（3.7 节），因此
+在运行中重新解析地址、**先失效模块缓存与 .pyc**（3.7 节、见 25.2.6），因此
 「改实现代码 → remount」即可热更新，无需重启进程。
 
 ---
@@ -5071,7 +5012,9 @@ Registry 的注册 API 全集（`norpagent.kernel.registry`）：
 #### 25.2.6 热重载工具：键值对的值必须是有效模块（红线）
 
 工具集是**组件槽位**，`npa.remount(tools=...)` 下一次 `run()` 生效
-（Agent 循环每次 run 重新解析工具 schema）。三种形态都可热重载：
+（Agent 循环每次 run 重新解析工具 schema）。三种形态都可**热挂载
+（remount）**；但**改代码后的热重载（换上磁盘新代码）只有裸字符串
+地址做得到**，见下文。
 
 ```python
 npa.remount(tools=["echo", "weather"])                    # 已注册名列表
@@ -5112,12 +5055,39 @@ npa.remount(tools={"weather": WeatherTool()})                 # 实例
 回落」）。**非地址形态的字符串（如 `"high"`、`"./dir"`）不受影响，
 保持字面语义**。
 
-另一个热重载细节：**地址热重载会先失效模块缓存**。`remount` 对
-字符串地址执行 `_invalidate_address_module`——删 `__cached__` 对应
-的 .pyc、弹出 `sys.modules` 条目，下次解析从磁盘重新导入（3.7 节）。
-因此「修改 `myapp/weather_tool.py` → `npa.remount(tools={"weather":
-"myapp.weather_tool:create"})`」即可热更新代码。注意：**实例 / 已注册
-名形态不做模块失效**（没有可失效的地址），改代码后请用地址形态。
+另一个热重载细节（**最容易踩的坑**）：**只有「裸字符串地址」形态
+才触发模块缓存失效**。`remount` 里的判断是
+`if isinstance(value, str): self._invalidate_address_module(value)`
+（`layer.py` L243），它**只看传入的最外层值是不是字符串**，既不
+递归进 dict 的 value，也不遍历 list 的元素。各形态对照：
+
+| 传入形态 | 触发缓存失效 | 改代码后热重载 |
+|---|---|---|
+| `tools="myapp.weather_tool:create"`（裸字符串地址） | 是 | **是** |
+| `tools={"weather": "myapp.weather_tool:create"}`（dict，value 是地址） | 否 | **否**（命中 `sys.modules` 旧模块） |
+| `tools=["myapp.weather_tool:create"]`（list 元素是地址） | 否 | **否** |
+| `tools={"weather": WeatherTool()}`（实例）/ `tools="weather"`（已注册名） | 否 | 否（没有可失效的地址） |
+
+所以「修改 `myapp/weather_tool.py` → 想热更新代码」时，**必须用
+裸字符串地址**：
+
+```python
+# 正确：触发缓存失效，换上磁盘上的新代码
+npa.remount(tools="myapp.weather_tool:create")
+
+# 反例：能挂载、不报错，但会命中 sys.modules 里的旧模块，改了代码也不生效
+npa.remount(tools={"weather": "myapp.weather_tool:create"})
+```
+
+`_invalidate_address_module` 做两步失效：删 `__cached__` 对应的
+.pyc、弹出 `sys.modules` 条目，下次解析从磁盘重新导入（3.7 节）。
+注意它只处理地址里的模块名（`;` 子配置与 `:attr` 不属于模块路径）。
+
+**子模块不失效**：失效动作只弹出地址里那个**确切的模块名**
+（`sys.modules.pop(module_name, None)`，`layer.py` L288），不递归其
+子模块。若地址指向的是**包**、而实现代码在其**已导入的子模块**里，
+改子模块文件后 remount 不会重载——此时应把地址直接指到叶子模块
+（如 `pkg.impl:create`，别停在 `pkg:create`）。
 
 调试建议：热重载失败时检查 `eng.layer.describe()` 的装配清单（3.5 节），
 以及 `reg.list_tools()` 确认名字是否真的注册过。
@@ -5244,7 +5214,7 @@ npa(model="my_http")
 npa(model="myapp.models.http_json:create;endpoint=http://127.0.0.1:8000/v1")
 npa(model=HttpJsonModel(endpoint="..."))
 
-# 热重载：换模型 / 换配置 / 换代码（地址形态会失效模块缓存）
+# 热重载：换模型 / 换配置 / 换代码（裸字符串地址形态会失效模块缓存）
 npa.remount(model="myapp.models.http_json:create;endpoint=http://127.0.0.1:9000/v1")
 ```
 
@@ -5883,7 +5853,7 @@ npa.remount(vector_store={"embedder": "myapp.embd:create"})    # 拼错 → Addr
   点分标识符的字符串保持字面 / 名字语义。
 
 **热重载前会失效模块缓存**：`remount` 对字符串地址先删 .pyc、弹出
-`sys.modules`，再重新导入（3.7 节）。改代码 → remount 即生效；
+`sys.modules`，再重新导入（3.7 节、见 25.2.6）。改代码 → remount 即生效；
 实例形态不做缓存失效。排查热重载失败用 `layer.describe()` 看装配
 清单、`AddressError` 的 traceback 定位地址。
 
@@ -6263,12 +6233,15 @@ reg 用上（如上面的程序式装配，或直接把 reg 传给自定义
 `agent_runtime` 工厂）。最省心的做法是：程序式装配用
 `build_registry(layer)` 产出的 reg，声明式装配用 `npa()` 槽位参数。
 
-热重载的模块缓存失效机制（3.7 节）：`remount` 对字符串地址先执行
-`_invalidate_address_module`——删除模块 `__cached__` 对应的 .pyc、
-弹出 `sys.modules` 条目，下次解析从磁盘重新导入。因此
-「改 `myapp/weather_tool.py` → `npa.remount(tools={"weather":
-"myapp.weather_tool:create"})`」即热更新代码；**实例 / 已注册名
-形态没有可失效的地址，改代码后请用地址形态**。
+热重载的模块缓存失效机制（3.7 节）：`remount` **仅对「最外层值为
+裸字符串地址」**先执行 `_invalidate_address_module`——删除模块
+`__cached__` 对应的 .pyc、弹出 `sys.modules` 条目，下次解析从磁盘
+重新导入。因此要热更新代码必须用裸字符串地址：「改
+`myapp/weather_tool.py` → `npa.remount(tools=
+"myapp.weather_tool:create")`」；**dict / list 形态的地址值
+（如 `tools={"weather": "…:create"}`）不触发失效，会命中
+`sys.modules` 旧模块，改代码后不生效**；实例 / 已注册名形态没有
+可失效的地址。详见 25.2.6。
 
 重入安全：`apply_slot_overrides` 可对运行中的注册表重复执行（每次
 `npa.remount` 都调），重复执行前会先退订上次由它挂上的架构级订阅
@@ -6753,15 +6726,19 @@ layer.remount("model")                      # 按当前配置重解析（热重�
 layer.remount("model", None)                # 清空配置，回落到默认逻辑
 ```
 
-`remount` 的字符串地址会先做两步缓存失效（`_invalidate_address_module`）：
+`remount` **仅当传入值的最外层是字符串**时，才先做两步缓存失效
+（`_invalidate_address_module`；`layer.py` 的 `if isinstance(value, str)`
+判断，不递归 dict / list）：
 
 1. 删除模块字节码缓存（`module.__cached__` 的 .pyc）——否则同一秒内改写
    同尺寸文件会被 importlib 误判为「缓存仍新」，重新导入拿到旧代码；
 2. 弹出 `sys.modules` 条目——下次解析从磁盘重新导入。
 
-于是「改代码 → remount → 新代码生效」的热重载闭环成立。自定义槽位
-（`register_slot` 注册，3.8）同样支持 remount，按注册时的 spec 解析；
-`replace=True` 热替换 spec 后再 remount 按新 spec 解析。
+于是「改代码 → remount（**裸字符串地址**）→ 新代码生效」的热重载闭环
+成立；**dict / list 形态的地址值不会触发失效**，改代码后仍会命中
+`sys.modules` 旧模块（见 25.2.6）。自定义槽位（`register_slot` 注册，
+3.8）同样支持 remount，按注册时的 spec 解析；`replace=True` 热替换 spec
+后再 remount 按新 spec 解析。
 
 #### 27.4.7 与槽位表的关系
 
@@ -7154,6 +7131,7 @@ finally:
 |---|---|---|
 | 订阅了却收不到事件 | 模块级 API 缺省挂在**进程默认系统**，与引擎总线不是同一条 | 显式传 `system=engine.registry`，或直接用 `engine.registry.hooks` |
 | `remount(tools=...)` 报 `AddressError` | 值形如地址但无法解析（红线） | 检查模块路径与属性名；用已注册名或有效实例 |
+| 改代码后 `remount` 仍跑旧逻辑 | 用了 dict / list 形态的地址值，未触发模块缓存失效（只有最外层裸字符串才失效） | 改用裸字符串地址：`npa.remount(tools="myapp.weather_tool:create")`（25.2.6） |
 | `wait` 一直不返回 | 事件名拼写不一致 / 超时参数为 0（视为无限等待） | 用 `subscriber_count` 先确认订阅；明确给 timeout |
 | 热挂载后旧逻辑仍在 | 未重建 AgentRuntime 的槽位（`remount_rebuild_agent=False`） | 查看槽位规格（附录 A）；自定义装配型槽位置 True |
 | 钩子否决不生效 | 用的是 `emit` 而不是可变分发 | 可变语义必须走 `intercept`（9.3） |
@@ -7629,7 +7607,6 @@ src/norpagent/cnb/           # v1.0.7 内核集成后的实现位置
 src/nervous_bus/             # v1.0.7 起为兼容 shim（re-export norpagent.cnb）
 ├── __init__.py      # 符号 re-export + 子模块 sys.modules 注入 + 版本跟随
 ├── cli.py / demo.py # 物理薄文件（python -m 入口走文件执行路径）
-└── test_cnb.py / test_deep_tree.py / test_e2e.py   # 自测（随包，命令不变）
 ```
 
 传输层 `bus.py` 零依赖（仅标准库）：每个节点起一个 `ThreadingHTTPServer` 作为总线接入点，客户端用 `urllib` 投递。总线端点：
@@ -7923,28 +7900,6 @@ tbl.check("file_read")       # True（默认允许）
 6. **传输默认回环**：默认绑定 `127.0.0.1`，跨机部署需显式配置 host 并自行保证网络可信（建议叠加 TLS/签名）。
 7. **中枢不受下行控制**：中枢（level 0）无父节点，任何下行指令均无法通过祖先校验——低等级无法改写高等级。
 
-### 30.11 测试与验证
-
-| 套件 | 覆盖 | 结果 |
-|---|---|---|
-| `test_cnb.py`（60 项） | 树状拓扑链、逐级注册转发、分层等级、上行只读、下行服从、权限控制（node_id/node_kind/*）、越权拦截（低->高/平级/控制字段/等级篡改/父节点篡改/类型伪装/非祖先上报）、注销与**活子救树提升**、权限面审计（T-A0~T-A6：`perm.denied` / `perm.changed` 上行汇聚与 `perm_audit` 视图） | 60/60 通过 |
-| `test_e2e.py`（13 项） | 真实多进程（main.py 入口：1 中枢 + 3 节点）、CLI 全链路、权限收紧后执行被拒、越权拦截、心跳汇聚 | 13/13 通过 |
-| `test/test_cnb_automount.py`（12 项，2026-09 新增） | 普通引擎 `NORP_CNB_*` 自动挂载（含 `NORP_CNB_MANAGED=1` 跳过开关）；exec 动作面（run_task/status/stop_task，缺 prompt 拒、未知动作拒——新契约 `ok=False` + 顶层 error）；stop 停任务引擎保持运行；reload 重读 env + 插件热载面；perm 收紧/恢复；引擎停止注销 | 12/12 通过 |
-| `test_deep_tree.py`（36 项，2026-09-05 新增） | 4 层链（cortex->tech->rnd->dev）：深层父子关系（B1）、祖先链无重复（B6）、深层心跳/事件/请求汇聚（B2）、中间层正常退出救树（B3）、中间层崩溃清扫救树、权限时间序（B4）、心跳自愈（D11）、真死收敛（D12）、清扫后中间层本地缓存收敛（D13a-f） | 36/36 通过 |
-| `test/test_cnb_kernel_actions.py`（32 项，v1.0.7 新增） | A 21 项同进程：全 14 项内核动作面（engine_state/inspect/snapshot/rollback/undo/redo/list_snapshots/mark_good/remount/reload_plugins/stop_engine 等）、心跳携带内核状态、`task_started` 上行、stop_engine 注销收敛；B 11 项多进程：CLI cortex/node 默认引擎装配（engine=on、动作面 14）、中枢 exec engine_state、心跳 reports 可见、stop_engine 节点进程退出 | A 21/21 + B 11/11 通过 |
-| `test/test_cnb_tree_suite.py`（56 项，2026-09-12 反馈轮新增） | 神经树显式定义：三来源解析（dict / JSON / PY）、必要参数逐条报错、父级端口表示与 `level:N` 轮转、进程内装配与差分改形、监视自动改形、自动收敛、多进程真进程树、np 集成与错误语义、CLI | 56/56 通过 |
-
-```bash
-# 测试命令（v1.0.7 起 nervous_bus 为兼容 shim，下列命令指向 norpagent.cnb 内核实现）
-python -m nervous_bus.test_cnb
-python -m nervous_bus.test_e2e
-python -m nervous_bus.test_deep_tree     # 深树专项回归（4 层链）
-python -m nervous_bus.demo               # 同进程模拟神经树演示
-python test/test_cnb_automount.py        # 自动挂载验收冒烟（需 PYTHONPATH=src）
-python test/test_cnb_kernel_actions.py   # 内核动作面验收（需 PYTHONPATH=src；可加 A/B 参数分场景）
-python test/test_cnb_tree_suite.py        # 神经树显式定义验收（需 PYTHONPATH=src）
-```
-
 ### 30.12 与 norpagent 本体的集成点（v1.0.2+ 实际位置）
 
 | 文件 | 改动 | 说明 |
@@ -7957,7 +7912,6 @@ python test/test_cnb_tree_suite.py        # 神经树显式定义验收（需 PY
 | `norpagent/runtime/cnb.py`（转发层） | re-export `norpagent.cnb.engine`（`CnbAdapter` / `setup_cnb` / `KERNEL_ACTIONS` / `EXEC_ACTIONS` 兼容名） | `NorpEngine._setup_cnb()` 的 `from norpagent.runtime.cnb import setup_cnb` 保持可用（engine.py 零改动） |
 | `norpagent/cnb/engine.py`（v1.0.7 新增） | `CnbAdapter`：env 读取 → NervousNode 装配 → **14 项内核动作注册**（KERNEL_ACTIONS）→ 后台挂载（注册重试 / 降级 / 注销）；心跳 provider（engine_state / active_tasks / version / actions） | 30.8 / 30.16 的完整实现；含 `NORP_CNB_MANAGED` 跳过开关 |
 | `norpagent/loops/nasyncio.py` | 可选扩展 `submit_async`（`NasyncTaskHandle` 单任务可取消句柄） | 任务级取消的 loop 层基础（引擎以 hasattr 探测，缺失自动降级） |
-| `nervous_bus/test_e2e.py` | ROOT 定位自动爬升至含 `main.py` 的仓库根 | v1.0.2 src/ 布局下 `python -m nervous_bus.test_e2e` 恢复可用（v1.0.7 经 shim 指向 `norpagent.cnb` 实现） |
 
 设计边界（如实记录）：本版为**本机多实例**设计（回环传输、无加密）；跨机部署需补充 TLS 与节点签名。① 自动挂载契约只认 `NORP_CNB_*` 环境变量（不读 config.json）；② `cmd.exec` 动作面为**内核动作注册表**（14 项内核动作，未注册动作节点端拒绝）；③ 中枢权限指令对 **CNB 指令面**立即生效（节点权限表在每次 `cmd.exec` 前置检查）；把中枢权限同步进**进程内工具调用链**属于后续 `permission_cascade.PermissionCascade` 接入项（`perm_changed` 回调已预留）；④ kind / level / parent / port 注册后不可变（身份防篡改），`reload` 只热更新运行时参数与外部插件。
 
@@ -7989,7 +7943,7 @@ engine.forget_task(handle.task_id)   # 从注册表摘除已完成任务（书�
 
 ### 30.14 深树修复：浅树自洽、深树断裂整改（2026-09-05）
 
-**背景**：官方自测（test_cnb 51 + test_e2e 13 + automount 12）全部是 ≤2 层扁平场景（原子直挂中枢），从未覆盖 ≥3 层链式转发。对 cortex → tech → rnd → dev 四层链做体检，注册 / 上行 / 断链三条主链暴露 9 项问题，3 项高危。以下为逐项修复记录（全部有深树回归测试覆盖，见 30.11）。
+**背景**：对 cortex → tech → rnd → dev 四层链做体检，注册 / 上行 / 断链三条主链暴露 9 项问题，3 项高危。以下为逐项修复记录。
 
 #### B1（高危）深层注册坍缩 —— `via` 每跳覆盖
 
@@ -8007,7 +7961,7 @@ engine.forget_task(handle.task_id)   # 从注册表摘除已完成任务（书�
 - 修复（`node.py _rescue_children` + `cortex.py` 清扫线程）：
   1. **正常退出路径**：收到 `report.deregister(X)` 时先救树——把 X 的每个直接子**提升挂到本节点之下**（`topology.set_parent`，双向维护 children），并下发 **`cmd.reroot`**（新下行指令：携带新父 id / 总线地址 / 祖父链）通知子节点改挂；子节点收到后更新 `parent_url`/`parent_node_id`/`_ancestors` 并**立即重新注册锚定**（此后心跳/上报直发新父）。最后才注销 X（子已改挂，只删自身）。整条链逐级执行同一逻辑，中枢最终收敛为权威视图。
   2. **崩溃路径**（无 deregister）：中枢新增**失联清扫守护线程**（`Cortex(sweep_interval / dead_timeout / drop_grace)`，`_sweep_loop` 接线此前零调用点的 `sweep_dead`）：超 `dead_timeout` 未心跳 → 标记 dead；dead 且有子 → 救树提升；整支失联超 `drop_grace` → 级联注销；dead 叶子超 `drop_grace` → 注销（宽限期保护「父断链导致上报中断」的活叶子——其父被救后转发恢复，心跳即续上）。
-  3. **心跳自愈**：任何节点心跳被父节点拒绝（父重启 / 中枢视图重建 / 被清扫误判）→ 自动重新注册。`test_deep_tree` D07/D11/D12 实测：中间层崩溃后活子树被救并续传心跳、失忆节点自动重挂、真死节点被清扫收敛。
+  3. **心跳自愈**：任何节点心跳被父节点拒绝（父重启 / 中枢视图重建 / 被清扫误判）→ 自动重新注册：中间层崩溃后活子树被救并续传心跳、失忆节点自动重挂、真死节点被清扫收敛。
 - 附带修复：`topology.set_parent` 原先只往新父 children 追加、**不摘除旧父 children**（旧父注销时 DFS 会把已改挂子节点误删），已改为双向维护；`Topology.register` 对父节点缺失显式 `ValueError`（原实现维护 children 时 KeyError 崩溃）。
 
 #### B4 类型级 revoke 失效 —— 权限判定改纯时间序
@@ -8039,7 +7993,6 @@ engine.forget_task(handle.task_id)   # 从注册表摘除已完成任务（书�
 
 **新下行指令 `cmd.reroot`**（协议层 DOWNLINK_TYPES 已登记）：父链断链救援专用——由祖先（典型为中枢）下发，payload `{parent_id, parent_url, ancestors}`；接收节点更新本地父指针与祖先链后立即 `register()` 重新锚定。仍受下行祖先校验约束（非祖先下发一律拒绝）。
 
-**测试防线**：新增 `src/nervous_bus/test_deep_tree.py`（30 项，4 层链专项），四层链 + 崩溃 + 清扫 + 权限时序 + 心跳状态 + 自动广播全覆盖；T48（原「级联注销」断言）改为「活子救树提升」语义。
 
 ### 30.15 深树收敛闭环与权限面审计（v1.0.6，2026-09-05）
 
@@ -8052,7 +8005,6 @@ engine.forget_task(handle.task_id)   # 从注册表摘除已完成任务（书�
   1. **剪枝**：本地拓扑中不在快照里的节点（自身除外）级联注销（中枢清扫/注销后的收敛路径）；
   2. **父指针收敛**：快照内节点父指针与本地不一致时 `topology.set_parent` 对齐中枢权威视图（等级 / 类型防篡改校验保留，防御性拒绝）；
   3. **自愈兜底**：剪枝造成的瞬时缺失（注册上行在途、快照时刻略旧）由「心跳被拒 → 自动重新注册」自愈，活节点不丢。
-- 回归：`test_deep_tree` 新增 D13a-f——probe-x 直挂中间层 rnd 后强杀，中枢清扫注销 → rnd 本地拓扑剪枝 → 心跳 descendants 收敛 → 子树视图与中枢一致（同 id 集合）。套件 30→**36 全绿**。
 
 #### 缺口 B：权限面审计上行（依赖内核上汇中枢）
 
@@ -8061,9 +8013,8 @@ engine.forget_task(handle.task_id)   # 从注册表摘除已完成任务（书�
   1. **节点上行**（`node.py`）：`cmd.exec` 被权限表拒绝 → 上行 `report.audit(event="perm.denied", detail={action, perm, path})`；`cmd.perm.*` 生效 → 上行 `report.audit(event="perm.changed", detail={op, target_type, target, perm/allows, source})`（`_perm_uplink_audit`），并补节点本地生效审计行。经父链逐级汇聚（中间层只记录并转发，B2 语义），最终落在中枢 reports 环。
   2. **中枢记录**（`cortex.py`）：`_note_perm_op` 把中枢自身发出的 grant/revoke/set 写结构化权限操作环（500 条）；`perm_audit(n)` 合并中枢操作（`perm.op.*`）与节点上行事件（`perm.denied` / `perm.changed`），按时间倒序。
   3. **读取面**：中枢 REPL 新增 `perm_audit [n]` 命令；控制端点新增 `op=perm_audit`（`/cnb/ctrl`）——同权限审计读取方直接消费该端点。
-- 回归：`test_cnb` 新增 T-A0~T-A6——构造撤销+拒绝+授予，验证中枢可见 `perm.denied` / `perm.changed` 上行、**深层 pilot 的拒绝经中间层转发到中枢**、`op=perm_audit` 视图同时含中枢操作与节点上行事件。套件 52→**60 全绿**。
 
-**版本**：norpagent **1.0.6**；CNB 协议仍为 CNB/1.0（协议面新增语义不变：`cmd.topology.sync` 快照镜像收敛、`report.audit` 权限面事件约定）。全部套件复跑：test_cnb 60 + test_deep_tree 36 + test_e2e 13 + automount 12 全绿。
+**版本**：norpagent **1.0.6**；CNB 协议仍为 CNB/1.0（协议面新增语义不变：`cmd.topology.sync` 快照镜像收敛、`report.audit` 权限面事件约定）。
 
 ### 30.16 CNB 内核集成（v1.0.7）：实现内化为内核子模块
 
@@ -8152,19 +8103,6 @@ API：`register_action(action, handler)` / `unregister_action(action)` /
   （中枢视角任务全生命周期可见）；
 - 未知动作拒绝、权限拒绝（`perm.denied`）等审计照常上行（缺口 B 机制不变）。
 
-#### 30.16.6 测试矩阵（2026-09-05 实测全绿）
-
-| 套件 | 数量 | 说明 |
-|---|---|---|
-| `python -m nervous_bus.test_cnb` | 60/60 | 单元/集成（迁移回归零破坏，经 shim） |
-| `python -m nervous_bus.test_deep_tree` | 36/36 | 4 层深树回归 |
-| `python -m nervous_bus.test_e2e` | 13/13 | 真实多进程端到端（经 main.py / norpagent.cnb.cli） |
-| `test/test_cnb_automount.py` | 12/12 | env 自动挂载验收（四回调 + perm + managed） |
-| `test/test_cnb_kernel_actions.py` | A 21 + B 11 = 32/32 | **v1.0.7 新增**：A 同进程全动作面（snapshot/rollback/undo/redo/remount/stop_engine/心跳内核态/task_started）；B 多进程 CLI 默认引擎（engine=on、动作面 15、stop_engine 进程退出） |
-| `python -m nervous_bus.test_cnb_v200` | 44/44 | **v2.0.0 新增**：任务分子通道（mol 六要素原样/验收回执/mol_id 贯穿）、冻结态（拒新单/保活取证/不判 dead/康复回树）、行为基线分级（黄/黑升级链）、传票取证（容量分档/分卷/隔离帧/读取即焚/冒用拒绝/签发留痕） |
-
-运行示例：`PYTHONPATH=src python test/test_cnb_kernel_actions.py A`（或 `B`）。
-
 ---
 
 ### 30.17 内核功能扩展：任务分子通道 / 隔离冻结态 / 行为基线 / 传票取证（v2.0.0 · 远星 FarStars）
@@ -8199,8 +8137,6 @@ API：`register_action(action, handler)` / `unregister_action(action)` /
   原样随 `task_done` 回传中枢（是否判定通过由中枢/上层策略消费，内核
   不替判定）；中枢 reports 环即完整的 mol 全生命周期视图。
 
-验收实证（§30.11 测试矩阵 `test_cnb_v200` S101~S109）：六要素深度相等
-无字段丢失；task_done 事件带 mol_id + acceptance；审计可追溯。
 
 #### 30.17.2 隔离冻结态（quarantine）：freeze / unfreeze
 
@@ -8357,10 +8293,6 @@ norpagent exec --node norpbot-01 --action slot_describe \
 
 `CnbAdapter.bind_actions()` 同时完成：内核动作面直接注册（source=kernel）+ 完整实例模块挂入默认槽位 `norpagent`（source=slot，动作面兜底——即便手工装配不做直接注册，节点仍具备完整实例操作面）；心跳携带槽位用量（`slots.count` / `slots.free`），中枢 `reports` 可直接看到每个原子的槽位占用与空位。
 
-#### 30.18.5 验收
-
-`src/nervous_bus/test_cnb_slots.py`（51 项）、`test/test_cnb_kernel_actions.py`（32 项）、M4.5 暴力混合压测 H 域（含槽位子域）全绿。
-
 ---
 
 ### 30.19 神经树显式定义：不预设形状（2026-09-12 反馈轮）
@@ -8443,10 +8375,6 @@ np.remount(cnb=False)                           # 卸载整树
 - 直接校验面（`validate_cnb_config` / `np.remount`）：保持「显式报错」的严格语义（调用方可立即处理）；
 - 端口规则不变：不写死默认端口（R-025）；禁止静默退化。
 
-#### 30.19.7 验收
-
-`test/test_cnb_tree_suite.py`（56 项）：三来源解析、必要参数逐条报错、父级三种表示、进程内装配与差分改形、监视自动改形、自动收敛、多进程真进程树、np 集成与错误语义、CLI——全部通过；回归复跑 CNB 全家与 M4.5 全绿。
-
 ## 第 31 章　成品发行版：norpagent unbox
 
 ### 31.1 定位
@@ -8468,7 +8396,7 @@ np.remount(cnb=False)                           # 卸载整树
 ```bash
 norpagent unbox                          # 浏览器打开即用（默认端口 8890）
 norpagent unbox --port 8891 --no-browser # 指定端口 / 不自动开浏览器
-norpagent unbox --smoke                  # 自检：装配 → 健康检查 → 退出（CI/测试）
+norpagent unbox --smoke                  # 自检：装配 → 健康检查 → 退出（CI）
 norpagent unbox --cnb --cnb-port 17811   # 显式启用 CNB（端口必配，R-025）
 norpagent unbox --cnb-parent http://127.0.0.1:17800 --cnb-port 17811
                                          # 以节点身份加入既有神经树
@@ -8535,7 +8463,7 @@ FarStars（远星）开箱即用软件已上线
 - 入树节点：等待引擎挂载状态（`cnb_status == "mounted"`）；
 - 神经树（显式定义）：等待 `cnb_status` 到达 `mounted`；`config-error` 属「显式报错、不阻塞启动」的既定语义，按产品健康口径如实报告（打印错误内容）。
 
-输出末行 `SMOKE OK`（退出码 0）或 `SMOKE FAILED`（退出码 1），CI / 测试可直接断言。
+输出末行 `SMOKE OK`（退出码 0）或 `SMOKE FAILED`（退出码 1），CI 流程可直接断言。
 
 ### 31.6 失败处置与救援提示
 
@@ -8645,14 +8573,9 @@ API：`ApprovalPolicy.decisions()`（面板数据源）/ `set_manual()`（勾选
 
 进化日志（JSONL，默认 `~/.norpagent/evolution_log.jsonl`，`NORPAGENT_EVOLUTION_LOG` 可覆盖）事件：`hotswap.stage` / `hotswap.activate` / `hotswap.failed` / `hotswap.rollback` / `fspack.export` / `fspack.import` / `fspack.import.failed` / `fspack.bundle.export` / `fspack.bundle.import.ok` / `fspack.bundle.import.failed` / `evolution.command` 等。
 
-### 32.8 验收
-
-- `test/test_evolution_suite.py`（49 项）全绿；
-- M4.5 暴力混合压测 I 域（自进化：勾选 / 热重载 / 进化包 / 节奏）全绿。
-
 ### 32.9 运行期加固：健康核验、自动回退与巡检（2026-09-12 反馈轮）
 
-> 反馈问题：自进化「会不会自己改坏了」。回答不是承诺，而是**多层防线 + 每层可验证**（下述机制均有套件实证）。
+> 反馈问题：自进化「会不会自己改坏了」。回答不是承诺，而是**多层防线 + 每层可验证**（下述机制均可验证）。
 
 **防线清单（纵深防御）**：
 
@@ -8678,7 +8601,6 @@ board = evo.ProposalBoard()
 print(board.health_sweep())          # 巡检全部已应用代码提案（启动时自动执行一次）
 ```
 
-验收：`test/test_evo_hardening_suite.py`（19 项：健康通过 / 失败回退 / 自定义回退 / 无回退手段仍显式失败 / 坏代码无法激活 / 文件丢失与原文件被改动检出 / 巡检回退熔断 / 启动巡检 / 锁定项拒绝）全绿；既有进化套件 49 项复跑全绿。
 
 ## 第 33 章　插件开发完全指南
 
@@ -9428,25 +9350,17 @@ np.remount(cnb=False)                                  # 运行中摘下（引�
 - **共通 i18n（`/assets/i18n.js`）**：统一语言集 `zh_CN / zh_TW / en`、统一存储键 `np_lang`；接口 `FarStarsI18N.get() / set(lang) / onChange(fn) / t(key) / register(dicts)`；旧键（`farstars_lang` / `norpflow.lang`）自动迁移；主前端 / 星轨控制台 / FLOW 三端接入，任一页切换全端生效（含跨标签 storage 同步）；
 - **会话与输入框**：会话批量清除 / 清空全部（`POST /api/sessions/clear`，ids 省略 = 全部）；输入框内联控制模式 / 模型名 / 工作区（含目录选择器 `/api/fs/list`）。
 
-### 34.9 验收
-
-- `test/test_v22_suite.py`（65 项：元框架 / 成品态 / CNB remount / 设置事实源 / 白盒 / 进化闭环 / 前端与 i18n）全绿；
-- `test/stress_m45_suite.py` 扩展（J16~J23 / K11~K14）全绿；最小内核 147 / 进化 49 / CNB 槽位 51 / 插件 100 复跑全绿；
-- 前端 V2 无头浏览器冒烟全绿；版本号统一 2.2.0；
-- **2026-09-12 反馈轮新增**：`test/test_cnb_tree_suite.py`（56 项，神经树显式定义）与 `test/test_evo_hardening_suite.py`（19 项，自进化运行期加固）全绿；M4.5 219、v2.2 65、最小内核 147、进化 49、CNB 全家（60 / 44 / 36 / 13 / 57 / 12 / 51 / 32）复跑全绿。
-
 ---
 
 ### 34.10 2026-09-12 反馈轮增补（版本约定 / nasyncio / 自进化加固 / CNB 树定义）
 
 | 项 | 落点 | 说明 |
 |---|---|---|
-| 版本约定 | 本手册头部 + 全部活跃文档 | 活跃文档统一以当前发布版本为代码基线（该章成文时为 **2.2.0**，现行为 **2.2.1**）；历史修订记录版本号仅表示当时基线；归档文档保持原样 |
+| 版本约定 | 本手册头部 + 全部活跃文档 | 活跃文档统一以当前发布版本为代码基线（该章成文时为 **2.2.0**，现行为 **2.2.2**）；历史修订记录版本号仅表示当时基线；归档文档保持原样 |
 | asyncio 与 nasyncio 并存 | §4.7 + 第 19 章 FAQ | 标准库 `asyncio` 与自研 `norpagent.nasyncio` 互不冲突、可同进程同时使用（不依赖 = 不接管） |
 | 自进化运行期加固 | §32.9；`evolution/hotswap.py` / `evolution/proposals.py` | `verify_active` / `activate(health=...)` 自动回退 / `health_sweep` 巡检 / `bootstrap` 启动巡检 |
 | CNB 神经树显式定义 | §30.19；`cnb/tree.py`；`norpagent tree validate|show|up` | 不预设形状；三种来源；缺必要参数即报错；两种装配；remount 改形 / 监视自动改形 / 自动收敛；`np()` 启动路径配置错误不阻塞启动 |
 
-验收：`test/test_cnb_tree_suite.py` 56 项、`test/test_evo_hardening_suite.py` 19 项全绿；M4.5 219、v2.2 65、最小内核 147、进化 49、CNB 全家（60 / 44 / 36 / 13 / 57 / 12 / 51 / 32）复跑全绿。
 
 ## 附录 D　术语表
 
@@ -9995,21 +9909,6 @@ STT: POST {stt_service_url}（multipart/form-data）
 
 状态查询：`engine.cnb_status`（`not-mounted` / `managed-skip` / `mounting` / `mounted` / `failed` / `stopped` / `config-error`——配置错误显式报错且不加载神经树、宿主照常运行）；配置与装配错误内容经 `engine.cnb_error` 读取；`engine.cnb` 返回适配器（含 `status` / `perm_summary`）。中枢下行指令面：`exec`（动作白名单 `run_task`/`status`/`stop_task`）、`stop`、`reload`、`perm.*`，落地语义见 §30.8 四回调表。
 
-### J.7 测试命令
-
-```bash
-# v2.0.0 实测全绿；nervous_bus 为兼容 shim（测试文件仍随 shim 包分发，命令不变）
-python -m nervous_bus.test_cnb             # 60 项单元/集成自测（含权限面审计 T-A0~T-A6）
-python -m nervous_bus.test_e2e             # 13 项真实多进程端到端（ROOT 自动定位仓库根）
-python -m nervous_bus.test_deep_tree       # 36 项深树专项回归（4 层链：注册坍缩/上行汇聚/救树/清扫/权限时间序/心跳自愈/自动广播/缓存收敛）
-python -m nervous_bus.test_cnb_v200      # 44 项 v2.0.0 新增能力验收（mol 通道/冻结态/行为基线/传票取证）
-python -m nervous_bus.test_cnb_slots     # 51 项：通用槽位体系（R-024 / R-025：≤64 边界 / 动作冲突 / 事务性 / 实例模块）
-python -m nervous_bus.demo                 # 同进程神经树演示
-python test/test_cnb_automount.py          # 12 项：引擎 NORP_CNB_* 自动挂载验收冒烟（需 PYTHONPATH=src）
-python test/test_cnb_kernel_actions.py     # 32 项：内核动作面验收 A 21 + B 11（v1.0.7 新增；需 PYTHONPATH=src）
-python test/test_cnb_tree_suite.py         # 56 项：神经树显式定义验收（2026-09-12 反馈轮新增；需 PYTHONPATH=src）
-```
-
 ### J.8 v2.0.0 新增命令面与常量（远星 FarStars）
 
 ```bash
@@ -10041,7 +9940,7 @@ norpagent exec --root ... --node dev --action task_records --args '{"mol_id": ".
 
 ## 修订记录（历史版本）
 
-> **版本约定（2026-09-12 反馈轮）**：本手册与全部活跃文档以当前发布版本 **2.2.1** 为代码基线；下方历史修订记录中的版本号仅表示当时的基线，不再代表现状；归档文档（旧版手册、历史更新摘录等）保持原样。
+> **版本约定（2026-09-12 反馈轮）**：本手册与全部活跃文档以当前发布版本 **2.2.2** 为代码基线；下方历史修订记录中的版本号仅表示当时的基线，不再代表现状；归档文档（旧版手册、历史更新摘录等）保持原样。
 > **2026-09-12 v2.2.1 缺陷收口（R-032 / R-033）**：① **`ask_user` 工具补齐（R-033）**——内置工具面新增 `ask_user`，模型可通过工具调用主动向用户提问 / 澄清需求 / 确认危险操作（此前仅有 UI 适配器与内核审批链的内部机制，活跃工具集缺失该工具）；standard / ptc / longrun 预设与 `install_defaults` / `install_core` 两个装配入口均注册该工具；② **token 计数计入原始文本（R-032）**——端点未回传 usage 时，后端按**原始文本**（raw markdown / LaTeX 源码 + 提示词）估算 input + output（此前只统计渲染后的可见输出且缺 input，导致总 token 偏低）；估算值带 `estimated` 标记，前端以「≈」如实标注为估算；端点回传 usage 时仍以服务端数值为准。版本号统一升至 **2.2.1**。
 > **2026-09-12 v2.2.1 反馈轮收口（前端统计口径 / 设置双语 / 滚动统一 / 即时停止 / 工作区清整）**：同一 2.2.1 版本内继续收口用户反馈轮问题（不另起版本号）——① **前端统计口径**：移除右上角恒为 0 的「0 tok」徽标，token / 速度估算纳入思考（think）与工具调用参数（tool，`toolCallTextOf`，不含工具返回结果）；② **设置项双语**：前端 `SET_ZH` / `SET_ZH_POINT` 词典覆盖全部 123 个非进化类设置键（进化点标题运行时组合），`settingRowHtml` 按语言渲染（英回退 schema、简中用词典、繁中回退简中）；③ **一键回到底部**：新增 `.msgs-wrap` 包裹层，按钮移出滚动容器 `#msgs`、稳定悬浮右下角；④ **打开会话滑动到底部**：`slideToBottom()` 逐帧 easeOutCubic 约 720ms，仅切换 / 打开会话触发；⑤ **滚动逻辑统一（对齐 `duo2.py`）**：粘性 `_userScrolled`（容差 10px）取代距离判据，自动滚动收敛到唯一入口 `scrollBottom(force, animate)`；⑥ **停止即时生效**：`web.py::_stop_events` 每会话取消事件表（`stop_task()` 同步 `set()`）+ 内核流式循环回传部分内容并以 `stopped` 收尾、部分回复落库；⑦ **工作区清整**：根目录 `_*` 产物 622 项移入 `test/`，本手册开头超长修订块移至文末「修订记录（历史版本）」。版本号保持 **2.2.1**。
 > **2026-09-12 反馈轮（版本号统一 / asyncio 与 nasyncio 并存声明 / 自进化运行期加固 / CNB 神经树显式定义）**：① **版本号统一**——活跃文档一律以 **2.2.0** 为代码基线（见上「版本约定」；NERVOUS_BUS.md 的 2.0.0 等历史声明同步修正）；② **asyncio 与 nasyncio 并存**——标准库 `asyncio` 与自研 `norpagent.nasyncio` **互不冲突、可在同一进程内同时使用**（不依赖 = 不接管；详见 §4.7 与第 19 章 FAQ）；③ **自进化运行期加固**——激活后健康核验 + 失败自动回退、活跃版本巡检（`hotswap.verify_active`）、启动巡检与损坏自动回退熔断（`ProposalBoard.health_sweep`；详见 §32.9、§34.10）；④ **CNB 神经树显式定义**——CNB **不预设任何树形状**：启动时显式传入整树定义（每层 LEVEL、个数、低层父级、端口等必要参数，缺一即逐条显式报错），定义来源支持直接参数 / JSON 文件 / PY 文件；支持进程内整树与多进程真进程树两种装配；运行中可 `np.remount(cnb={"tree": ...})` 改形、可监视定义文件自动改形、自动收敛；npa 启动路径 CNB 配置错误**不阻塞启动**（显式报错 + 神经树不加载，`cnb_status=config-error`、`cnb_error` 可查）；新增 `norpagent tree validate|show|up` 子命令（详见 §30.19）。
@@ -10049,18 +9948,18 @@ norpagent exec --root ... --node dev --action task_records --args '{"mol_id": ".
 > **2026-09-11 v2.1.0 插件系统专项（内核派发修复 + 插件能力全量扩展 + 新增第 33 章）**：① **内核钩子派发修复**——`before_step / before_tool_call / after_tool_call` 三处 emit+intercept 双派发收敛为单次调用（副作用不再翻倍、UI 不再双打印）；`EventBus.intercept` 升级为「遍历全部订阅者、首个非 None 生效」（多插件不再互截断）；② **插件桥接完整修复**——`PluginContext` 补齐 `logger / storage`（既有生态插件的核心依赖）；16 个兼容钩子签名逐参数对齐（`on_task_stopped` 支持 `(ctx)` 与 `(reason, ctx)` 自适应、`after_step` 补 `reasoning` 与完整 `tool_calls` 列表、`on_usage_update` 新旧双键名）；pass-through 返回规范化为不改写；钩子异常不再静默（首错打印 + 计数 + `diagnostics` 记录）；③ **29 钩子全开放**（16 兼容 + 13 原生）；④ **`setup(api)` 注册门面**——插件可注册动态工具 / 自定义槽位 / 组件 / 模型 / 会话 / 沙箱 / 调度器 / UI / 自定义钩子 / 事件订阅 / 服务 / Web 页面 / CLI 命令 / 设置项，能力声明门禁（`PLUGIN_CAPABILITIES`）；⑤ **生命周期与干净热重载**——`on_load / on_unload`、卸载真正退订与回收注册、单插件 `reload`；⑥ **依赖与版本声明**（`PLUGIN_REQUIRES / PLUGIN_MIN_NORPAGENT`）；⑦ **Web 插件面板升级**（完整状态 / 失败原因 / 签名 / 隔离 / 警告 / 诊断；启用禁用 / 卸载 / 上传安装）与 CLI `norpagent plugins list|run`；⑧ **新增第 33 章《插件开发完全指南》**（中英同步，含 29 钩子全表 / setup API 全表 / 完整教程 / 排错 / 迁移 / 发布清单）。版本号统一升至 **2.1.0**。
 > **2026-09-11 增补（CNB 通用槽位 / 成品发行版入口 unbox / 自进化体系）**：① **CNB 通用槽位（R-024 / R-025 修订版）**——神经总线每一节点提供最多 **64 个通用槽位**，走总线可挂载 model / tools / plugins / 自定义模块；norpagent 完整实例不做抛弃：包装为标准可插拔模块 `NorpAgentModule`（kind=`norpagent-instance`），可插、可拔、可描述、可替换（详见 §30.18）；② **成品发行版入口 `norpagent unbox`（R-006 / R-014 / R-007）**——一键拉起开箱即用的自进化用户软件：单个功能强大的智能体 + Web 控制台 + 声明式装配档案；CNB 默认不携带、启用须手动配置端口（详见第 31 章）；③ **自进化体系（R-004 / R-005 / R-010 ~ R-012 / R-017）**——设置事实源（SQLite + JSON）、逐项勾选审批、代码热重载（不删原逻辑、可回退）、进化包 .fspack / 整合包 .zip、进化节奏与方向（详见第 32 章）；④ 版本号统一为 **2.0.1**（`pyproject.toml` / 主包 / CNB / recovery 同步）。
 > **2026-09-05 v2.0.0（远星 FarStars 品牌定名 + 内核功能扩展）**：正式宣传名定为**远星 / FarStars**（norpagent 调用方式与内核名称不变，FarStars 仅作宣传名/品牌冠名，代码/导入/PyPI 包名保持 norpagent）。新增四组功能，见新专节 **§30.17**：① **任务分子通道**——exec `run_task` 的 `task_params` 结构化扩展：mol 六要素（mol_id/objective/acceptance/context_capsule/depends_on/budget/model_tier）JSON 原样承载直达原子吸收位，新增内核动作 `task_records` 提供验收回执数据面，audit/`task_started`/`task_done` 中 mol_id 贯穿可追溯、acceptance 随事件回传中枢；② **隔离冻结态**——新下行指令 `cmd.freeze`/`cmd.unfreeze`：冻结节点拒新任务（接单面关闭）、进程/心跳保活取证、可审计可解除、不触发清扫判 dead（心跳标记 frozen，中枢调度摘流量）；③ **行为基线内核侧聚合**——节点本地累计心跳缺失率/审计异常率/任务失败率，随心跳压缩上汇，中枢 `behavior_view` 按阈值分级（黄劣化/黑疑似恶意）；④ **subpoena 传票取证**——level 0 专属最高取证权限：新下行指令 `cmd.subpoena` 强制中间层原始审计直传中枢（非 2KB 摘要），五道闸（判据前置/隔离帧 RAW-UNTRUSTED/取数通道/容量分档 64-128-256-512KB/签发即留痕黑级），超 512KB 强制转人工终裁，低层级冒用拒绝并审计。
-> **2026-09-05 v1.0.7（CNB 内核集成）**：① **结构并入**——中枢神经总线实现整体迁入内核子模块 `norpagent.cnb/`（protocol / topology / permissions / bus / node / cortex / cli / demo + 新增 engine 引擎绑定层），版本并入 norpagent（无独立版本号），`import norpagent` 即就绪（顶层 `norpagent.cnb` 与 `CnbAdapter` / `setup_cnb` / `KERNEL_ACTIONS` 直接可用）；旧独立包名 `nervous_bus` 保留为**兼容 shim**（re-export + sys.modules 子模块注入 + cli/demo 物理薄文件），1.0.6 及更早脚本 / 命令 / 测试零改动继续可用。② **能力面内核化**——`NervousNode` 新增 exec 动作注册表（`register_action` / `unregister_action` / `list_actions`），中枢 `cmd.exec` 的动作**优先路由到注册处理器**，旧回调钩子兜底，两者皆无才拒绝（未知动作应答契约升级：`ok=False` + 顶层 `error`）；引擎绑定层把 NorpEngine 公开 API 注册为 **14 项内核动作面**：任务面 `run_task`/`status`/`stop_task`，状态面 `engine_state`/`inspect`，快照面 `snapshot`/`rollback`/`undo`/`redo`/`list_snapshots`/`mark_good`（工作回退 / 崩溃救援体系直通中枢），运维面 `remount`/`reload_plugins`/`stop_engine`；`cmd.stop`（停全部任务、实例保持运行）与 `cmd.reload`（重读 env + 热重载插件）下行语义不变。③ **运行形态真身化**——`norpagent cortex/node` 子命令（及 `main.py --norp-cortex/--norp-node`）**默认装配完整内核引擎**：每个神经原子都是真实可执行任务的 norpagent 实例（默认 minimal/mock 零依赖，`--mode`/`--model` 可换，`--bare` 回到纯神经空壳探针；中枢 = 最高级 norpagent 实例）；`stop_engine` 动作应答先行、引擎延迟 1s 平滑停止并注销节点，CLI 进程随主循环自然退出。④ **上行融合**——心跳自动携带内核深度状态（`engine_state`/`active_tasks`/`version`/`actions`，中枢 `reports` 直接可见），任务 `task_started`/`task_done` 事件上行（中枢视角任务全生命周期可见）；CLI `reports` 打印心跳内核状态字段。⑤ `runtime/cnb.py` 保留为转发层（engine 零改动）；`norpagent.cli` 与 `main.py` CNB 转发指向新路径。⑥ 测试：test_cnb 60 + test_deep_tree 36 + test_e2e 13 + automount 12/12 全绿（迁移回归零破坏），新增内核动作面验收 `test/test_cnb_kernel_actions.py`（A 同进程 21 项 + B 多进程 11 项，实测 32/32 通过）。详见 §30.16。全部活跃版本号统一为 **1.0.7**。
-> **1.0.2 修订（CNB 随包分发）**：修复 PyPI 1.0.1 包不含中枢神经总线（CNB）的问题——`nervous_bus/` 由仓库根目录迁入 `src/nervous_bus/` 随包发布（`pip install norpagent==1.0.2` 即自带 CNB）；`norpagent` 命令新增 `cortex / node / topo / ping / exec / stop / reload / perm / reports / audit / sync` 神经树子命令（与 `python -m nervous_bus.cli ...` 等价，兼容 `--norp-cortex` / `--norp-node` 旧写法）；仓库源码运行由 `main.py` / `api.py` 顶部 src 路径引导自动适配；全部活跃版本号统一为 1.0.2（`pyproject.toml`、`src/norpagent/__init__.py`、recovery 子模块 `__version__`、多模态 UA 标识、版本断言测试同步）。
-> **2026-09-05 深树修复（CNB 内核 B1-B9，体检整改）**：内核「浅树自洽、深树断裂」——官方自测全是 ≤2 层扁平场景（原子直挂中枢），从未覆盖 ≥3 层链式转发；五层树实测三条主链（注册/上行/断链）全有硬伤，9 项问题 3 项高危（B1 深层注册坍缩：转发每跳覆盖 `via` 致中枢错挂父子；B2 中间层收心跳/事件只记录不转发致中枢对深层全盲；B3 中间层退出致中枢级联注销整棵活子树成孤岛）。全部修复：`via` 改 `setdefault` 保留原始直接父；上行逐级汇聚转发 + 上层拒绝回传驱动深层自愈；新增救树 `_rescue_children` + `cmd.reroot` 改挂指令，活子树不陪葬；权限判定改纯时间序（类型级 revoke 不再被旧 node_id grant 屏蔽）；中枢失联清扫守护线程接线（`sweep_dead` 落地：判死→救树→宽限收敛）；hello 祖先链去重；心跳支持自定义状态位；注册/注销/救树后防抖自动拓扑广播。新增 4 层深树专项回归 `nervous_bus/test_deep_tree.py`（30 项），全部套件 52+13+30+12 实测通过。详见 §30.14。全部活跃版本号统一为 **1.0.4**（`pyproject.toml`、`src/norpagent/__init__.py`、recovery 子模块 `__version__`、多模态 UA 标识、版本断言测试同步）。
-> **2026-09-05 v1.0.6 增量（深树收敛闭环 + 权限面审计，现场实测验证）**：① **缺口 A**——中枢清扫收敛注销后的自动广播虽已触发，但接收端 `cmd.topology.sync` 只加不删，中间层本地缓存不收敛（运行中的演示树实测：中枢已注销 probe-x 并广播 11 成功，rnd 心跳 `descendants` 150s+ 仍含 probe-x）。修复为**权威快照镜像**：剪枝（快照缺失节点级联注销，自身除外）+ 父指针收敛（以中枢视图为准 `set_parent`），瞬时缺失由心跳被拒自动重注册自愈；深树回归 30→**36**（新增 D13a-f）。② **缺口 B**——exec 权限拒绝与 perm 变更生效上行 `report.audit`（`perm.denied` / `perm.changed`）逐级汇聚中枢；中枢新增结构化权限操作记录与统一视图 `perm_audit(n)`（REPL `perm_audit` + 控制端点 `op=perm_audit`），同权限审计读取方直接消费该端点。test_cnb 52→**60**（新增 T-A0~T-A6 权限面审计回归，含深层经中间层转发）。详见 §30.15。全部活跃版本号统一为 **1.0.6**。
-> **2026-09 修订（CNB 环境自动挂载 + 任务级取消 + 手册校准）**：① **P0-1 落地**——普通 norpagent 实例（np()/GUI/嵌入式）在装配期读取 `NORP_CNB_*` 环境变量自动以节点身份挂上神经树（新增 `norpagent/runtime/cnb.py`：CnbAdapter + 后台挂载线程 + 注册重试 + 失败降级普通单实例；`NORP_CNB_MANAGED=1` 跳过开关供上层 managed 自建，防双重挂载；shutdown 路径注销）；中枢下行四回调落地到真实引擎控制点：`exec`（动作白名单 `run_task`/`status`/`stop_task`，缺 prompt 拒、未知 action 拒、审计回执、任务完成上报 `report.event`）、`stop`（`stop_all_tasks()` 停全部在途会话任务、实例保持运行）、`reload`（重读 CNB 环境配置 + 经 remount 机制热重载外部插件）、`perm_changed`（权限摘要记录与审计；权限表在 cmd.exec 前置强制）。② **P2-1 任务级取消**——loop 层新增可选扩展 `submit_async`（`NasyncTaskHandle`，单任务深度取消，仍受 Ctrl+C/engine-stop 全量取消覆盖），引擎层新增 `submit_async`/`cancel_task`/`stop_all_tasks`/`active_tasks`/`forget_task`。③ **P1-1/P2-2 校准**——`--help` 现展示 CNB 子命令分支；§30.8/§30.12/附录 J 改写为真实实现位置（`runtime/engine.py` + `runtime/cnb.py`，移除 `api.py AgentAPI._setup_cnb()` 与 config.json 同键的不实描述，config 键不再声称支持，收敛为环境变量契约）。④ `nervous_bus.test_e2e` 的 ROOT 定位改为自动爬升至含 `main.py` 的仓库根（v1.0.2 src/ 布局下 `python -m nervous_bus.test_e2e` 恢复 13/13）。⑤ 新增验收冒烟 `test/test_cnb_automount.py`（12 项，2026-09-05 实测 12/12 通过）。
-> **1.0.1 修订（版本里程碑）**：0.9.x 系列收官，正式进入 **1.0.x 系列**——统一全部活跃版本号为 1.0.1（`pyproject.toml`、`src/norpagent/__init__.py`、recovery 子模块 `__version__`、多模态 UA 标识、版本断言测试同步）；1.0 系列承载此前全部能力：多模态（视觉 + 声音）、中枢神经总线（CNB）多实例神经树、救援模式、29 钩子、插件体系。
+> **2026-09-05 v1.0.7（CNB 内核集成）**：① **结构并入**——中枢神经总线实现整体迁入内核子模块 `norpagent.cnb/`（protocol / topology / permissions / bus / node / cortex / cli / demo + 新增 engine 引擎绑定层），版本并入 norpagent（无独立版本号），`import norpagent` 即就绪（顶层 `norpagent.cnb` 与 `CnbAdapter` / `setup_cnb` / `KERNEL_ACTIONS` 直接可用）；旧独立包名 `nervous_bus` 保留为**兼容 shim**（re-export + sys.modules 子模块注入 + cli/demo 物理薄文件），1.0.6 及更早脚本 / 命令 / 测试零改动继续可用。② **能力面内核化**——`NervousNode` 新增 exec 动作注册表（`register_action` / `unregister_action` / `list_actions`），中枢 `cmd.exec` 的动作**优先路由到注册处理器**，旧回调钩子兜底，两者皆无才拒绝（未知动作应答契约升级：`ok=False` + 顶层 `error`）；引擎绑定层把 NorpEngine 公开 API 注册为 **14 项内核动作面**：任务面 `run_task`/`status`/`stop_task`，状态面 `engine_state`/`inspect`，快照面 `snapshot`/`rollback`/`undo`/`redo`/`list_snapshots`/`mark_good`（工作回退 / 崩溃救援体系直通中枢），运维面 `remount`/`reload_plugins`/`stop_engine`；`cmd.stop`（停全部任务、实例保持运行）与 `cmd.reload`（重读 env + 热重载插件）下行语义不变。③ **运行形态真身化**——`norpagent cortex/node` 子命令（及 `main.py --norp-cortex/--norp-node`）**默认装配完整内核引擎**：每个神经原子都是真实可执行任务的 norpagent 实例（默认 minimal/mock 零依赖，`--mode`/`--model` 可换，`--bare` 回到纯神经空壳探针；中枢 = 最高级 norpagent 实例）；`stop_engine` 动作应答先行、引擎延迟 1s 平滑停止并注销节点，CLI 进程随主循环自然退出。④ **上行融合**——心跳自动携带内核深度状态（`engine_state`/`active_tasks`/`version`/`actions`，中枢 `reports` 直接可见），任务 `task_started`/`task_done` 事件上行（中枢视角任务全生命周期可见）；CLI `reports` 打印心跳内核状态字段。⑤ `runtime/cnb.py` 保留为转发层（engine 零改动）；`norpagent.cli` 与 `main.py` CNB 转发指向新路径。详见 §30.16。全部活跃版本号统一为 **1.0.7**。
+> **1.0.2 修订（CNB 随包分发）**：修复 PyPI 1.0.1 包不含中枢神经总线（CNB）的问题——`nervous_bus/` 由仓库根目录迁入 `src/nervous_bus/` 随包发布（`pip install norpagent==1.0.2` 即自带 CNB）；`norpagent` 命令新增 `cortex / node / topo / ping / exec / stop / reload / perm / reports / audit / sync` 神经树子命令（与 `python -m nervous_bus.cli ...` 等价，兼容 `--norp-cortex` / `--norp-node` 旧写法）；仓库源码运行由 `main.py` / `api.py` 顶部 src 路径引导自动适配；全部活跃版本号统一为 1.0.2（`pyproject.toml`、`src/norpagent/__init__.py`、recovery 子模块 `__version__`、多模态 UA 标识）。
+> **2026-09-05 深树修复（CNB 内核 B1-B9，体检整改）**：内核「浅树自洽、深树断裂」——五层树实测三条主链（注册/上行/断链）全有硬伤，9 项问题 3 项高危（B1 深层注册坍缩：转发每跳覆盖 `via` 致中枢错挂父子；B2 中间层收心跳/事件只记录不转发致中枢对深层全盲；B3 中间层退出致中枢级联注销整棵活子树成孤岛）。全部修复：`via` 改 `setdefault` 保留原始直接父；上行逐级汇聚转发 + 上层拒绝回传驱动深层自愈；新增救树 `_rescue_children` + `cmd.reroot` 改挂指令，活子树不陪葬；权限判定改纯时间序（类型级 revoke 不再被旧 node_id grant 屏蔽）；中枢失联清扫守护线程接线（`sweep_dead` 落地：判死→救树→宽限收敛）；hello 祖先链去重；心跳支持自定义状态位；注册/注销/救树后防抖自动拓扑广播。详见 §30.14。全部活跃版本号统一为 **1.0.4**（`pyproject.toml`、`src/norpagent/__init__.py`、recovery 子模块 `__version__`、多模态 UA 标识）。
+> **2026-09-05 v1.0.6 增量（深树收敛闭环 + 权限面审计，现场实测验证）**：① **缺口 A**——中枢清扫收敛注销后的自动广播虽已触发，但接收端 `cmd.topology.sync` 只加不删，中间层本地缓存不收敛（运行中的演示树实测：中枢已注销 probe-x 并广播 11 成功，rnd 心跳 `descendants` 150s+ 仍含 probe-x）。修复为**权威快照镜像**：剪枝（快照缺失节点级联注销，自身除外）+ 父指针收敛（以中枢视图为准 `set_parent`），瞬时缺失由心跳被拒自动重注册自愈。② **缺口 B**——exec 权限拒绝与 perm 变更生效上行 `report.audit`（`perm.denied` / `perm.changed`）逐级汇聚中枢；中枢新增结构化权限操作记录与统一视图 `perm_audit(n)`（REPL `perm_audit` + 控制端点 `op=perm_audit`），同权限审计读取方直接消费该端点。详见 §30.15。全部活跃版本号统一为 **1.0.6**。
+> **2026-09 修订（CNB 环境自动挂载 + 任务级取消 + 手册校准）**：① **P0-1 落地**——普通 norpagent 实例（np()/GUI/嵌入式）在装配期读取 `NORP_CNB_*` 环境变量自动以节点身份挂上神经树（新增 `norpagent/runtime/cnb.py`：CnbAdapter + 后台挂载线程 + 注册重试 + 失败降级普通单实例；`NORP_CNB_MANAGED=1` 跳过开关供上层 managed 自建，防双重挂载；shutdown 路径注销）；中枢下行四回调落地到真实引擎控制点：`exec`（动作白名单 `run_task`/`status`/`stop_task`，缺 prompt 拒、未知 action 拒、审计回执、任务完成上报 `report.event`）、`stop`（`stop_all_tasks()` 停全部在途会话任务、实例保持运行）、`reload`（重读 CNB 环境配置 + 经 remount 机制热重载外部插件）、`perm_changed`（权限摘要记录与审计；权限表在 cmd.exec 前置强制）。② **P2-1 任务级取消**——loop 层新增可选扩展 `submit_async`（`NasyncTaskHandle`，单任务深度取消，仍受 Ctrl+C/engine-stop 全量取消覆盖），引擎层新增 `submit_async`/`cancel_task`/`stop_all_tasks`/`active_tasks`/`forget_task`。③ **P1-1/P2-2 校准**——`--help` 现展示 CNB 子命令分支；§30.8/§30.12/附录 J 改写为真实实现位置（`runtime/engine.py` + `runtime/cnb.py`，移除 `api.py AgentAPI._setup_cnb()` 与 config.json 同键的不实描述，config 键不再声称支持，收敛为环境变量契约）。
+> **1.0.1 修订（版本里程碑）**：0.9.x 系列收官，正式进入 **1.0.x 系列**——统一全部活跃版本号为 1.0.1（`pyproject.toml`、`src/norpagent/__init__.py`、recovery 子模块 `__version__`、多模态 UA 标识）；1.0 系列承载此前全部能力：多模态（视觉 + 声音）、中枢神经总线（CNB）多实例神经树、救援模式、29 钩子、插件体系。
 > **0.9.9 修订（多模态）**：新增**第 29 章「多模态：视觉与声音」**与**附录 I「多模态配置与 API 速查」**——视觉：上传/粘贴/拖拽图片经 `/api/vision` 由外部视觉服务理解后融入对话；声音：语音朗读（TTS）与语音输入（STT）**全部后端原生实现**（Windows SAPI / macOS say / Linux espeak-ng 离线可用，或配置 OpenAI 兼容服务），提示音后端生成，浏览器只采集与播放、不依赖任何浏览器语音 API；`/api/upload` 支持图片；`tts_service_api_key` / `stt_service_api_key` 纳入 DPAPI 加密存储。
-> **2026-08 中枢神经总线（CNB）多实例升级**：新增**第 30 章「中枢神经总线：多实例与神经树」**与**附录 J「中枢神经总线速查表」**——中枢（最高级 norpagent 实例）通过中枢神经总线控制任意层级任意单位原子的操作权限；低层级只能通过总线上报，不可控制上层；神经树为树状拓扑链；低等级无条件服从高等级指令，不允许改写高等级，只允许回传上报。`nervous_bus/` 全模块（协议层 / 树状拓扑链 / 神经权限表 / 零依赖传输层 / 节点 / 中枢 / CLI），51 项单元集成 + 13 项真实多进程端到端自测通过；`main.py` 新增 `--norp-cortex` / `--norp-node` 无 GUI 后台多实例入口（绕过单实例锁），`api.py` 支持 GUI 实例以节点身份加入神经树。
-> 2026-08 修订：第 24 章救援模式专章（底层循环控制 + 人类接管）｜ 内核修复：select 超时上限钳制（暴力压测发现，Windows 超远定时器崩溃）｜ 新增 35 项最小主异步循环暴力压测（test/stress_nasyncio_core.py）｜ 15.6 人类救援手动工具接管 API（v0.9.3，模型失效时手操全部工具：tools / tool-call / manual / serve）｜ 3.9 任务级槽位注入（submit(slot_overrides=...)）｜ 3.7 装配槽位热重建的在途任务竞态与排水建议 ｜ 4.6.4 守护工作池队列语义与卡死兜底矩阵 ｜ 23.1 EventBus 基准口径与锁竞争边界 ｜ 第 25 章开发者实战专章（逐模块开发 / 槽位开发 / 插件与工具开发详解，含热重载红线：键值对的值必须是有效模块）｜ 第 26 章注册流程详解（注册表 9 大命名空间 / 四种形态与字符串语义 / npa() 装配全链路 / 三种注册时机与热重载 / 槽位注册与组件注册的区别 / 校验与错误处理 / 检查清单）｜ 第 27 章最小内核详解专章（事件总线 / 槽位连接器 / 注册表 / 地址解析器四组件：数据结构、API、内部机制与启动 / 热挂载协作走查）
+> **2026-08 中枢神经总线（CNB）多实例升级**：新增**第 30 章「中枢神经总线：多实例与神经树」**与**附录 J「中枢神经总线速查表」**——中枢（最高级 norpagent 实例）通过中枢神经总线控制任意层级任意单位原子的操作权限；低层级只能通过总线上报，不可控制上层；神经树为树状拓扑链；低等级无条件服从高等级指令，不允许改写高等级，只允许回传上报。`nervous_bus/` 全模块（协议层 / 树状拓扑链 / 神经权限表 / 零依赖传输层 / 节点 / 中枢 / CLI），`main.py` 新增 `--norp-cortex` / `--norp-node` 无 GUI 后台多实例入口（绕过单实例锁），`api.py` 支持 GUI 实例以节点身份加入神经树。
+> 2026-08 修订：第 24 章救援模式专章（底层循环控制 + 人类接管）｜ 内核修复：select 超时上限钳制（Windows 超远定时器崩溃）｜ 15.6 人类救援手动工具接管 API（v0.9.3，模型失效时手操全部工具：tools / tool-call / manual / serve）｜ 3.9 任务级槽位注入（submit(slot_overrides=...)）｜ 3.7 装配槽位热重建的在途任务竞态与排水建议 ｜ 4.6.4 守护工作池队列语义与卡死兜底矩阵 ｜ 23.1 EventBus 基准口径与锁竞争边界 ｜ 第 25 章开发者实战专章（逐模块开发 / 槽位开发 / 插件与工具开发详解，含热重载红线：键值对的值必须是有效模块）｜ 第 26 章注册流程详解（注册表 9 大命名空间 / 四种形态与字符串语义 / npa() 装配全链路 / 三种注册时机与热重载 / 槽位注册与组件注册的区别 / 校验与错误处理 / 检查清单）｜ 第 27 章最小内核详解专章（事件总线 / 槽位连接器 / 注册表 / 地址解析器四组件：数据结构、API、内部机制与启动 / 热挂载协作走查）
 > **0.9.7 修订**：救援模式支持自定义工具手动控制（`RescueToolEnvironment` 新增 `extra_tools` / `tools` / `plugin_dirs`，CLI 新增 `--tools` / `--plugin-dirs`，操作员页面与清单标注 builtin / custom / plugin 来源）｜ 通用事件总线（GeneralEventBus，类名 `EventBus`）新增通用能力：`once` / `wait` / `emit_all` / `subscriber_count` / `has_listeners` / `clear` ｜ 第 9 章新增 9.8「29 钩子逐个用法（Python 代码实现）」｜ 新增第 28 章「外部 Python 脚本集成：热挂载与钩子订阅」｜ 新增附录 F（前后端通讯方式速查表）/ 附录 G（全部命令用法速查表）/ 附录 H（全部函数及结构用法速查表）｜ 第 13 章命令行入口扩充（命令行前端进入方式 + 救援模式命令补全）｜ 全文语言严谨化与术语统一（EventBus 在手册中称通用事件总线 GeneralEventBus，代码符号名不变）
 
 ---
 
-*NorpAgent 开发手册 · v2.2.1 · FarStars（远星）· Copyright (c) 2026 xingluosama121, MIT Licensed*
+*NorpAgent 开发手册 · v2.2.2 · FarStars（远星）· Copyright (c) 2026 xingluosama121, MIT Licensed*
 

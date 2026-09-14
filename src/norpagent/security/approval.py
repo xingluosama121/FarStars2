@@ -54,10 +54,14 @@ class ApprovalPolicy:
     def __init__(self, config: Optional[dict] = None,
                  tool_hints: Optional[dict] = None) -> None:
         config = config or {}
-        legacy = config.get("confirm_write_delete", True)
+        # native tool confirmation is OFF by default (2026-09-13): the master
+        # switch defaults to False unless a legacy "confirm_write_delete" key
+        # explicitly opted in. When the master switch is on but a per-class key
+        # is absent, the class defaults to on.
+        legacy = bool(config.get("confirm_write_delete", False))
         self.native_enabled = bool(config.get("native_confirm_enabled", legacy))
-        self.native_write = bool(config.get("native_confirm_write", legacy))
-        self.native_delete = bool(config.get("native_confirm_delete", legacy))
+        self.native_write = bool(config.get("native_confirm_write", True))
+        self.native_delete = bool(config.get("native_confirm_delete", True))
         self.native_exec = bool(config.get("native_confirm_exec", True))
         self.plugin_enabled = bool(config.get("approval_enabled", True))
         self._tool_hints = tool_hints or {}

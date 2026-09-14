@@ -103,11 +103,19 @@ class MockModelProvider:
         tools: Optional[List[Dict[str, Any]]],
         params: Dict[str, Any],
     ) -> ModelOutput:
-        # task-level script override (params["mock_script"])
+        # task-level script override (params["mock_script"]): consumed per task.
+        # The cursor rides inside the task params dict (a fresh task builds
+        # fresh params), so every task starts its script from the first entry —
+        # one task's consumption never shifts the next task's script window.
+        # The instance-level counter drives only the constructor-provided
+        # script (fixed benchmark scripts keep their call-order semantics).
         override = params.get("mock_script")
         if isinstance(override, list):
-            entry = override[min(self._call_count, len(override) - 1)]
-            self._call_count += 1
+            cursor = params.get("_mock_script_cursor", 0)
+            if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+                cursor = 0
+            entry = override[min(cursor, len(override) - 1)]
+            params["_mock_script_cursor"] = cursor + 1
         else:
             entry = self._next_entry()
         output = self._entry_to_output(entry)

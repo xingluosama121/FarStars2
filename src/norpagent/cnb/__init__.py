@@ -8,10 +8,10 @@ norpagent 的内核子模块。与「外挂模块」时期的差异：
   本包是 norpagent 内核的一部分，版本跟随 norpagent（无独立版本号）。
   ``import norpagent`` 即完成装配；旧名 nervous_bus 保留为兼容 shim
   （re-export 本包全部符号与子模块），1.0.6 及更早的脚本/命令零改动继续可用。
-- 能力：NervousNode 提供 exec 动作注册表（register_action），皮层 cmd.exec
+- 能力：NervousNode 提供 exec 动作注册表（register_action），中枢 cmd.exec
   的动作直接路由到注册处理器；引擎绑定层 norpagent.cnb.engine 把
   NorpEngine 公开 API（任务/快照/回滚/重载/运维）注册为节点的内核动作面，
-  皮层可对任意层级原子下发——CNB 不再只是传输层外挂，而是可操作内核的能力面。
+  中枢可对任意层级原子下发——CNB 不再只是传输层外挂，而是可操作内核的能力面。
 - 运行形态：norpagent cortex/node 子命令（本包 cli）默认装配完整内核引擎，
   每个神经原子都是一个真实可执行任务的 norpagent 实例；--bare 回到纯神经
   空壳（探针）。普通 GUI 实例仍按 NORP_CNB_* env 可选装配（单实例可选挂载）。
@@ -19,13 +19,13 @@ norpagent 的内核子模块。与「外挂模块」时期的差异：
 模块：
   protocol     协议层（消息信封、上行/下行、等级、权限原子）
   topology     树状拓扑链（注册/注销、祖先判定、无环与等级校验）
-  permissions  神经权限表（皮层对任意层级任意原子的操作权限控制）
+  permissions  神经权限表（中枢对任意层级任意原子的操作权限控制）
   bus          传输层（零依赖 HTTP，每节点一个总线端点）
   node         CNB 节点（总线/心跳/上行/下行 + exec 动作注册表）
-  cortex       大脑皮层（根节点 + 控制 API + REPL）
+  cortex       中枢（根节点 + 控制 API + REPL）
   engine       引擎绑定层（CnbAdapter：内核动作面 + env 自动挂载；NorpEngine 集成）
   cli          命令行入口（cortex / node / topo / ping / exec / stop / ...）
-  demo         快速演示（1 个皮层 + 树状三级节点，同进程模拟）
+  demo         快速演示（1 个中枢 + 树状三级节点，同进程模拟）
 
 兼容说明：``python -m nervous_bus.cli``、``from nervous_bus import NervousNode``
 等旧写法经由 nervous_bus shim 落到本包，行为与 1.0.6 一致。
@@ -60,10 +60,23 @@ from .engine import (  # noqa: E402,F401
     read_env_config,
     KERNEL_ACTIONS,
 )
+# 神经树显式定义（2026-09-12 反馈轮）：不预设形状；启动时显式传入定义，
+# 三种来源（dict / JSON 文件 / PY 文件），严格校验缺必要参数，两种装配。
+from .tree import (  # noqa: E402,F401
+    InProcTree,
+    SpawnTree,
+    TreeBuildError,
+    TreeDefinitionError,
+    TreeMount,
+    build_in_process,
+    parse_tree_definition,
+    plan_table,
+    spawn_tree,
+)
 
 # v1.0.7 起 CNB 并入内核：版本跟随 norpagent（publish_pypi.ps1 校验一致）。
 # 与 norpagent/__init__.py 的 __version__ 保持同步。
-__version__ = "2.0.1"
+__version__ = "2.2.2"
 
 __all__ = [
     "__version__",
@@ -84,4 +97,8 @@ __all__ = [
     "NervousNode", "Cortex",
     # 引擎绑定层（v1.0.7 内核集成）
     "CnbAdapter", "setup_cnb", "read_env_config", "KERNEL_ACTIONS",
+    # 神经树显式定义（2026-09-12 反馈轮）
+    "TreeDefinitionError", "TreeBuildError", "TreeMount",
+    "InProcTree", "SpawnTree", "parse_tree_definition", "plan_table",
+    "build_in_process", "spawn_tree",
 ]

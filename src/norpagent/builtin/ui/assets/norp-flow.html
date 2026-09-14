@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NORP 模块流程编排 · FLOW</title>
+<script src="/assets/i18n.js"></script>
 <style>
   :root{
     --bg:#202020;
@@ -1346,10 +1347,16 @@ const I18N = {
 };
 let LANG = 'zh';
 try{
-  const saved = localStorage.getItem('norpflow.lang');
-  if(saved === 'zh' || saved === 'en'){ LANG = saved; }
-  else if(!saved && typeof navigator !== 'undefined' && navigator.language &&
-          navigator.language.toLowerCase().indexOf('zh') !== 0){ LANG = 'en'; }
+  /* 三端共通语言状态（/assets/i18n.js 的 np_lang）：zh_CN / zh_TW → 中文视图，en → 英文视图；
+     旧键 norpflow.lang 兼容迁移 */
+  const common = (window.FarStarsI18N && FarStarsI18N.get()) || '';
+  if(common){ LANG = (common === 'en') ? 'en' : 'zh'; }
+  else {
+    const saved = localStorage.getItem('norpflow.lang');
+    if(saved === 'zh' || saved === 'en'){ LANG = saved; }
+    else if(!saved && typeof navigator !== 'undefined' && navigator.language &&
+            navigator.language.toLowerCase().indexOf('zh') !== 0){ LANG = 'en'; }
+  }
 }catch(err){ /* localStorage 不可用时保持默认中文 */ }
 function t(key, vars){
   let s = (I18N[LANG] && I18N[LANG][key]) || (I18N.zh && I18N.zh[key]) || key;
@@ -4394,8 +4401,17 @@ function applyI18n(){
 $('#btn-lang').addEventListener('click', ()=>{
   LANG = LANG==='zh' ? 'en' : 'zh';
   try{ localStorage.setItem('norpflow.lang', LANG); }catch(err){}
+  /* 三端共通：语言状态写入 np_lang（主前端 / 星轨控制台重载后同语言） */
+  if(window.FarStarsI18N){ FarStarsI18N.set(LANG === 'en' ? 'en' : 'zh_CN'); }
   applyI18n();
   log(t('log.langSwitch',{lang: LANG==='zh' ? '中文' : 'English'}), 'info');
+});
+/* 跨页语言同步：另一页切换 np_lang → 本页即时跟随 */
+window.addEventListener('storage', (ev)=>{
+  if(ev.key==='np_lang'&&ev.newValue){
+    const l = ev.newValue === 'en' ? 'en' : 'zh';
+    if(l !== LANG){ LANG = l; applyI18n(); }
+  }
 });
 
 /* ---------------- 节点按钮委托 ---------------- */
@@ -4597,12 +4613,10 @@ function initDockWheel(){
 /* ---------------- 连接设置（API Key / Base URL / 项目根目录） ---------------- */
 /* 远端模型列表：填好 API Key 后自动从 provider 拉取（后端 GET /api/models?base_url=） */
 let _remoteModels = [];
-// 已停用模型名（deepseek-chat / deepseek-reasoner 于 2026-07-24 停用）：
-// 远端返回或历史缓存中一律过滤，不再进入提示列表与模块坞
-const RETIRED_REMOTE = { 'deepseek-chat':1, 'deepseek-reasoner':1 };
+// Retired remote model names are filtered by the model adapter on the backend
+// (the UI layer must not hardcode model names), so the fetched list is trusted here.
 function remoteModelOk(m){
-  const s = String(m || '').trim().toLowerCase();
-  return RETIRED_REMOTE[s] ? false : true;
+  return !!String(m || '').trim();
 }
 function renderModelOptions(preferred){
   const inp = $('#sett-model');

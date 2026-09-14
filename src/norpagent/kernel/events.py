@@ -91,7 +91,9 @@ class EventBus:
     - ``unsubscribe(listener, event_type=None)``: remove a subscription
     - ``emit(type, **payload)``: publishes an event; subscriber exceptions are
       caught and logged without breaking the main flow
-    - ``intercept(type, **payload)``: mutating dispatch, first non-None wins
+    - ``intercept(type, **payload)``: mutating dispatch — every subscriber runs
+      exactly once; the first non-None return value wins (returned after the
+      full traversal)
     - ``emit_all(type, **payload)``: publish and collect all return values
     - ``wait(type, timeout=None)``: block until the event fires, return it
     - ``subscriber_count / has_listeners / clear``: state queries & reset
@@ -270,40 +272,53 @@ class EventBus:
                     self._report_error(event_type, exc)
 
     def intercept(self, event_type: str, **payload: Any) -> Any:
-        """Mutating-event dispatch: returns the first non-None subscriber return value.
+        """Mutating-event dispatch: every subscriber runs exactly once; the first non-None return value wins.
 
-        Consistent with the existing application's plugin_system
-        _broadcast_mutating semantics: before_step / before_tool_call /
-        after_tool_call hooks can modify the data flow through return values
-        (None = no intervention). Returns None when there are no subscribers or
-        all return None.
+        Traversal semantics (fixed 2026-09-11, plugin-system overhaul):
 
-        ``HookVeto`` is special: **not caught** (the veto semantics must reach the
-        kernel); other subscriber exceptions are logged and processing continues
-        (subscribers must not break the main loop).
+        - **every subscriber is invoked exactly once** — side effects of all
+          subscribers execute (multi-plugin chains no longer lose steps to
+          early exits);
+        - the **first non-None return value** is captured as the winner and
+          returned after the full traversal (None = no intervention when all
+          subscribers return None);
+        - ``HookVeto`` is special: **not caught** (the veto semantics must reach
+          the kernel immediately; traversal stops at the veto); other subscriber
+          exceptions are logged and processing continues (subscribers must not
+          break the main loop).
+
+        Previous behavior stopped at the first non-None value, truncating later
+        subscribers (their side effects never ran and their rewrites never had a
+        chance). The old semantics is gone; see the plugin-system documentation.
         """
         event = AgentEvent(type=event_type, payload=payload)
         all_listeners, typed_listeners = self._snapshot(event_type)
+        winner: Any = None
+        has_winner = False
         for fn in all_listeners:
             try:
                 result = fn(event)
-                if result is not None:
-                    return result
             except HookVeto:
                 raise
             except Exception as exc:  # noqa: BLE001 — subscribers must not break the main loop
                 self._report_error(event_type, exc)
+                continue
+            if result is not None and not has_winner:
+                winner = result
+                has_winner = True
         if typed_listeners:
             for fn in typed_listeners:
                 try:
                     result = fn(event)
-                    if result is not None:
-                        return result
                 except HookVeto:
                     raise
                 except Exception as exc:  # noqa: BLE001 — subscribers must not break the main loop
                     self._report_error(event_type, exc)
-        return None
+                    continue
+                if result is not None and not has_winner:
+                    winner = result
+                    has_winner = True
+        return winner
 
     def _report_error(self, event_type: str, exc: Exception) -> None:
         msg = f"[EventBus] subscriber error on event {event_type}: {exc}"

@@ -2,7 +2,7 @@
 """
 norpagent.cnb.permissions — 神经权限表
 
-大脑皮层通过中枢神经总线对「任意层级任意单位原子」进行操作权限控制。
+中枢通过中枢神经总线对「任意层级任意单位原子」进行操作权限控制。
 
 权限模型：
 - 权限原子与 permission_cascade.Permission 语义对齐（file_read / file_write /
@@ -10,11 +10,11 @@ norpagent.cnb.permissions — 神经权限表
 - 每个目标（node_id 精确匹配，或 node_kind 通配，或 "*" 全量通配）维护
   一组权限状态：allow=True 表示授予，allow=False 表示撤销。
 - 判定规则（B4 修订）：**纯时间序**——命中本节点且权限原子相同的规则中，
-  最近写入的一条生效（后写覆盖先写，跨 target 粒度同样生效）。皮层按时间
+  最近写入的一条生效（后写覆盖先写，跨 target 粒度同样生效）。中枢按时间
   顺序下发指令，最新一条代表最新管理意图：先特批 node_id 再收紧 node_kind
   会收紧；先收紧再特批会放开；不会被更早的旧规则屏蔽。
-- 默认策略：allow-by-default（未受控的权限默认允许，由皮层显式收紧）。
-  皮层可通过 cmd.perm.set 对某目标一次性整体覆盖，实现「白名单收紧」。
+- 默认策略：allow-by-default（未受控的权限默认允许，由中枢显式收紧）。
+  中枢可通过 cmd.perm.set 对某目标一次性整体覆盖，实现「白名单收紧」。
 """
 
 import threading
@@ -53,7 +53,7 @@ class PermRule:
 class NeuralPermissionTable:
     """神经权限表（线程安全）。
 
-    这是每个 CNB 节点本地持有的权限视图：皮层下发的权限指令（cmd.perm.*）
+    这是每个 CNB 节点本地持有的权限视图：中枢下发的权限指令（cmd.perm.*）
     落地为本表规则；本地工具/动作执行前调用 check() 判定是否被允许。
     """
 
@@ -76,13 +76,13 @@ class NeuralPermissionTable:
         if not is_valid_perm(perm):
             self._history.append({
                 "ts": time.time(), "op": "apply_rejected",
-                "reason": f"未知权限原子: {perm}", "source": source,
+                "reason": f"unknown permission atom: {perm}", "source": source,
             })
             return False
         if target_type not in ("node_id", "node_kind", "*"):
             self._history.append({
                 "ts": time.time(), "op": "apply_rejected",
-                "reason": f"非法目标类型: {target_type}", "source": source,
+                "reason": f"invalid target type: {target_type}", "source": source,
             })
             return False
 
@@ -144,10 +144,10 @@ class NeuralPermissionTable:
           - 遍历全部规则（node_id / node_kind / * 均参与），命中本节点
             （精确 id / 类型通配 / 全量通配）且 perm 相同者中，取
             「最近写入」的一条为准 —— 后写覆盖先写，跨粒度同样生效。
-          - 语义：皮层按时间顺序下发指令，最近一条代表最新管理意图；
+          - 语义：中枢按时间顺序下发指令，最近一条代表最新管理意图；
             无论其粒度（先特批 node_id 后收紧 node_kind 会收紧，
             先收紧后特批会放开），都不会被更早的旧规则屏蔽。
-          - 无任何规则命中 => 默认允许（allow-by-default，由皮层显式收紧）。
+          - 无任何规则命中 => 默认允许（allow-by-default，由中枢显式收紧）。
         """
         if not is_valid_perm(perm):
             return False
@@ -196,7 +196,7 @@ class NeuralPermissionTable:
             return list(self._history)
 
     def summary(self) -> Dict:
-        """导出给上层（皮层）看的权限视图。"""
+        """导出给上层（中枢）看的权限视图。"""
         with self._lock:
             return {
                 "node_id": self.node_id,

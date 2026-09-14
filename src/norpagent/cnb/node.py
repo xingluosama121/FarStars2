@@ -5,7 +5,7 @@ norpagent.cnb.node — CNB 节点（每个 norpagent 实例内置一个）
 节点是神经树上的一个单位原子（norpbot / norpilot / norpmemory ... 或
 任意自定义实例），职责：
 
-1. 上行（只读上报）：向父节点（最终汇聚到大脑皮层）上报
+1. 上行（只读上报）：向父节点（最终汇聚到中枢）上报
    - report.register / report.deregister（注册 / 注销，沿树逐级转发）
    - report.heartbeat（心跳与状态）
    - report.event（事件）
@@ -14,8 +14,8 @@ norpagent.cnb.node — CNB 节点（每个 norpagent 实例内置一个）
 
 2. 下行（无条件服从）：接收祖先节点下发的指令并执行
    - cmd.hello / cmd.ping / cmd.exec / cmd.stop / cmd.reload
-   - cmd.perm.set / grant / revoke（大脑皮层控制本节点操作权限）
-   - cmd.topology.sync（皮层广播拓扑）
+   - cmd.perm.set / grant / revoke（中枢控制本节点操作权限）
+   - cmd.topology.sync（中枢广播拓扑）
 
 铁律（代码强制）：
 - 上行消息若携带控制字段，传输层直接拒绝（低等级永远无法控制上层）。
@@ -33,9 +33,28 @@ from . import protocol
 from .bus import BusClient, start_bus
 from .permissions import NeuralPermissionTable
 from .topology import Topology
+from .slots import SlotBay, SlotError, MAX_SLOTS, build_module_from_spec
 
 # 心跳默认间隔（秒）
 DEFAULT_HEARTBEAT_INTERVAL = 5.0
+
+# 网络层「父节点不可达」判据：协调关闭时父节点先于子节点下线、或父进程
+# 已整体退出，都会表现为连接被拒 / 超时 / 重置（典型 WinError 10061）。
+# 这类注销失败是可预期且无害的——节点本就即将销毁，中枢下次启动为空拓扑、
+# 不会残留僵尸——必须与「父节点在线但拒绝注销」（真·注销失败，如拓扑已
+# 不含本节点）区分开：前者降为一行温和提示，后者保留完整告警。
+_UNREACHABLE_MARKERS = (
+    "urlerror",            # urllib 网络异常（含 WinError 10061 等）
+    "10061", "10060", "10054", "10053",  # WSAECONNREFUSED / TIMEOUT / RESET
+    "refused", "reset", "aborted", "connectionerror",
+    "timed out", "timeout", "getaddrinfo", "name or service not known",
+)
+
+
+def _is_parent_unreachable(err: str) -> bool:
+    """判断注销失败是否源自「父节点已不可达」（可预期、无害）。"""
+    low = str(err or "").lower()
+    return any(m in low for m in _UNREACHABLE_MARKERS)
 
 
 class NervousNode:
@@ -50,17 +69,17 @@ class NervousNode:
         self.node_id = node_id
         self.kind = kind
         self.level = int(level)
-        self.parent_url = parent_url          # 父节点总线地址（None = 根/皮层）
+        self.parent_url = parent_url          # 父节点总线地址（None = 根/中枢）
         self.parent_node_id: Optional[str] = None  # 父节点 id（收到 cmd.hello 后确认）
         self.host = host
         self.port = int(port)
         self.meta = dict(meta or {})
         self.base_url = f"http://{host}:{port}"
-        # 把自己的总线地址放进 meta，随注册上报，皮层据此定位任意节点
+        # 把自己的总线地址放进 meta，随注册上报，中枢据此定位任意节点
         self.meta.setdefault("base_url", self.base_url)
         self.heartbeat_interval = heartbeat_interval
 
-        # 本地拓扑：自己 + 已注册的后代（皮层为根时 = 全量拓扑）
+        # 本地拓扑：自己 + 已注册的后代（中枢为根时 = 全量拓扑）
         self.topology = Topology()
         self.topology.register(node_id, self.level, kind,
                                parent_id=None, meta=self.meta)
@@ -69,21 +88,37 @@ class NervousNode:
         # 本地拓扑只含子树视图，深层节点据此判定任意祖先的下行合法性。
         self._ancestors: List[str] = []
 
-        # 神经权限表：皮层下发的权限指令落地于此
+        # 神经权限表：中枢下发的权限指令落地于此
         self.permissions = NeuralPermissionTable(node_id, kind)
 
         # 回调钩子（与 norpagent 本体集成点）
         self._callbacks: Dict[str, Callable] = {}
 
-        # 内核动作注册表（v1.0.7 内核集成）：皮层 cmd.exec 的 action 优先路由
+        # 内核动作注册表（v1.0.7 内核集成）：中枢 cmd.exec 的 action 优先路由
         # 到注册处理器（handler(payload: dict) -> dict），未注册动作回退到旧
         # 回调钩子（fire "exec"），两者皆无才拒绝。引擎绑定层（norpagent.cnb.
         # engine.CnbAdapter）把 NorpEngine 公开 API 注册为内核动作面。
         self._actions: Dict[str, Callable[[Dict], Dict]] = {}
 
+        # ── 通用槽位（R-024 修订，2026-09-11）──
+        # 每节点最多 64 个通用槽位；槽位走神经总线，什么都可以挂载（model /
+        # tools / plugins / 完整 norpagent 实例模块 / 任意自定义模块）。CNB
+        # 因此成为「槽位连接器」的多实例延伸：单实例连本地部件，多实例经
+        # 神经树跨进程连同一套槽位协议。norpagent 完整实例不被抛弃——它被
+        # 包装为 NorpAgentModule（见 norpagent.cnb.slots），作为标准模块挂入
+        # 槽位（CnbAdapter 自动挂载到默认槽位 norpagent）。
+        # 节点自身提供四个槽位动作（经总线可达）：
+        #   slot_list / slot_describe（只读取证面，冻结期放行）
+        #   slot_mount / slot_unmount（变更面，冻结期拒绝）
+        self.slots = SlotBay(self, max_slots=MAX_SLOTS)
+        self._actions["slot_list"] = self._builtin_slot_list
+        self._actions["slot_describe"] = self._builtin_slot_describe
+        self._actions["slot_mount"] = self._builtin_slot_mount
+        self._actions["slot_unmount"] = self._builtin_slot_unmount
+
         # 心跳状态提供者（v1.0.7）：provider() -> (status: str, extra: dict)
         # 或 None。引擎绑定层注入后，心跳自动携带内核状态（engine_state /
-        # active_tasks 等），皮层汇聚可见。
+        # active_tasks 等），中枢汇聚可见。
         self._heartbeat_provider: Optional[Callable[[], Any]] = None
         # provider 健康翻转标记（白盒：故障/恢复各审计一次，防刷屏）
         self._provider_failed = False
@@ -102,7 +137,7 @@ class NervousNode:
         # ── 隔离冻结态（quarantine）──
         # 冻结 = 拒新任务（接单面关闭）+ 进程/心跳存活（取证面保全）+ 可审计
         # 可解除 + 不触发清扫判 dead（冻结节点心跳照常，清扫只看心跳时效）。
-        # 冻结位在皮层下发 cmd.freeze 后置位；解除由 cmd.unfreeze（康复回树）
+        # 冻结位在中枢下发 cmd.freeze 后置位；解除由 cmd.unfreeze（康复回树）
         # 或节点销毁重建（杜绝带病复用）。冻结期间的 exec 动作按
         # protocol.FROZEN_ALLOWED_ACTIONS 白名单放行（只读取证面）。
         self._frozen = False
@@ -113,7 +148,7 @@ class NervousNode:
         # ── 行为基线聚合（内核侧统计，随心跳压缩上汇）──
         # 机械行为基线：心跳缺失率 / 审计异常率 / 任务失败率。节点本地累计
         # 统计，心跳上报自动携带聚合字段（不上行原始流，压缩上汇量）；
-        # 皮层按阈值分级（黄劣化 / 黑疑似恶意）。
+        # 中枢按阈值分级（黄劣化 / 黑疑似恶意）。
         self._behavior = {
             "hb_sent": 0,      # 心跳发送次数
             "hb_ok": 0,        # 心跳被父节点接受次数
@@ -132,6 +167,10 @@ class NervousNode:
         self._running = False
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        # stop() 幂等保护：重复 stop（如 shutdown 与「停止全部」双路径）
+        # 不再重复注销/关总线，避免同一失败打印两遍、也避免对已关闭总线操作。
+        self._stopped = False
+        self._stop_lock = threading.Lock()
         self._started_at = time.time()
 
     # ------------------------------------------------------------------
@@ -160,33 +199,53 @@ class NervousNode:
         return self
 
     def stop(self):
-        """停止节点：注销、停心跳、关总线。
+        """停止节点：注销、停心跳、关总线（幂等）。
 
         白盒约束：注销/关总线失败不静默——stderr 提示（进程即将退出，
-        本地审计无读者；皮层侧由心跳超时清扫兜底收敛）。
+        本地审计无读者；中枢侧由心跳超时清扫兜底收敛）。但须区分两类：
+          - 父节点已不可达（协调关闭顺序 / 父进程先退出）：可预期且无害，
+            降为一行温和提示；
+          - 父节点在线却拒绝注销（真·注销失败）：保留完整告警。
+        本方法幂等：重复调用只生效一次，杜绝同一失败重复打印。
         """
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
         self._running = False
         self._stop_event.set()
         if self.parent_url:
             try:
                 r = self.deregister()
                 if not r.get("ok"):
-                    print(f"[cnb] {self.node_id} 注销失败（皮层将按失联清扫"
-                          f"收敛）: {r.get('error')}", file=sys.stderr)
+                    err = str(r.get("error") or "")
+                    if _is_parent_unreachable(err):
+                        print(f"[cnb] {self.node_id} parent offline, skipping deregistration"
+                              f" (expected; node is being destroyed, no action needed)",
+                              file=sys.stderr)
+                    else:
+                        print(f"[cnb] {self.node_id} deregistration failed (the cortex "
+                              f"will reconcile it as lost during sweep): {err}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
-                print(f"[cnb] {self.node_id} 注销异常: {e}", file=sys.stderr)
+                if _is_parent_unreachable(f"{type(e).__name__}: {e}"):
+                    print(f"[cnb] {self.node_id} parent offline, skipping deregistration"
+                          f" (expected; node is being destroyed, no action needed)",
+                          file=sys.stderr)
+                else:
+                    print(f"[cnb] {self.node_id} deregistration error: {e}",
+                          file=sys.stderr)
         if self._bus is not None:
             try:
                 self._bus.shutdown()
                 self._bus.server_close()
             except Exception as e:  # noqa: BLE001
-                print(f"[cnb] {self.node_id} 总线关闭异常: {e}", file=sys.stderr)
+                print(f"[cnb] {self.node_id} bus shutdown error: {e}", file=sys.stderr)
 
     def _heartbeat_once(self) -> Dict:
         """执行一次心跳上报；若注册了心跳状态提供者，携带内核深度状态。
 
         白盒约束：provider 故障绝不静默——故障期间心跳状态降级为
-        degraded 并携带 provider_error 字段（皮层汇聚可见，可区分
+        degraded 并携带 provider_error 字段（中枢汇聚可见，可区分
         「引擎无状态」与「状态源故障」）；故障发生与恢复各审计一次
         （状态翻转审计，避免每周期刷屏淹没审计环）。
         """
@@ -204,7 +263,7 @@ class NervousNode:
                 self._note_provider_health(ok=False, error=e)
                 status = "degraded"
                 extra["provider_error"] = f"{type(e).__name__}: {e}"[:200]
-        # 冻结节点心跳强制标记（皮层调度侧据此摘流量），
+        # 冻结节点心跳强制标记（中枢调度侧据此摘流量），
         # 心跳照常发送——冻结不得被误判为 dead（与清扫线程语义互斥）。
         if self._frozen:
             status = "frozen"
@@ -212,7 +271,7 @@ class NervousNode:
             extra["frozen_reason"] = self._frozen_reason
             extra["frozen_at"] = self._frozen_at
             extra["frozen_by"] = self._frozen_by
-        # 行为基线聚合字段随心跳上汇（压缩上汇量，皮层分级）。
+        # 行为基线聚合字段随心跳上汇（压缩上汇量，中枢分级）。
         with self._behavior_lock:
             bh = dict(self._behavior)
         extra.setdefault("behavior", {
@@ -254,9 +313,9 @@ class NervousNode:
         while self._running and not self._stop_event.is_set():
             try:
                 r = self._heartbeat_once()
-                # 自愈：父节点已把本节点遗忘（如皮层救树/清扫后的拓扑变化）
+                # 自愈：父节点已把本节点遗忘（如中枢救树/清扫后的拓扑变化）
                 # -> 心跳被拒 -> 主动重新注册，重新锚定到父节点。
-                # 典型场景：父节点同 id 重启 / 皮层 rescue 后视图重建。
+                # 典型场景：父节点同 id 重启 / 中枢 rescue 后视图重建。
                 if not r.get("ok") and "not my descendant" in str(r.get("error", "")):
                     self.audit("心跳被父节点拒绝（本节点已不在其拓扑），自动重新注册")
                     try:
@@ -277,7 +336,7 @@ class NervousNode:
         - exec(payload: dict) -> dict   执行通用指令，返回值作为回执 detail
         - stop()                         停止本地任务
         - reload()                       重载配置
-        - perm_changed(rule: dict)       权限表被皮层修改
+        - perm_changed(rule: dict)       权限表被中枢修改
         - registered(parent_id: str)     注册被父节点确认
         """
         self._callbacks[event] = cb
@@ -298,7 +357,7 @@ class NervousNode:
     # ------------------------------------------------------------------
 
     def register_action(self, action: str, handler: Callable) -> "NervousNode":
-        """注册内核动作处理器：皮层 cmd.exec action=<action> 时被调用。
+        """注册内核动作处理器：中枢 cmd.exec action=<action> 时被调用。
 
         handler 签名：handler(payload: dict) -> dict（返回回执 detail）。
 
@@ -319,17 +378,121 @@ class NervousNode:
         return self._actions.pop(action, None) is not None
 
     def has_action(self, action: str) -> bool:
-        return action in self._actions
+        """动作是否存在（内核动作表 + 槽位模块动作面两级统一视图）。"""
+        return action in self._actions or action in self.slots.action_index()
 
     def list_actions(self) -> List[str]:
-        """当前注册的内核动作名（皮层可见该原子可执行的动作面）。"""
-        return sorted(self._actions)
+        """当前可执行的动作名（内核动作 + 槽位模块动作的并集）。
+
+        中枢可见该原子完整的能力面：内核动作（引擎绑定层注册）与槽位模块
+        导出的动作（如完整 norpagent 实例模块导出的内核动作面）。
+        """
+        return sorted(set(self._actions) | set(self.slots.action_index()))
+
+    # ------------------------------------------------------------------
+    # 通用槽位（R-024 修订：≤64 槽位；完整 norpagent 实例 = 标准模块）
+    # ------------------------------------------------------------------
+
+    def mount_module(self, slot_id: str, module: Any,
+                     meta: Optional[Dict] = None) -> Dict:
+        """挂载一个模块到通用槽位。
+
+        - module 满足可挂载协议（describe()/actions()/可选 on_mount 等）；
+        - 容量 ≤64、slot_id 唯一、动作名与既有槽位不冲突（SlotError 如实抛出）；
+        - 挂载即审计；模块动作自动并入节点动作面（slot_list 可查）。
+        """
+        return self.slots.mount(slot_id, module, meta=meta)
+
+    def unmount_module(self, slot_id: str) -> Dict:
+        """卸载槽位模块（回调 + 动作面收回 + 审计）。"""
+        return self.slots.unmount(slot_id)
+
+    def describe_slots(self) -> List[Dict]:
+        """槽位全景描述（白盒：可看）。"""
+        return self.slots.describe()
+
+    def _builtin_slot_list(self, payload: Dict) -> Dict:
+        """slot_list：槽位数量 / 空位 / 槽位摘要（只读取证面）。"""
+        return {
+            "ok": True,
+            "action": "slot_list",
+            "count": self.slots.count(),
+            "free": self.slots.free(),
+            "max_slots": self.slots.max_slots,
+            "slots": [
+                {"slot_id": s.get("slot_id"), "kind": s.get("kind"),
+                 "label": s.get("label")}
+                for s in self.slots.describe()
+            ],
+        }
+
+    def _builtin_slot_describe(self, payload: Dict) -> Dict:
+        """slot_describe：单槽位或全槽位完整描述（只读取证面）。"""
+        args = payload.get("args")
+        if not isinstance(args, dict):
+            args = {}
+        sid = str(args.get("slot_id") or args.get("id") or "").strip()
+        if sid:
+            slot = self.slots.get(sid)
+            if slot is None:
+                return {"ok": False, "action": "slot_describe",
+                        "error": f"slot {sid!r} is not occupied"}
+            return {"ok": True, "action": "slot_describe",
+                    "slot": slot.describe()}
+        return {"ok": True, "action": "slot_describe",
+                "count": self.slots.count(),
+                "slots": self.slots.describe()}
+
+    def _builtin_slot_mount(self, payload: Dict) -> Dict:
+        """slot_mount：经总线挂载通用模块（model / tools / plugins / 自定义）。
+
+        args: {"slot_id": "...", "module": {"kind": "...", "label": "...",
+               "payload": {...}}}
+        完整 norpagent 实例模块需要活引擎对象，不能经 JSON 规格构建——
+        该场景请走 Python 侧 node.mount_module(..., NorpAgentModule(engine))。
+        """
+        args = payload.get("args")
+        if not isinstance(args, dict):
+            args = {}
+        sid = str(args.get("slot_id") or args.get("id") or "").strip()
+        if not sid:
+            return {"ok": False, "action": "slot_mount",
+                    "error": "missing slot_id (args.slot_id is required)"}
+        spec = args.get("module")
+        if not isinstance(spec, dict):
+            return {"ok": False, "action": "slot_mount",
+                    "error": "missing module spec "
+                             "(args.module = {kind, label, payload})"}
+        try:
+            module = build_module_from_spec(spec)
+            info = self.slots.mount(sid, module,
+                                    meta={"source": "bus.slot_mount"})
+        except SlotError as exc:
+            self.audit(f"slot_mount rejected: {exc}")
+            return {"ok": False, "action": "slot_mount", "error": str(exc)}
+        return {"ok": True, "action": "slot_mount", "slot": info}
+
+    def _builtin_slot_unmount(self, payload: Dict) -> Dict:
+        """slot_unmount：经总线卸载槽位模块（动作面同步收回）。"""
+        args = payload.get("args")
+        if not isinstance(args, dict):
+            args = {}
+        sid = str(args.get("slot_id") or args.get("id") or "").strip()
+        if not sid:
+            return {"ok": False, "action": "slot_unmount",
+                    "error": "missing slot_id (args.slot_id is required)"}
+        try:
+            info = self.slots.unmount(sid)
+        except SlotError as exc:
+            self.audit(f"slot_unmount rejected: {exc}")
+            return {"ok": False, "action": "slot_unmount", "error": str(exc)}
+        return {"ok": True, "action": "slot_unmount", "unmounted": info}
 
     def set_heartbeat_provider(self, provider: Optional[Callable]) -> "NervousNode":
         """设置心跳状态提供者：provider() -> (status: str, extra: dict) 或 None。
 
         引擎绑定层注入后，心跳自动携带内核深度状态（engine_state /
-        active_tasks / 版本号等），经父链逐级汇聚到皮层。
+        active_tasks / 版本号等），经父链逐级汇聚到中枢。
         """
         if provider is not None and not callable(provider):
             raise ValueError("heartbeat provider must be callable or None")
@@ -393,11 +556,11 @@ class NervousNode:
     def freeze(self, reason: str = "", source: str = "cortex") -> Dict:
         """冻结本节点：拒新任务接单、进程/心跳保活（取证面保全）。
 
-        由皮层 cmd.freeze 下行触发（_handle_downlink 祖先校验通过后执行），
+        由中枢 cmd.freeze 下行触发（_handle_downlink 祖先校验通过后执行），
         也可由引擎绑定层/上层应用直接调用。冻结期间：
           - exec 只放行 FROZEN_ALLOWED_ACTIONS（只读取证面），run_task /
             stop_engine / rollback 等变更性动作一律拒绝并审计；
-          - 心跳照常发送且标记 frozen（皮层调度摘流量；不触发清扫判 dead）；
+          - 心跳照常发送且标记 frozen（中枢调度摘流量；不触发清扫判 dead）；
           - 本地审计与上报记录保持可读（subpoena 取证通道不受影响）。
         """
         if self._frozen:
@@ -416,8 +579,8 @@ class NervousNode:
     def unfreeze(self, reason: str = "", source: str = "cortex") -> Dict:
         """解除冻结：复核通过后康复回树（接单面恢复）。
 
-        由皮层 cmd.unfreeze 下行触发；解除后心跳恢复普通状态字。
-        杜绝带病复用由皮层处置把关（复核未通过应销毁重建而非解冻）。
+        由中枢 cmd.unfreeze 下行触发；解除后心跳恢复普通状态字。
+        杜绝带病复用由中枢处置把关（复核未通过应销毁重建而非解冻）。
         """
         if not self._frozen:
             return {"ok": True, "frozen": False, "already": True}
@@ -447,7 +610,7 @@ class NervousNode:
         return self
 
     def behavior_summary(self) -> Dict:
-        """当前行为基线统计摘要（皮层分级消费）。"""
+        """当前行为基线统计摘要（中枢分级消费）。"""
         with self._behavior_lock:
             bh = dict(self._behavior)
         return {
@@ -491,7 +654,7 @@ class NervousNode:
                    大小写不敏感）；None = 不限。
             max_bytes: 单卷字节预算（容量档；默认 64KB）。
             vol: 取第几卷（0 起）。超预算自动分卷，应答带 total_vols 供
-                 皮层逐卷取完（512KB 档只流式分卷裁决，不整喂）。
+                 中枢逐卷取完（512KB 档只流式分卷裁决，不整喂）。
 
         Returns:
             隔离帧应答：{ok, subpoena: RAW/UNTRUSTED, scope, total_records,
@@ -588,16 +751,16 @@ class NervousNode:
             return list(self._reports)
 
     # ------------------------------------------------------------------
-    # 发送：上行上报（只发往父节点，逐级汇聚到皮层）
+    # 发送：上行上报（只发往父节点，逐级汇聚到中枢）
     # ------------------------------------------------------------------
 
     def _send_uplink(self, msg_type: str, payload: Dict) -> Dict:
         """构造并投递上行消息到父节点。控制字段在传输层被剥离/拒绝。
 
         白盒约束：投递失败不静默丢失——
-          - 心跳类失败计入行为基线 hb_fail（随下次心跳聚合上汇皮层）；
+          - 心跳类失败计入行为基线 hb_fail（随下次心跳聚合上汇中枢）；
           - 事件/审计/注册等上行失败本地节流审计（30s 窗口），本地取证
-            链可查「皮层曾缺失哪些事件」，调用方无需逐个检查返回值。
+            链可查「中枢曾缺失哪些事件」，调用方无需逐个检查返回值。
         """
         if not self.parent_url:
             self._audit_throttled("上行投递失败（本节点为根，无父节点）",
@@ -609,7 +772,7 @@ class NervousNode:
             "parent", msg_type, payload)
         r = self._client.try_post_msg(self.parent_url, env)
         if not r.get("ok") and msg_type != "report.heartbeat":
-            # 心跳失败已由 report_heartbeat 计入 hb_fail（皮层可见），
+            # 心跳失败已由 report_heartbeat 计入 hb_fail（中枢可见），
             # 此处只审计非心跳上行（事件/审计/请求/注册/注销）的丢失。
             self._audit_throttled("上行投递失败",
                                   f"type={msg_type} error={r.get('error')}",
@@ -617,10 +780,10 @@ class NervousNode:
         return r
 
     def register(self) -> Dict:
-        """向父节点注册（沿树逐级转发到皮层）。
+        """向父节点注册（沿树逐级转发到中枢）。
 
         注册应答中的 hello 携带父节点真实 id：确认后更新本地拓扑，
-        此后皮层（及一切祖先）的下行指令才会被识别为合法。
+        此后中枢（及一切祖先）的下行指令才会被识别为合法。
         """
         payload = {
             "node_id": self.node_id,
@@ -649,16 +812,16 @@ class NervousNode:
 
         Args:
             status: 状态字（running / busy / idle / frozen / degraded ...，由
-                    上层原子按忙闲语义自定义上报，皮层汇聚可见）。
+                    上层原子按忙闲语义自定义上报，中枢汇聚可见）。
             **extra: 附加状态字段（如 task_count / load / 业务指标）。
                      控制字段（cmd.* / perm.* 等）会被接收端传输层拒绝。
 
         每次心跳按结果累计行为基线（hb_sent/hb_ok/hb_fail），
-        聚合统计由 _heartbeat_once 统一附加，皮层据此分级。
+        聚合统计由 _heartbeat_once 统一附加，中枢据此分级。
 
         白盒约束：extra 中被传输层判定为控制字段的键（如 cmd.* / perm.* /
         裸 exec）会被静默剥离——本方法把被剥字段名列进
-        _dropped_control_fields（与 status 同层上汇），皮层与本地审计
+        _dropped_control_fields（与 status 同层上汇），中枢与本地审计
         均可见「哪些字段没送上去」，杜绝无声丢字段。
         """
         with self._behavior_lock:
@@ -766,7 +929,7 @@ class NervousNode:
             # 改挂（cmd.reroot），避免活子树随中间层一起被级联注销成孤岛。
             self._rescue_children(sender_id)
             self._record_report(env, "deregister (children rescued)")
-            self._forward_uplink(env)  # 继续上报皮层（上层同样执行救树，收敛一致）
+            self._forward_uplink(env)  # 继续上报中枢（上层同样执行救树，收敛一致）
             self._maybe_auto_sync()
             return {"ok": True}
 
@@ -778,7 +941,7 @@ class NervousNode:
         if msg_type == "report.heartbeat":
             self.topology.heartbeat(sender_id)
         self._record_report(env)
-        up = self._forward_uplink(env)  # 上行汇聚：继续上报皮层，保证深层全可见
+        up = self._forward_uplink(env)  # 上行汇聚：继续上报中枢，保证深层全可见
         if up is not None and not up.get("ok"):
             # 上层拒绝（典型：本节点已被上层拓扑移除/遗忘）：
             # 把裁决回传给发送方（子节点），驱动其心跳自愈（重新注册）。
@@ -795,7 +958,7 @@ class NervousNode:
         2. 把 node_id 自身从本地拓扑注销（子已改挂，此时只删自身）。
 
         返回改挂通知成功的子节点 id 列表。通知失败（子真死/网络断）的子
-        保留在本节点之下（dead），由皮层清扫线程按宽限期收敛清除。
+        保留在本节点之下（dead），由中枢清扫线程按宽限期收敛清除。
         """
         node = self.topology.get(node_id)
         if node is None:
@@ -832,7 +995,7 @@ class NervousNode:
         return rescued
 
     def _maybe_auto_sync(self):
-        """拓扑变更后的自动同步钩子。皮层覆写为防抖广播；普通节点为空操作。"""
+        """拓扑变更后的自动同步钩子。中枢覆写为防抖广播；普通节点为空操作。"""
 
     def _accept_register(self, env: Dict) -> Dict:
         """接受注册：加入本地拓扑，必要时继续向上转发。
@@ -855,7 +1018,7 @@ class NervousNode:
         except ValueError as e:
             self.audit(f"register reject: {e}")
             return {"ok": False, "error": str(e)}
-        # 沿树继续向上转发（到达皮层为止）
+        # 沿树继续向上转发（到达中枢为止）
         self._forward_uplink(env)
         self._maybe_auto_sync()
         return {"ok": True,
@@ -870,10 +1033,10 @@ class NervousNode:
 
         深树关键语义：via 记录「原始直接父」（最接近发送者的转发者），
         每跳只允许 setdefault——若已有 via 必须原样保留。一旦每跳覆盖，
-        皮层会把深层节点错挂到最末一跳转发者之下（深层注册坍缩，B1）。
+        中枢会把深层节点错挂到最末一跳转发者之下（深层注册坍缩，B1）。
 
         Returns:
-            父节点/皮层的应答 dict；无父（根节点）或已转发过返回 None。
+            父节点/中枢的应答 dict；无父（根节点）或已转发过返回 None。
         """
         if not self.parent_url:
             return None
@@ -890,7 +1053,7 @@ class NervousNode:
 
         注意：注册确认（cmd.hello）的 ancestors 字段只应携带「父的祖先链」
         （不含父自身），由子端前置直接父，避免父节点重复出现（B6）。
-        本方法含自身，适用于皮层 REPL / 审计展示类场景。
+        本方法含自身，适用于中枢 REPL / 审计展示类场景。
         """
         return [self.node_id] + list(self._ancestors)
 
@@ -916,7 +1079,7 @@ class NervousNode:
             return {"ok": False, "error": "not my ancestor"}
 
         # 3. 无条件执行（记录审计；exec 指令同时记录 action 名，
-        #    保证审计可检索「皮层执行了哪个动作」——白盒约束）。
+        #    保证审计可检索「中枢执行了哪个动作」——白盒约束）。
         payload = dict(env.get("payload", {}))
         action_note = ""
         if msg_type == "cmd.exec":
@@ -971,12 +1134,12 @@ class NervousNode:
                     "uptime": round(time.time() - getattr(self, "_started_at", time.time()), 1)}
 
         if msg_type == "cmd.exec":
-            # 执行前检查神经权限表（皮层可据此收紧任意原子的操作权限）
+            # 执行前检查神经权限表（中枢可据此收紧任意原子的操作权限）
             action = payload.get("action", "")
             perm = payload.get("perm", "process_exec")
             if not self.permissions.check(perm, payload.get("path", "")):
-                self.audit(f"exec denied: {action} 需要权限 {perm}（被皮层撤销）")
-                # 权限拒绝上行审计：皮层侧因此有权限面审计视图
+                self.audit(f"exec denied: {action} 需要权限 {perm}（被中枢撤销）")
+                # 权限拒绝上行审计：中枢侧因此有权限面审计视图
                 self.report_audit("perm.denied", json.dumps(
                     {"action": action, "perm": perm,
                      "path": payload.get("path", "")},
@@ -996,17 +1159,23 @@ class NervousNode:
                 return {"ok": False, "error":
                         f"node frozen (quarantine): {action} rejected — "
                         f"read-only evidence actions only"}
-            # 路由：内核动作注册表优先，旧回调钩子兜底（v1.0.7 内核集成）。
-            # 动作表命中 -> 直接执行；未命中但有 exec 回调 -> 兼容旧绑定
-            # （bare echo / 第三方回调）；两者皆无 -> 拒绝并审计。
+            # 路由：内核动作注册表优先，槽位模块动作面次之，旧回调钩子兜底
+            # （v1.0.7 内核集成 + R-024 槽位面）。动作表命中 -> 直接执行；
+            # 未命中但槽位模块提供该动作 -> 经槽位面执行（source="slot"）；
+            # 再未命中但有 exec 回调 -> 兼容旧绑定（bare echo / 第三方回调）；
+            # 三者皆无 -> 拒绝并审计。
             handler = self._actions.get(action)
+            source = "kernel"
+            if handler is None:
+                handler = self.slots.action_index().get(action)
+                source = "slot"
             if handler is not None:
                 try:
                     detail = handler(dict(payload)) or {}
                     if not isinstance(detail, dict):
                         detail = {"result": detail}
                     return {"ok": True, "action": action,
-                            "source": "kernel", "detail": detail}
+                            "source": source, "detail": detail}
                 except Exception as e:  # noqa: BLE001 — 动作处理器异常回执
                     self.audit(f"exec action {action} error: {e}")
                     return {"ok": False, "action": action,
@@ -1032,13 +1201,13 @@ class NervousNode:
             return self._exec_perm(msg_type, payload)
 
         if msg_type == "cmd.topology.sync":
-            # 权威快照镜像：皮层广播的是整树权威视图，接收端必须向它收敛。
-            #  1) 剪枝：本地拓扑中不在快照里的节点级联注销。皮层清扫收敛
+            # 权威快照镜像：中枢广播的是整树权威视图，接收端必须向它收敛。
+            #  1) 剪枝：本地拓扑中不在快照里的节点级联注销。中枢清扫收敛
             #     注销（dead->drop）后若只加不删，中间层本地缓存会长期残留
             #     stale 节点，其心跳 descendants 持续携带已死节点（缺口 A：
-            #     probe-x 被皮层清扫后，父链中间层 rnd 心跳仍含 probe-x）。
+            #     probe-x 被中枢清扫后，父链中间层 rnd 心跳仍含 probe-x）。
             #  2) 注册/更新快照内节点；父指针以快照为准——本地旧父偏差
-            #     （如救树/改挂后的视图滞后）一并收敛，子树视图与皮层一致。
+            #     （如救树/改挂后的视图滞后）一并收敛，子树视图与中枢一致。
             #  自身永不移除；剪枝造成的瞬时缺失由「心跳被拒 -> 自动重注册」
             #  自愈，活节点不会丢。
             nodes = payload.get("nodes", [])
@@ -1068,7 +1237,7 @@ class NervousNode:
             return {"ok": True, "synced": len(nodes)}
 
         if msg_type == "cmd.freeze":
-            # 皮层/上级签发冻结（隔离冻结态）。
+            # 中枢/上级签发冻结（隔离冻结态）。
             # 祖先校验已在 _handle_downlink 完成；冻结不改变拓扑与心跳，
             # 只关闭接单面（exec 变更性动作），进程保活供取证。
             reason = str(payload.get("reason") or "").strip()
@@ -1088,7 +1257,7 @@ class NervousNode:
         if msg_type == "cmd.subpoena":
             # 传票取证（最高取证权限）。
             # 五道闸：③ 取数通道在节点端执行；签发合法性（level 0 专属、
-            # 判据前置、容量分档）由皮层签发侧把关；本端兜底校验签发者
+            # 判据前置、容量分档）由中枢签发侧把关；本端兜底校验签发者
             # level == 0（低层级冒用被拒并审计），并强制隔离帧标记。
             sender_level = int(payload.get("_sender_level", -1))
             if sender_level != protocol.LEVEL_CORTEX:
@@ -1131,7 +1300,7 @@ class NervousNode:
         return {"ok": False, "error": f"unsupported downlink: {msg_type}"}
 
     def _exec_perm(self, msg_type: str, payload: Dict) -> Dict:
-        """执行皮层权限指令：控制任意层级任意单位原子的操作权限。"""
+        """执行中枢权限指令：控制任意层级任意单位原子的操作权限。"""
         target_type = payload.get("target_type", "*")
         target = payload.get("target", "*")
         source = payload.get("source", "cortex")
@@ -1177,10 +1346,10 @@ class NervousNode:
     def _perm_uplink_audit(self, op: str, target_type: str, target: str,
                            perm: str = None, allows: Dict = None,
                            source: str = "cortex"):
-        """权限变更生效后上行审计：皮层侧汇聚权限面视图。
+        """权限变更生效后上行审计：中枢侧汇聚权限面视图。
 
-        经父链逐级转发（中间层只记录并汇聚），最终落在皮层 reports 环；
-        皮层 /cnb/ctrl op=perm_audit 据此提供统一权限面审计视图。
+        经父链逐级转发（中间层只记录并汇聚），最终落在中枢 reports 环；
+        中枢 /cnb/ctrl op=perm_audit 据此提供统一权限面审计视图。
         """
         body = {"op": op, "target_type": target_type, "target": target,
                 "source": source}
@@ -1197,7 +1366,7 @@ class NervousNode:
 
     def send_downlink(self, to_node_id: str, target_url: str,
                       msg_type: str, payload: Dict) -> Dict:
-        """向指定节点下发指令（仅皮层/上级可用；由接收方校验祖先关系）。"""
+        """向指定节点下发指令（仅中枢/上级可用；由接收方校验祖先关系）。"""
         env = protocol.make_envelope(
             protocol.DIR_DOWNLINK,
             {"node_id": self.node_id, "level": self.level, "kind": self.kind},

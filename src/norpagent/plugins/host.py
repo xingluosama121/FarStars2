@@ -38,8 +38,10 @@ from norpagent.plugins.loader import (
     HOOK_NAMES,
     PLUGIN_MODULE_PREFIX,
     PluginContext,
+    PluginLogger,
     _ImportBlocker,
     _loading_plugin,
+    _positional_capacity,
 )
 
 # protocol operations
@@ -194,6 +196,7 @@ class PluginHostProcess:
             h for h in HOOK_NAMES if callable(getattr(module, h, None))
         ]
         has_execute = callable(getattr(module, "execute", None))
+        has_setup = callable(getattr(module, "setup", None))
 
         # tool approval hints (APPROVAL_HINTS)
         approval_hints: Dict[str, dict] = {}
@@ -221,6 +224,7 @@ class PluginHostProcess:
             "tools": _safe_json(tools),
             "hook_names": hook_names,
             "has_execute": has_execute,
+            "has_setup": has_setup,
             "publisher": (publisher if isinstance(publisher, str) else ""),
             "version": (version if isinstance(version, str) else ""),
             "description": (description if isinstance(description, str) else ""),
@@ -229,11 +233,16 @@ class PluginHostProcess:
 
     def _make_context(self, plugin_name: str, req: dict) -> PluginContext:
         c = req.get("context") or {}
+        log_dir = str(c.get("plugin_log_dir") or
+                      os.path.join(os.path.expanduser("~"),
+                                   ".norpagent", "plugin_logs"))
         return PluginContext(
             plugin_name=plugin_name,
             project_root=str(c.get("project_root", "")),
             app_dir=str(c.get("app_dir", "")),
             config=(c.get("config") or {}),
+            storage={},
+            logger=PluginLogger(plugin_name, log_dir),
         )
 
     def _sync_context(self, plugin_name: str, req: dict) -> PluginContext:
@@ -284,6 +293,11 @@ class PluginHostProcess:
         if not isinstance(args, (list, tuple)):
             args = [args]
         args = list(args)
+        if hook == "on_task_stopped":
+            # legacy signature is (context); a 2+ positional function gets (reason, context)
+            capacity = _positional_capacity(fn)
+            if capacity is not None and capacity < 2:
+                args = []
         ctx = self._sync_context(plugin_name, req)
         try:
             result = fn(*args, ctx)

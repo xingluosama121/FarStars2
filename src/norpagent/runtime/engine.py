@@ -181,6 +181,7 @@ class NorpEngine:
         # degrades to a plain single instance; request_stop unmounts.
         self._cnb: Optional[Any] = None
         self._cnb_managed = False
+        self._cnb_error: Optional[str] = None
         self._cnb_lock = threading.Lock()
         # task-level cancellation (EngineTaskHandle; manual 30.13): task_id -> handle
         self._tasks: Dict[str, Any] = {}
@@ -550,14 +551,32 @@ class NorpEngine:
 
         NORP_CNB_MANAGED=1 asks the kernel to skip mounting (an
         upper layer builds its own node — prevents double mounting). Mounting runs
-        on a background thread: startup is never delayed, and any failure degrades
-        to a plain single instance (warning printed). request_stop() unmounts.
-        """
-        try:
-            from norpagent.runtime.cnb import setup_cnb
+        on a background thread: startup is never delayed, and network/port
+        failures degrade to a plain single instance (warning printed).
 
-            setup_cnb(self)
+        R-023：默认不携带 CNB；显式配置（``np(cnb=...)``）或 env 才启用。
+        R-025 / 2026-09-12 反馈轮（错误语义定稿）：配置错误（含缺端口、
+        缺节点标识、神经树定义缺必要参数）显式报错但**不阻塞主线程启动**——
+        宿主照常启动、神经树不加载；错误经 ``engine.cnb_error`` 可查、
+        ``engine.cnb_status`` 显示为 ``config-error``。request_stop() unmounts.
+        """
+        explicit = getattr(self, "_cnb_explicit", None)
+        try:
+            from norpagent.runtime.cnb import CnbConfigError, setup_cnb
+        except Exception as exc:  # noqa: BLE001 — package level failure: degrade
+            self._cnb_error = f"{type(exc).__name__}: {exc}"
+            print(f"[cnb] auto-mount unavailable; degrading to a plain instance: {exc}")
+            return
+        try:
+            setup_cnb(self, explicit=explicit)
+            self._cnb_error = None
+        except CnbConfigError as exc:
+            # 配置错误显式报错、不阻塞启动（2026-09-12 反馈轮）：宿主正常
+            # 启动，神经树不加载；错误状态可查（cnb_status=config-error）。
+            self._cnb_error = str(exc)
+            print(f"[cnb] config error (does not block startup; neural tree not loaded): {exc}")
         except Exception as exc:  # noqa: BLE001 — auto-mount must never break the instance
+            self._cnb_error = f"{type(exc).__name__}: {exc}"
             print(f"[cnb] auto-mount error; degrading to a plain instance: {exc}")
 
     def _teardown_cnb(self) -> None:
@@ -579,14 +598,28 @@ class NorpEngine:
 
     @property
     def cnb_status(self) -> str:
-        """Mount status: not-mounted / managed-skip / mounting / mounted / failed / stopped."""
+        """Mount status: not-mounted / managed-skip / mounting / mounted / failed /
+        stopped / config-error（配置错误：显式报错且不加载神经树，宿主照常运行）。"""
         with self._cnb_lock:
             if self._cnb_managed:
                 return "managed-skip"
             adapter = self._cnb
+            err = self._cnb_error
         if adapter is None:
-            return "not-mounted"
+            return "config-error" if err else "not-mounted"
         return str(getattr(adapter, "status", "unknown"))
+
+    @property
+    def cnb_error(self) -> Optional[str]:
+        """CNB 最近一次配置/装配错误（None = 无错误；显式报错的可查通道）。"""
+        with self._cnb_lock:
+            err = self._cnb_error
+            adapter = self._cnb
+        if err:
+            return err
+        if adapter is not None:
+            return getattr(adapter, "error", None)
+        return None
 
     @staticmethod
     def _normalize_task_overrides(

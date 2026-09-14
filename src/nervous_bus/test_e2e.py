@@ -3,10 +3,10 @@
 nervous_bus.test_e2e — 端到端验证（真实多进程）
 
 通过 norpagent 主入口 main.py 启动：
-  1 个大脑皮层进程（--norp-cortex）
-  2 个节点进程（--norp-node，树状拓扑链：皮层 -> bot -> pilot）
+  1 个中枢进程（--norp-cortex）
+  2 个节点进程（--norp-node，树状拓扑链：中枢 -> bot -> pilot）
 
-再用 nervous_bus.cli 命令（皮层控制端点）验证：拓扑、探活、执行、
+再用 nervous_bus.cli 命令（中枢控制端点）验证：拓扑、探活、执行、
 权限控制、越权拦截、进程清理。
 
 运行：python -m nervous_bus.test_e2e
@@ -86,15 +86,15 @@ def main():
 
     procs = []
 
-    # 1. 启动皮层
+    # 1. 启动中枢
     cortex = subprocess.Popen(
         [PY, "main.py", "--norp-cortex", "--port", "17900"],
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     procs.append(cortex)
-    check("E01 皮层进程启动",
+    check("E01 中枢进程启动",
           wait_health("http://127.0.0.1:17900"))
 
-    # 2. 启动两级节点（树状链：皮层 -> bot -> pilot）
+    # 2. 启动两级节点（树状链：中枢 -> bot -> pilot）
     bot = subprocess.Popen(
         [PY, "main.py", "--norp-node", "--id", "norpbot-e2e", "--kind", "bot",
          "--parent", "http://127.0.0.1:17900", "--port", "17901", "--level", "3"],
@@ -112,7 +112,7 @@ def main():
     rc, out = run_cli("topo", "--root", "http://127.0.0.1:17900")
     check("E02 CLI 查看拓扑",
           rc == 0 and "norpbot-e2e" in out and "norpilot-e2e" in out, out)
-    check("E03 拓扑为树状链（bot 挂在皮层下，pilot 挂在 bot 下）",
+    check("E03 拓扑为树状链（bot 挂在中枢下，pilot 挂在 bot 下）",
           "[3] norpbot-e2e" in out and "[4] norpilot-e2e" in out, out)
 
     # 4. 探活
@@ -145,7 +145,7 @@ def main():
                       "--target", "bot", "--perm", "file_write")
     check("E09 CLI 按原子类型授权", rc == 0 and '"ok": true' in out, out)
 
-    # 8. 越权：低等级节点直接向皮层发下行指令 -> 拒绝
+    # 8. 越权：低等级节点直接向中枢发下行指令 -> 拒绝
     from nervous_bus import protocol
     from nervous_bus.bus import BusClient
     env = protocol.make_envelope(
@@ -153,7 +153,7 @@ def main():
         {"node_id": "norpbot-e2e", "level": 3, "kind": "bot"},
         "cortex", "cmd.ping", {})
     r = BusClient(timeout=10).post_msg("http://127.0.0.1:17900", env)
-    check("E10 低等级向皮层发指令被拒",
+    check("E10 低等级向中枢发指令被拒",
           (not r.get("ok")) and "not my ancestor" in str(r.get("error")), str(r))
 
     # 9. 平级节点互发指令 -> 拒绝（先起一个同级 memory 节点）
@@ -171,14 +171,14 @@ def main():
     check("E11 平级节点互发指令被拒",
           (not r.get("ok")) and "not my ancestor" in str(r.get("error")), str(r))
 
-    # 10. 上报汇聚：皮层能看到心跳
+    # 10. 上报汇聚：中枢能看到心跳
     rc, out = run_cli("reports", "--root", "http://127.0.0.1:17900", "--n", "50")
-    check("E12 皮层上报记录含心跳",
+    check("E12 中枢上报记录含心跳",
           rc == 0 and "report.heartbeat" in out and "norpbot-e2e" in out, out)
 
     # 11. 拓扑广播
     rc, out = run_cli("sync", "--root", "http://127.0.0.1:17900")
-    check("E13 皮层拓扑广播", rc == 0 and '"ok": true' in out, out)
+    check("E13 中枢拓扑广播", rc == 0 and '"ok": true' in out, out)
 
     # 12. 清理
     for p in procs:

@@ -32,6 +32,12 @@ _REDACT_KEYS = frozenset((
     "secret", "token", "password", "passwd", "authorization",
 ))
 
+# Placeholder written into snapshots in place of a secret. It must never be
+# written back over a live value: doing so replaces the real secret with the
+# literal string "<redacted>" and breaks every subsequent model call (401).
+# ``restore_redacted`` re-injects the existing on-disk value for any placeholder.
+REDACTED = "<redacted>"
+
 # engine params that are web-mount / model config keys (handled specially during replay)
 _WEB_PARAM_KEYS = frozenset((
     "port", "host", "open_browser", "language", "html", "flow_html",
@@ -62,7 +68,7 @@ def jsonable(value: Any, _depth: int = 0) -> Any:
         for k, v in value.items():
             key = str(k)
             if key.lower() in _REDACT_KEYS:
-                out[key] = "<redacted>"
+                out[key] = REDACTED
             else:
                 out[key] = jsonable(v, _depth + 1)
         return out
@@ -80,6 +86,30 @@ def jsonable(value: Any, _depth: int = 0) -> Any:
 def is_marker(value: Any) -> bool:
     """Whether the value is an "unserializable" type marker (skipped during replay)."""
     return isinstance(value, dict) and "__instance__" in value
+
+
+def restore_redacted(incoming: Any, existing: Any) -> Any:
+    """Re-inject existing secret values wherever ``incoming`` carries a placeholder.
+
+    Snapshots store secrets as ``REDACTED`` for safety. When replaying a snapshot
+    back onto the live system, that placeholder must NOT overwrite a real value:
+    a redacted secret means "keep whatever is already there". This applies
+    recursively through dicts (and positionally through equal-length lists), so
+    nested secret keys are preserved as well.
+    """
+    if isinstance(incoming, str) and incoming == REDACTED:
+        return existing if existing is not None else incoming
+    if isinstance(incoming, dict):
+        base = existing if isinstance(existing, dict) else {}
+        out: Dict[str, Any] = {}
+        for k, v in incoming.items():
+            out[k] = restore_redacted(v, base.get(k)) if k in base else v
+        return out
+    if isinstance(incoming, list):
+        if isinstance(existing, list) and len(existing) == len(incoming):
+            return [restore_redacted(v, e) for v, e in zip(incoming, existing)]
+        return incoming
+    return incoming
 
 
 def _read_webui_config() -> Optional[Dict[str, Any]]:
@@ -224,10 +254,17 @@ def capture_cli(
 
 # ── replay ───────────────────────────────────────────────
 
-def _write_webui_config(cfg: Optional[Dict[str, Any]]) -> None:
-    """Write the snapshot's WebUI settings back to disk (takes effect on next start / restart)."""
+def _write_webui_config(cfg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Write the snapshot's WebUI settings back to disk (takes effect on next start / restart).
+
+    Redacted secrets in ``cfg`` are replaced with the values currently on disk
+    (see ``restore_redacted``) so a rollback can never overwrite a real API key
+    with the literal ``<redacted>`` placeholder. Returns the merged config that
+    was actually written (or None when there was nothing to write).
+    """
     if not isinstance(cfg, dict):
-        return
+        return None
+    merged = restore_redacted(cfg, _read_webui_config())
     path = os.environ.get(
         "NORPAGENT_WEBUI_CONFIG",
         os.path.join(os.path.expanduser("~"), ".norpagent",
@@ -237,10 +274,11 @@ def _write_webui_config(cfg: Optional[Dict[str, Any]]) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json.dump(merged, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     except OSError:
         pass
+    return merged
 
 
 def _restore_session_files(snapshot_data: Dict[str, Any],
@@ -286,6 +324,6 @@ def restore_files(snapshot_data: Dict[str, Any],
 
 
 __all__ = [
-    "jsonable", "is_marker", "capture_system", "capture_cli",
-    "restore_files",
+    "jsonable", "is_marker", "restore_redacted", "REDACTED",
+    "capture_system", "capture_cli", "restore_files",
 ]

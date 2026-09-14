@@ -8,18 +8,18 @@ nervous_bus.test_cnb_v200 — v2.0.0 新增内核能力验收（FarStars 远星�
             - mol 六要素结构化 JSON 原样承载到达原子吸收位（无字段丢失）；
             - task_records 动作查询受理载荷与完成结果（验收回执数据面）；
             - audit / task_started / task_done 事件中 mol_id 贯穿可追溯；
-            - acceptance 规格随 task_done 原样回传皮层。
+            - acceptance 规格随 task_done 原样回传中枢。
   隔离冻结态 freeze/unfreeze
             - 冻结后拒新任务（run_task 拒绝并审计上行）、只读取证动作放行；
-            - 冻结节点心跳照常且标记 frozen（皮层调度摘流量）；
+            - 冻结节点心跳照常且标记 frozen（中枢调度摘流量）；
             - 冻结不触发清扫判 dead（心跳保活）；
-            - 解除冻结后接单恢复；皮层 perm_audit 记录 freeze/unfreeze。
+            - 解除冻结后接单恢复；中枢 perm_audit 记录 freeze/unfreeze。
   行为基线内核侧聚合
             - 节点心跳自动携带 behavior 聚合统计（hb/audit_anomaly/task_fail）；
-            - 皮层 behavior_view 分级：黄劣化 / 黑疑似恶意。
+            - 中枢 behavior_view 分级：黄劣化 / 黑疑似恶意。
   subpoena 传票最高取证权限
             - level 0 专属签发；非法判据 / 未穷尽摘要 / 超档审批 / 超 512KB
-              在皮层端拒绝；
+              在中枢端拒绝；
             - 节点端低层级冒用（level>0 签发）拒绝并上行审计 subpoena.forged；
             - 原始审计直传（隔离帧 RAW/UNTRUSTED 标记）；
             - 容量分档与自动分卷（>64KB 多卷自动取全）；
@@ -173,8 +173,8 @@ def main():
     print("=" * 64)
 
     client = BusClient(timeout=10.0)
-    # 皮层（level 0）+ 中间层 tech（level 1）+ 原子 dev（level 2）
-    # 树状链：cortex -> tech -> dev（深树语义：上行逐级汇聚到皮层）
+    # 中枢（level 0）+ 中间层 tech（level 1）+ 原子 dev（level 2）
+    # 树状链：cortex -> tech -> dev（深树语义：上行逐级汇聚到中枢）
     cortex = Cortex(node_id="cortex", port=_next_port(),
                     sweep_enabled=False, dead_timeout=2.0, drop_grace=6.0)
     cortex.start()
@@ -186,7 +186,7 @@ def main():
                       parent_url=tech.base_url, port=_next_port(),
                       heartbeat_interval=0.4)
     dev.start()
-    check("S00 树装配：皮层拓扑含 3 节点",
+    check("S00 树装配：中枢拓扑含 3 节点",
           wait_until(lambda: cortex.topology.size() == 3
                      and cortex.topology.get("dev") is not None
                      and cortex.topology.get("dev").parent_id == "tech"))
@@ -225,7 +225,7 @@ def main():
           wait_until(lambda: any(
               a.get("mol_id") == "mol-20260905-0001"
               for a in dev.get_audit())))
-    # 皮层 reports 环：task_started 事件带 mol_id（上行贯穿）
+    # 中枢 reports 环：task_started 事件带 mol_id（上行贯穿）
     check("S104 task_started 上行事件带 mol_id",
           wait_until(lambda: any(
               rep.get("type") == "report.event"
@@ -233,7 +233,7 @@ def main():
               and (rep.get("payload") or {}).get("data", {}).get("mol_id")
               == "mol-20260905-0001"
               for rep in cortex.get_reports())))
-    # task_done 上行带 mol_id + acceptance（验收回执沿树回传皮层）
+    # task_done 上行带 mol_id + acceptance（验收回执沿树回传中枢）
     check("S105 task_done 上行事件带 mol_id + acceptance",
           wait_until(lambda: any(
               rep.get("type") == "report.event"
@@ -255,7 +255,7 @@ def main():
           bool(records) and records[0].get("status") == "done"
           and records[0].get("content_len", 0) > 0)
     # mol_id 贯穿 audit 可追溯
-    check("S108 皮层/节点审计可查 mol_id",
+    check("S108 中枢/节点审计可查 mol_id",
           any("mol-20260905-0001" in str(a) for a in dev.get_audit()))
 
     # 缺失 prompt 拒绝（契约：缺 prompt 拒 + 上行审计）
@@ -267,7 +267,7 @@ def main():
     # ── 隔离冻结态 ──
     print("\n── 隔离冻结态（freeze / unfreeze）──")
     rf = cortex.freeze_node("dev", reason="隔离处置：疑似恶意行为")
-    check("S201 皮层签发冻结 ok", rf.get("ok") and rf.get("frozen"),
+    check("S201 中枢签发冻结 ok", rf.get("ok") and rf.get("frozen"),
           json.dumps(rf, ensure_ascii=False)[:300])
     check("S202 dev 冻结位置位", dev.is_frozen())
     # 冻结期间：新任务拒绝（接单面关闭）
@@ -275,7 +275,7 @@ def main():
     check("S203 冻结期 run_task 被拒（拒新任务）",
           not r3.get("ok") and "frozen" in str(r3.get("error", "")).lower(),
           json.dumps(r3, ensure_ascii=False)[:300])
-    check("S204 冻结拒绝上行审计 frozen.reject 达皮层",
+    check("S204 冻结拒绝上行审计 frozen.reject 达中枢",
           wait_until(lambda: any(
               rep.get("type") == "report.audit"
               and (rep.get("payload") or {}).get("event") == "frozen.reject"
@@ -287,8 +287,8 @@ def main():
           not r4.get("ok") and "frozen" in str(r4.get("error", "")).lower())
     r5 = cortex.exec_cmd("dev", "engine_state", args={})
     check("S206 冻结期只读取证动作放行", r5.get("ok"))
-    # 冻结节点心跳照常且标记 frozen（皮层调度侧摘流量）
-    check("S207 皮层 reports 出现 status=frozen 心跳",
+    # 冻结节点心跳照常且标记 frozen（中枢调度侧摘流量）
+    check("S207 中枢 reports 出现 status=frozen 心跳",
           wait_until(lambda: any(
               rep.get("type") == "report.heartbeat"
               and (rep.get("payload") or {}).get("status") == "frozen"
@@ -300,13 +300,13 @@ def main():
     ninfo = cortex.topology.get("dev")
     check("S208 冻结不判 dead（心跳保活，alive=True）",
           ninfo is not None and ninfo.alive, str(ninfo))
-    # 皮层 perm_audit 记录 freeze（冻结签发留痕）
-    check("S209 皮层权限面审计含 freeze 记录",
+    # 中枢 perm_audit 记录 freeze（冻结签发留痕）
+    check("S209 中枢权限面审计含 freeze 记录",
           any("freeze" in (a.get("event") or "")
               for a in cortex.perm_audit(200)))
     # 解除冻结
     ru = cortex.unfreeze_node("dev", reason="复核通过：误报")
-    check("S210 皮层解除冻结 ok", ru.get("ok") and not ru.get("frozen"))
+    check("S210 中枢解除冻结 ok", ru.get("ok") and not ru.get("frozen"))
     check("S211 解冻后 dev 冻结位清除", not dev.is_frozen())
     r6 = cortex.exec_cmd("dev", "run_task",
                          args={"prompt": "back to work",
@@ -335,7 +335,7 @@ def main():
               and (rep.get("payload") or {}).get("behavior", {}).get(
                   "task_total", 0) >= 1
               for rep in cortex.get_reports())))
-    # 皮层分级视图：dev 已出现（审计异常率 ≥ 阈值 -> 黄/黑）
+    # 中枢分级视图：dev 已出现（审计异常率 ≥ 阈值 -> 黄/黑）
     bv = cortex.behavior_view()
     dev_v = next((v for v in bv.get("verdicts", [])
                   if v.get("node_id") == "dev"), None)
@@ -348,7 +348,7 @@ def main():
     dev.audit("boom2", error="second exception")
     dev.audit("boom3", error="third exception")
     cortex.behavior_thresholds["black_audit_anomaly_rate"] = 0.10
-    time.sleep(1.0)  # 等心跳把新统计带上皮层
+    time.sleep(1.0)  # 等心跳把新统计带上中枢
     bv2 = cortex.behavior_view()
     dev_v2 = next((v for v in bv2.get("verdicts", [])
                    if v.get("node_id") == "dev"), None)
@@ -443,14 +443,14 @@ def main():
     check("S417 低层级冒用签发被拒（level 0 专属不可委派）",
           not forged.get("ok") and "level-0" in str(forged.get("error", "")),
           json.dumps(forged, ensure_ascii=False)[:300])
-    check("S418 冒用审计上行皮层（subpoena.forged）",
+    check("S418 冒用审计上行中枢（subpoena.forged）",
           wait_until(lambda: any(
               rep.get("type") == "report.audit"
               and (rep.get("payload") or {}).get("event") == "subpoena.forged"
               and rep.get("from") == "dev"
               for rep in cortex.get_reports())))
     # ctrl 端点透出（CLI/REPL 同路）：op=freeze / behavior / subpoena 已覆盖；
-    # 再验 ctrl 直达（皮层自身为 level 0，可对任意层级原子签发）
+    # 再验 ctrl 直达（中枢自身为 level 0，可对任意层级原子签发）
     ctrl_r = client.post_ctrl(cortex.base_url,
                               {"op": "subpoena", "node": "tech",
                                "basis": "confidence_low", "tier_kb": 64})

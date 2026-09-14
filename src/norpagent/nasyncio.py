@@ -35,6 +35,14 @@
 #        import norpagent.nasyncio            → gets this core module
 #        np.nasyncio.EventLoop                → the self-developed event loop class
 #        np.nasyncio()                        → a LoopRuntime (default implementation)
+#   - coexistence (2026-09-12): "not depending on it" never means "conflicting
+#     with it" — the standard asyncio and this core do NOT conflict and CAN be
+#     used side by side in the same process. norpagent schedules only through
+#     this core on the async_loop slot; user code may keep using the standard
+#     asyncio (including asyncio.run) unaffected. Cross-thread collaboration
+#     between the two goes through thread-safe APIs
+#     (run_coroutine_threadsafe / EventLoop.submit); there is no implicit
+#     takeover in either direction. See the developer manual 4.7.
 #
 # Copyright: Copyright (c) 2026 xingluosama
 # ============================================================================
@@ -53,7 +61,7 @@ import time as _time
 import traceback as _traceback
 from collections import deque
 
-__version__ = "2.0.1"
+__version__ = "2.2.2"
 
 __all__ = [
     # exceptions

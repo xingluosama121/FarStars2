@@ -15,8 +15,13 @@ norpagent.cnb.engine —— CNB 从外挂独立包内化为 norpagent 内核子�
 
 from norpagent.cnb.engine import (  # noqa: F401
     CnbAdapter,
+    CnbConfigError,
     setup_cnb,
+    remount_cnb,
+    detach_cnb,
     read_env_config,
+    apply_explicit_config,
+    validate_cnb_config,
     KERNEL_ACTIONS,
     CNB_ENV_KEYS,
     ENV_NODE,
@@ -28,6 +33,7 @@ from norpagent.cnb.engine import (  # noqa: F401
     ENV_DESC,
     ENV_MANAGED,
     ENV_CLI,
+    ENV_TREE,
 )
 from norpagent.cnb.engine import *  # noqa: F401,F403
 
@@ -36,8 +42,13 @@ EXEC_ACTIONS = frozenset(KERNEL_ACTIONS)
 
 __all__ = [
     "CnbAdapter",
+    "CnbConfigError",
     "setup_cnb",
+    "remount_cnb",
+    "detach_cnb",
     "read_env_config",
+    "apply_explicit_config",
+    "validate_cnb_config",
     "KERNEL_ACTIONS",
     "EXEC_ACTIONS",
     "CNB_ENV_KEYS",
@@ -50,4 +61,5 @@ __all__ = [
     "ENV_DESC",
     "ENV_MANAGED",
     "ENV_CLI",
+    "ENV_TREE",
 ]

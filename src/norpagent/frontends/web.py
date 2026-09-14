@@ -49,6 +49,67 @@ from typing import Any, Dict, List, Optional
 from norpagent.frontends.base import Frontend
 
 
+class _TaskScope:
+    """Shared scope: any number of chat tasks may run concurrently (2026-09-13)."""
+
+    def __init__(self, g: "_ConcurrencyGate") -> None:
+        self._g = g
+
+    def __enter__(self):
+        with self._g._cond:
+            while self._g._writer:
+                self._g._cond.wait()
+            self._g._readers += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._g._cond:
+            self._g._readers -= 1
+            if self._g._readers <= 0:
+                self._g._cond.notify_all()
+        return False
+
+
+class _ExclusiveScope:
+    """Exclusive scope: a rebuild waits for in-flight tasks to drain."""
+
+    def __init__(self, g: "_ConcurrencyGate") -> None:
+        self._g = g
+
+    def __enter__(self):
+        with self._g._cond:
+            while self._g._writer or self._g._readers > 0:
+                self._g._cond.wait()
+            self._g._writer = True
+        return self
+
+    def __exit__(self, *exc):
+        with self._g._cond:
+            self._g._writer = False
+            self._g._cond.notify_all()
+        return False
+
+
+class _ConcurrencyGate:
+    """Reader-writer gate replacing the old single global task lock (2026-09-13)."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+
+    def task_scope(self) -> "_TaskScope":
+        return _TaskScope(self)
+
+    def exclusive(self) -> "_ExclusiveScope":
+        return _ExclusiveScope(self)
+
+    def locked(self) -> bool:
+        """True while any task runs or a rebuild holds the gate (legacy check)."""
+        with self._cond:
+            return bool(self._writer or self._readers > 0)
+
+
 class WebFrontend:
     """HTTP + SSE frontend shell (page = front.html)."""
 
@@ -101,7 +162,21 @@ class WebFrontend:
         self._engine: Optional[Any] = None
         self._ui: Optional[Any] = None
         self._base_tools: List[str] = []  # snapshot of the preset's default tool set
-        self._gate = threading.Lock()
+        # 2026-09-13: reader-writer gate + per-session locks replace the single
+        # global lock that serialised every session (one session generating used
+        # to block all others). Chat tasks share; rebuilds are exclusive.
+        self._gate = _ConcurrencyGate()
+        self._sess_locks: Dict[str, threading.Lock] = {}
+        self._sess_locks_guard = threading.Lock()
+
+    def _session_lock(self, sid: Optional[str]) -> threading.Lock:
+        key = str(sid or "__none__")
+        with self._sess_locks_guard:
+            lk = self._sess_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                self._sess_locks[key] = lk
+            return lk
 
     def attach(self, engine: Any) -> None:
         from norpagent.builtin.ui.web import WebUI
@@ -178,10 +253,15 @@ class WebFrontend:
             engine._bus.subscribe(self._ui.on_event)
         engine.subscribe_ui(self._ui)
 
-        # restore the persisted agent tool set at startup (the agent_tools config saved last time)
+        # plugin page mounts queued by plugins loaded before this frontend attached
+        # (setup(api).mount_page stores pending requests on the registry; consume them here)
+        self._consume_pending_page_mounts(engine)
+
+        # startup restore: saved model/key registration + persisted agent tool
+        # set (round 9 — previously tools-only, which left CLI/restart paths
+        # without the saved API key in the provider)
         try:
-            saved = self._ui.get_config()
-            self._apply_agent_tools(saved or {})
+            self.restore_startup_config()
         except Exception:  # noqa: BLE001 — restore failure must not block startup
             pass
 
@@ -210,6 +290,25 @@ class WebFrontend:
         agent._ui_listener = self._ui.on_event
         engine._bus.subscribe(self._ui.on_event)
         engine.subscribe_ui(self._ui)
+
+        # plugin page mounts queued while this frontend was detached (AgentRuntime rebuild)
+        self._consume_pending_page_mounts(engine)
+
+    def _consume_pending_page_mounts(self, engine: Any) -> None:
+        """Apply plugin page mounts queued on the registry (setup(api).mount_page)."""
+        try:
+            reg = getattr(engine, "registry", None)
+            pending = getattr(reg, "_pending_page_mounts", None) if reg is not None else None
+            if not pending:
+                return
+            for page, html in list(pending.items()):
+                try:
+                    self.mount_page(page, html)
+                except Exception:  # noqa: BLE001 — a bad page mount must not break attach
+                    pass
+            pending.clear()
+        except Exception:  # noqa: BLE001
+            pass
 
     def mount_page(self, page: str, html: Optional[str] = None) -> bytes:
         """Hot-replace page bytes at runtime (HTTP service not restarted; port unchanged).
@@ -241,52 +340,33 @@ class WebFrontend:
 
     def _handle_task(self, prompt_text: str, session_id: Optional[str],
                      task_params: Optional[Dict[str, Any]] = None) -> Any:
-        # tasks run serially on the same runtime
-        with self._gate:
-            return self._engine.submit(
-                prompt_text, session_id=session_id, task_params=task_params
-            )
+        # 2026-09-13: per-session isolation — different sessions run concurrently
+        # on the shared engine; the same session stays serialised.
+        with self._session_lock(session_id):
+            with self._gate.task_scope():
+                return self._engine.submit(
+                    prompt_text, session_id=session_id, task_params=task_params
+                )
 
-    def _apply_config(self, cfg: Dict[str, Any]) -> None:
-        """Apply after the page saves config: mode / model / remote endpoint / API key / plugin dirs / security."""
+    def _apply_model_config(self, cfg: Dict[str, Any]) -> Any:
+        """Register the effective model provider with the saved key / base URL.
+
+        Extracted from ``_apply_config`` (2026-09-12 round 9) so the startup
+        restore path can reuse it. Two semantics: registry adapter name / remote
+        model name. When the config value is empty, fall back to the current
+        preset's model — the page keeps ``model=""`` while the engine preset
+        carries ``openai_compat``; that fallback is what makes the saved API key
+        actually reach the provider after a restart.
+        """
         engine = self._engine
         if engine is None or cfg is None:
-            return
+            return None
         reg = engine.registry
-
-        # ── mode: registry preset hot-switch (front "mode" selector) ──
-        # remount(preset=...) hot-rebuilds the AgentRuntime (stop old sandbox →
-        # build new runtime → frontend rebind), so it is skipped while a task is
-        # running (gate held); it takes effect on the next config application or
-        # restart; unchanged values are also skipped.
-        # note: with slot overrides the assembly layer names derived presets
-        # {base}_arch; comparisons use the base name so saving config does not
-        # misjudge every time as a "mode change".
-        preset_name = str(cfg.get("preset_name") or "")
-        agent = engine.agent
-        current_name = ""
-        if agent is not None:
-            preset = getattr(agent, "preset", None)
-            raw = str(getattr(preset, "name", "") or "")
-            current_name = raw[:-5] if raw.endswith("_arch") else raw
-        if preset_name and preset_name != current_name:
-            if not self._gate.locked():
-                try:
-                    engine.remount(preset=preset_name)
-                except Exception:  # noqa: BLE001 — keep the current mode when the preset name is invalid
-                    pass
-                agent = engine.agent
-                if agent is not None:
-                    preset = getattr(agent, "preset", None)
-                    if preset is not None:
-                        # refresh the default tool-set snapshot after the preset
-                        # hot-switch (the apply_agent_tools fallback base follows
-                        # the new preset, not the old one's tool set)
-                        self._base_tools = list(getattr(preset, "tools", ()) or ())
-
-        # ── model: two semantics — registry adapter name / remote model name ──
         agent = engine.agent
         model = str(cfg.get("model") or "")
+        if not model and agent is not None:
+            preset_cur = getattr(agent, "preset", None)
+            model = str(getattr(preset_cur, "model", "") or "")
         api_base = str(cfg.get("api_base") or "") or None
         api_key = str(cfg.get("api_key") or "") or None
 
@@ -328,31 +408,193 @@ class WebFrontend:
                     preset.model = model
                 except Exception:  # noqa: BLE001
                     pass
+        return agent
+
+    def restore_startup_config(self) -> None:
+        """Startup restore: saved model/key registration + persisted agent tool set.
+
+        Called from ``WebFrontend.attach`` and from the CLI web runner before the
+        HTTP service starts. Reads the in-process config (secrets included; HTTP
+        responses never carry the raw key) so a restarted instance can call the
+        model without re-saving settings. Previously the CLI path had no
+        config-apply wiring at all: chat calls kept failing with
+        "No API key found" until a manual settings save.
+        """
+        if self._ui is None:
+            return
+        # Deferred disk load: WebUI defers config reads to _ensure_disk_loaded()
+        # (called by start()); the restore runs before start(), so force the load
+        # here — otherwise the saved key/model would not be visible yet (the
+        # in-process config would still be all defaults).
+        ensure = getattr(self._ui, "_ensure_disk_loaded", None)
+        if callable(ensure):
+            try:
+                ensure()
+            except Exception:  # noqa: BLE001
+                pass
+        cfg: Optional[Dict[str, Any]] = None
+        getter = getattr(self._ui, "config_for_apply", None)
+        try:
+            cfg = getter() if callable(getter) else self._ui.get_config()
+        except Exception:  # noqa: BLE001
+            cfg = None
+        if not isinstance(cfg, dict):
+            return
+        try:
+            self._apply_model_config(cfg)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._apply_agent_tools(cfg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _apply_config(self, cfg: Dict[str, Any]) -> None:
+        """Apply after the page saves config: mode / model / remote endpoint / API key / plugin dirs / security."""
+        engine = self._engine
+        if engine is None or cfg is None:
+            return
+        reg = engine.registry
+
+        # ── mode: registry preset hot-switch (front "mode" selector) ──
+        # remount(preset=...) hot-rebuilds the AgentRuntime (stop old sandbox →
+        # build new runtime → frontend rebind), so it is skipped while a task is
+        # running (gate held); it takes effect on the next config application or
+        # restart; unchanged values are also skipped.
+        # note: with slot overrides the assembly layer names derived presets
+        # {base}_arch; comparisons use the base name so saving config does not
+        # misjudge every time as a "mode change".
+        preset_name = str(cfg.get("preset_name") or "")
+        agent = engine.agent
+        current_name = ""
+        if agent is not None:
+            preset = getattr(agent, "preset", None)
+            raw = str(getattr(preset, "name", "") or "")
+            current_name = raw[:-5] if raw.endswith("_arch") else raw
+        if preset_name and preset_name != current_name:
+            if not self._gate.locked():
+                try:
+                    engine.remount(preset=preset_name)
+                except Exception:  # noqa: BLE001 — keep the current mode when the preset name is invalid
+                    pass
+                agent = engine.agent
+                if agent is not None:
+                    preset = getattr(agent, "preset", None)
+                    if preset is not None:
+                        # refresh the default tool-set snapshot after the preset
+                        # hot-switch (the apply_agent_tools fallback base follows
+                        # the new preset, not the old one's tool set)
+                        self._base_tools = list(getattr(preset, "tools", ()) or ())
+
+        # ── model: two semantics — registry adapter name / remote model name ──
+        # (extracted into _apply_model_config so the startup restore path can
+        # reuse it — 2026-09-12 round 9; fixes the CLI-launched instance where
+        # the saved API key never reached the provider on restart)
+        agent = self._apply_model_config(cfg)
+
+        # ── snapshots: apply the configured storage directory (settings panel) ──
+        try:
+            _sdir = str(cfg.get("snapshot_dir") or "").strip()
+            if _sdir:
+                from norpagent.recovery import set_snapshot_dir
+
+                set_snapshot_dir(_sdir)
+        except Exception:  # noqa: BLE001 — a bad path must not break config apply
+            pass
 
         # ── agent tool set (file-as-module → front auto-invoked) ──
         self._apply_agent_tools(cfg)
 
-        # ── NORP security: install when enabled (one call for the full security suite) ──
-        if cfg.get("norp_safe_enabled") and getattr(reg, "security", None) is None:
+        # ── NORP security: mounted unless the master switches are off ──
+        #    security_enabled / norp_safe_enabled default to True. Turning them off
+        #    is an explicit, confirmed user choice (the settings panel gates it behind
+        #    a non-dismissable warning), so the mount honors the flags instead of
+        #    hard-forcing them. Hook intervention (jailbreak/injection blocking +
+        #    prompt hardening) is mounted so the safety system actually intercepts,
+        #    not just holds policy. Level comes from the settings store
+        #    (basic / standard / high).
+        #    Hot-remount: uninstall the old kit first so protection hooks never stack
+        #    on the bus; when switched off, uninstall and leave none mounted.
+        _sec_on = bool(cfg.get("security_enabled", True)) and bool(
+            cfg.get("norp_safe_enabled", True))
+        _prev_kit = getattr(reg, "_safety_kit", None)
+        if _prev_kit is not None:
+            try:
+                _prev_kit.uninstall(reg)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                setattr(reg, "_safety_kit", None)
+            except Exception:  # noqa: BLE001
+                pass
+        if _sec_on:
             try:
                 from norpagent import safe
 
-                safe(reg, level="standard")
-            except Exception:  # noqa: BLE001
+                _sec_level = str(cfg.get("security_level") or "standard").strip().lower()
+                if _sec_level not in ("basic", "standard", "high"):
+                    _sec_level = "standard"
+                # native tool confirmation + plugin-call approval: hand the runtime
+                # config to the security kit so ApprovalPolicy actually reads it
+                # (previously safe() was called without a config, so the settings
+                # panel had no way to reach the approval policy). Master switch is
+                # OFF by default; the three per-class switches default to ON and
+                # only apply when the master switch is on.
+                _approval = {
+                    "native_confirm_enabled": bool(cfg.get("native_confirm_enabled", False)),
+                    "native_confirm_write": bool(cfg.get("native_confirm_write", True)),
+                    "native_confirm_delete": bool(cfg.get("native_confirm_delete", True)),
+                    "native_confirm_exec": bool(cfg.get("native_confirm_exec", True)),
+                    "approval_enabled": bool(cfg.get("approval_enabled", True)),
+                }
+                _kit = safe(reg, level=_sec_level, hooks=True,
+                            config={"approval": _approval})
+                try:
+                    setattr(reg, "_safety_kit", _kit)
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001 — a broken security mount must not kill the app
                 pass
 
-        # ── plugin dirs: reinstall (signature→audit→import-restriction pipeline) ──
+        # ── plugin dirs: clean reinstall (signature → audit → import-restriction pipeline) ──
+        # 2026-09-11: unload the previous loader's plugins first (hook unsubscribe /
+        # tools removed / on_unload), pass the management config (disabled list /
+        # log dir / capability restriction), and record the new loader on the
+        # registry so the Web plugin panel can show the full record (failed /
+        # disabled / blocked plugins included).
         dirs = cfg.get("plugin_dirs") or []
-        if dirs:
-            try:
-                from norpagent.plugins import install_plugin_dirs
+        try:
+            from norpagent.plugins import install_plugin_dirs
 
-                install_plugin_dirs(reg, [str(d) for d in dirs], config={
+            prev_loader = getattr(reg, "plugin_loader", None)
+            if prev_loader is not None:
+                try:
+                    for prev_info in list(getattr(prev_loader, "plugins", ()) or ()):
+                        prev_loader.unload(reg, getattr(prev_info, "name", ""))
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    prev_loader.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    setattr(reg, "plugin_loader", None)
+                except Exception:  # noqa: BLE001
+                    pass
+            if dirs:
+                loader = install_plugin_dirs(reg, [str(d) for d in dirs], config={
                     "plugin_security_audit": cfg.get("plugin_security_audit") or "warn",
-                    "plugin_signature_verify": True,
+                    "plugin_signature_verify": bool(cfg.get("plugin_signature_verify", True)),
+                    "plugin_disabled": list(cfg.get("plugin_disabled") or []),
+                    "plugin_log_dir": str(cfg.get("plugin_log_dir") or ""),
+                    "plugin_capabilities": cfg.get("plugin_capabilities"),
                 })
-            except Exception:  # noqa: BLE001
-                pass
+                try:
+                    setattr(reg, "plugin_loader", loader)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
 
         # ── work rollback: a saved setting is a system change → auto snapshot ──
         try:
@@ -404,6 +646,24 @@ class WebFrontend:
                 if not ok:
                     return {"ok": False, "error": "snapshot not found"}
                 return {"ok": True, "deleted": payload.get("id")}
+            if action == "delete_many":
+                # 批量删除（回退面板「删除选中」）：单个失败不阻塞其余
+                ids = payload.get("ids") or []
+                if not isinstance(ids, list) or not ids:
+                    return {"ok": False, "error": "ids must be a non-empty list"}
+                deleted: List[str] = []
+                failed: List[str] = []
+                for sid in ids:
+                    try:
+                        ok = recovery.delete_snapshot(str(sid))
+                        if ok:
+                            deleted.append(str(sid))
+                        else:
+                            failed.append(str(sid))
+                    except Exception:  # noqa: BLE001 — 单个失败不阻塞其余
+                        failed.append(str(sid))
+                return {"ok": True, "deleted": deleted, "failed": failed,
+                        "count": len(deleted)}
             if action == "rename":
                 info = recovery.rename_snapshot(
                     str(payload.get("id") or ""),
@@ -441,12 +701,24 @@ class WebFrontend:
         except Exception:  # noqa: BLE001
             registered = set()
         if cfg.get("agent_tools_explicit"):
-            preset.tools = [
+            tools = [
                 str(t) for t in (cfg.get("agent_tools") or [])
                 if str(t) in registered
             ]
         else:
-            preset.tools = list(self._base_tools)
+            tools = list(self._base_tools)
+        # web retrieval switch (2026-09-12 round 9): the composer's "web search"
+        # toggle and the settings "tools.web_search" item gate the DuckDuckGo
+        # retrieval tools actually mounted for the agent. Previously the flag was
+        # a dangling config value that nothing consumed.
+        web_tools = ("web_search", "web_fetch", "web_extract_links")
+        if not bool(cfg.get("enable_web_search")):
+            tools = [t for t in tools if t not in web_tools]
+        else:
+            for name in web_tools:
+                if name in registered and name not in tools:
+                    tools.append(name)
+        preset.tools = tools
 
     def start(self) -> None:
         if self._ui is not None:

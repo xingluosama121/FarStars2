@@ -49,6 +49,20 @@ _EFFORT_MODEL_RE = re.compile(
 
 _DS_V4_RE = re.compile(r"^deepseek-v4([-_.]|$)", re.IGNORECASE)
 
+# Remote model names retired upstream by the vendor: stale fetch caches and
+# third-party mirrors still list them, so they are kept out of a fetched remote
+# model list. This vendor-specific knowledge belongs to the adapter; the generic
+# UI layer delegates here instead of hardcoding model names of its own.
+RETIRED_REMOTE_MODELS = frozenset(("deepseek-chat", "deepseek-reasoner"))
+
+
+def filter_remote_models(models: Any) -> List[str]:
+    """Drop retired remote model names from a fetched remote-model list."""
+    if not isinstance(models, (list, tuple, set)):
+        return []
+    return [str(m) for m in models
+            if str(m).strip().lower() not in RETIRED_REMOTE_MODELS]
+
 
 def model_supports_reasoning_effort(model: str) -> bool:
     """Decide whether the model name belongs to a reasoning series supporting reasoning_effort.
@@ -218,12 +232,19 @@ class OpenAICompatProvider:
         supports = model_supports_reasoning_effort(model)
         is_v4 = model_is_deepseek_v4(model)
         if effort and effort != "none":
-            if supports:
-                kwargs["reasoning_effort"] = effort
-                if is_v4:
-                    kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-            else:
-                kwargs["temperature"] = float(params.get("temperature", 1.0))
+            # Mirror duo2's behavior: when the user picked a strength, actually
+            # send it — do not silently drop it just because the model name does
+            # not match a hardcoded reasoning-series pattern (that made the
+            # reasoning-effort control a no-op for many endpoints).
+            eff = effort
+            if eff == "max" and not is_v4:
+                # OpenAI reasoning series accept low / medium / high only;
+                # "max" is a DeepSeek V4 extension — clamp it for others.
+                eff = "high"
+            kwargs["reasoning_effort"] = eff
+            if is_v4:
+                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            # reasoning on: omit temperature (endpoints reject it alongside reasoning)
         else:
             # no strength given / reasoning explicitly disabled
             if is_v4:
@@ -231,9 +252,17 @@ class OpenAICompatProvider:
                     kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
                 # not specified: keep the official default (thinking enabled; temperature ignored but not an error)
                 kwargs["temperature"] = float(params.get("temperature", 1.0))
-            elif not supports:
+            else:
                 kwargs["temperature"] = float(params.get("temperature", 1.0))
-            # supports and not v4 (OpenAI o*/gpt-5): reasoning cannot be disabled; no temperature
+        # top_p: sent only when temperature is sent (reasoning endpoints reject it
+        # alongside reasoning, same rule as temperature).
+        if not (effort and effort != "none"):
+            _top_p = params.get("top_p")
+            if _top_p is not None:
+                try:
+                    kwargs["top_p"] = float(_top_p)
+                except (TypeError, ValueError):
+                    pass
         max_tokens = params.get("max_tokens")
         if max_tokens:
             kwargs["max_tokens"] = int(max_tokens)

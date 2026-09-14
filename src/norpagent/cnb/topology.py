@@ -4,7 +4,7 @@ norpagent.cnb.topology — 神经树拓扑（树状拓扑链）
 
 维护 CNB 树状拓扑：
 
-- 每个节点有且仅有一个父节点；根节点（大脑皮层，level 0）无父。
+- 每个节点有且仅有一个父节点；根节点（中枢，level 0）无父。
 - 节点注册时声明 parent_id，总线做无环校验（父链不得回到自身）。
 - 等级约束：子节点 level 必须大于父节点 level（数字越大等级越低）。
 - 提供祖先/后代判定：下行指令只允许「祖先 -> 后代」；上行上报只允许
@@ -26,7 +26,7 @@ class NodeInfo:
         self.node_id = node_id
         self.level = int(level)
         self.kind = kind
-        self.parent_id = parent_id          # None 表示根（大脑皮层）
+        self.parent_id = parent_id          # None 表示根（中枢）
         self.meta = dict(meta or {})        # 附加信息（host、port、描述等）
         self.registered_at = time.time()
         self.last_seen = time.time()        # 最近心跳时间
@@ -71,7 +71,7 @@ class Topology:
             return list(self._nodes.values())
 
     def root(self) -> Optional[NodeInfo]:
-        """返回根节点（大脑皮层，parent_id 为 None 且 level 最低）。"""
+        """返回根节点（中枢，parent_id 为 None 且 level 最低）。"""
         with self._lock:
             candidates = [n for n in self._nodes.values() if n.parent_id is None]
             if not candidates:
@@ -96,7 +96,7 @@ class Topology:
         """
         level = int(level)
         if level < LEVEL_CORTEX or level > LEVEL_MAX:
-            raise ValueError(f"非法等级 {level}，允许范围 {LEVEL_CORTEX}~{LEVEL_MAX}")
+            raise ValueError(f"invalid level {level}; allowed range {LEVEL_CORTEX}~{LEVEL_MAX}")
 
         with self._lock:
             # 父节点必须存在于本地拓扑（直接注册时父即本节点；转发注册时
@@ -105,7 +105,8 @@ class Topology:
             if parent_id is not None and parent_id != node_id \
                     and parent_id not in self._nodes:
                 raise ValueError(
-                    f"父节点不存在于本地拓扑：{parent_id}（视图过期或注册次序异常）")
+                    f"parent node not present in the local topology: {parent_id} "
+                    f"(stale view or out-of-order registration)")
             # 环检测：沿 parent 链向上，不得出现 node_id 自身。
             # 父链上某节点不在本地拓扑中 => 位于本地视图之外（祖先方向），
             # 视为链的合法终点（本地拓扑是子树视图，祖先天然不在其中）。
@@ -113,18 +114,18 @@ class Topology:
             guard = 0
             while cur is not None:
                 if cur == node_id:
-                    raise ValueError(f"拓扑环拒绝：{node_id} 的父链出现自身")
+                    raise ValueError(f"topology cycle rejected: {node_id} appears in its own parent chain")
                 parent = self._nodes.get(cur)
                 if parent is None:
                     break  # 本地视图之外的祖先，合法终点
                 if parent.level >= level:
                     raise ValueError(
-                        f"等级约束拒绝：子节点 {node_id}(level {level}) 的等级必须"
-                        f"大于父节点 {cur}(level {parent.level})")
+                        f"level constraint rejected: child {node_id}(level {level}) must "
+                        f"be greater than parent {cur}(level {parent.level})")
                 cur = parent.parent_id
                 guard += 1
                 if guard > LEVEL_MAX + 1:
-                    raise ValueError("拓扑链过长，疑似环")
+                    raise ValueError("topology chain too long; possible cycle")
 
             node = self._nodes.get(node_id)
             if node is None:
@@ -135,16 +136,16 @@ class Topology:
                 # （低等级不允许改写高等级；树状拓扑链一经建立保持稳定）
                 if level != node.level:
                     raise ValueError(
-                        f"等级篡改拒绝：{node_id} 已注册为 level {node.level}，"
-                        f"不允许改为 {level}")
+                        f"level tampering rejected: {node_id} is registered as level "
+                        f"{node.level}; changing to {level} is not allowed")
                 if kind and kind != node.kind:
                     raise ValueError(
-                        f"类型篡改拒绝：{node_id} 已注册为 kind {node.kind}，"
-                        f"不允许改为 {kind}")
+                        f"kind tampering rejected: {node_id} is registered as kind "
+                        f"{node.kind}; changing to {kind} is not allowed")
                 if parent_id != node.parent_id:
                     raise ValueError(
-                        f"父节点篡改拒绝：{node_id} 的父节点是 {node.parent_id}，"
-                        f"不允许改为 {parent_id}")
+                        f"parent tampering rejected: {node_id}'s parent is {node.parent_id}; "
+                        f"changing to {parent_id} is not allowed")
                 node.meta.update(meta or {})
                 node.touch()
 
@@ -235,7 +236,7 @@ class Topology:
     # ------------------------------------------------------------------
 
     def render_tree(self) -> List[Dict]:
-        """输出整棵树的可读视图（用于皮层控制台 / CLI）。"""
+        """输出整棵树的可读视图（用于中枢控制台 / CLI）。"""
         with self._lock:
             view = []
             for node in self._nodes.values():
@@ -324,7 +325,7 @@ class Topology:
                 node.alive = False
 
     def sweep_dead(self, timeout: float = 30.0) -> List[str]:
-        """清扫超时未心跳的节点（标记 dead，不注销，供皮层处置）。"""
+        """清扫超时未心跳的节点（标记 dead，不注销，供中枢处置）。"""
         now = time.time()
         dead = []
         with self._lock:

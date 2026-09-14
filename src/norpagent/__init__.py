@@ -149,6 +149,9 @@ from norpagent.recovery import (  # noqa: F401
     register_snapshot_provider,
     set_snapshot_dir,
 )
+# crash-rescue（第 24 章）：快照救援 CLI（模块级零框架依赖）提升为包级可达面，
+# 与 recovery / cnb 一致——「随时保留知晓运行过程并干预的权利」的入口之一。
+from norpagent import rescue  # noqa: F401
 from norpagent.frontends import (  # noqa: F401
     Frontend,
     ConsoleFrontend,
@@ -160,6 +163,12 @@ from norpagent.frontends import (  # noqa: F401
 # norpagent.cnb 子模块，import norpagent 即就绪；旧独立包名 nervous_bus
 # 保留为兼容 shim（re-export 本子模块）。
 from norpagent import cnb  # noqa: E402,F401  # CNB 内核子模块（中枢神经总线）
+# 元框架态命名空间（架构书 §3.1 / 拍板 3A）：最小内核四构件 + 注册三件套
+# （register_slot / register_layer / register_hook）+ 裸装配路径。
+from norpagent import core  # noqa: E402,F401
+# 成品态独立入口模块（架构书 §3.1 / O5）：norpagent unbox 的入口本体
+# （与 frame 基座分离；norpagent.unbox 为兼容转发层）。
+from norpagent import farstars_app  # noqa: E402,F401
 
 # ═══════════════════════════════════════════════════════
 # 版本与品牌
@@ -172,10 +181,59 @@ from norpagent import cnb  # noqa: E402,F401  # CNB 内核子模块（中枢神�
 #       动作（audit/事件 mol_id 贯穿可追溯）；
 #       隔离冻结态 freeze/unfreeze（拒新任务、保活取证、可审计可解除、
 #       不触发清扫判 dead）；
-#       行为基线内核侧聚合（心跳压缩上汇 + 皮层分级视图黄劣化/黑疑似恶意）；
+#       行为基线内核侧聚合（心跳压缩上汇 + 中枢分级视图黄劣化/黑疑似恶意）；
 #       subpoena 传票最高取证权限（level 0 专属不可委派、五道闸、容量分档、
 #       隔离帧 RAW/UNTRUSTED、签发全审计）。
-__version__ = "2.0.1"
+# v2.1.0（2026-09-11）插件系统专项：
+#   - 内核钩子派发修复：before_step / before_tool_call / after_tool_call
+#     双派发收敛为单次；EventBus.intercept 全遍历 + 首个非 None 生效；
+#   - 插件桥接完整修复：PluginContext 补 logger / storage；16 兼容钩子签名
+#     对齐（on_task_stopped 自适应）；29 钩子全开放；pass-through 规范化；
+#     钩子异常上报；setup(api) 注册门面（工具/槽位/组件/模型/钩子/事件/
+#     服务/页面/CLI/设置）；on_load / on_unload；依赖与版本声明；
+#     干净热重载；Web 插件面板与 CLI plugins 子命令；第 33 章完全指南。
+# v2.2.0（2026-09-12）三位一体架构书全量落地 + 前端 V2：
+#   - 元框架态：norpagent.core —— 最小内核四构件命名空间 + 注册三件套
+#     （register_slot / register_layer / register_hook）+ 裸装配路径；
+#   - 成品态：独立入口模块 norpagent.farstars_app（unbox 本体迁入，与 frame
+#     基座分离；norpagent.unbox 保留兼容转发）；用户态启动全量装配全部内置工具；
+#   - 设置事实源：内核动点全量清单（十一域）+ 四层继承语义（全局 > 档案 >
+#     会话/任务 > 临时；不填=用上级、三态可查）+ 设置快照导入导出 +
+#     `norpagent settings` CLI（Web / CLI / REST 三通道同源）；
+#   - 白盒统一遍历：norpagent.whitebox（describe / audit_trail / settings
+#     三件套按环节树统一呈现）+ 控制台「白盒总览」页；
+#   - 进化闭环：提案引擎 + 提案中心 + 熔断 + 2A/2B/2C 执行器
+#     （2D 代码进化热重载已有）；
+#   - CNB 热挂载：np.remount(cnb=...) 运行时挂载 / 替换 / 卸载；
+#   - 前端 V2（暖阳版）：左列选项卡设置布局、每项悬停说明、总开关联动置灰、
+#     Reasoning Effort 增补 xhigh、工作区目录选择器、会话批量清除/清空、
+#     输入框内联模式/模型/工作区控制、三端共通 i18n（/assets/i18n.js · np_lang）。
+# v2.2.1（2026-09-12）缺陷收口（需求清单 R-032 / R-033）：
+#   - R-033 ask_user 工具：内置工具面补齐 ask_user——模型可通过工具调用主动向
+#     用户提问 / 澄清需求 / 确认危险操作（此前仅有 UI 适配器与内核审批链的内部
+#     机制，活跃工具集缺失该工具）；standard / ptc / longrun 预设与两个装配入口
+#     （install_defaults / install_core）均注册；
+#   - R-032 token 计数计入原始文本：端点未回传 usage 时，后端按「原始文本」
+#     （raw markdown / LaTeX 源码 + 提示词）估算 input + output（此前只算渲染后
+#     的可见输出且缺 input，导致总 token 偏低）；估算值带 estimated 标记，前端
+#     以「≈」如实标注，端点回传 usage 时依旧以服务端数值为准。
+# v2.2.2（2026-09-13）设置治理 / 安全可关闭 / 主题系统 / 前端修复 / 索引合并：
+#   - 设置项治理：灰化项逐个核实后端功能——确有功能且已接入运行态者重新启用
+#     （security.level / model.top_p / model.call_timeout / runtime.snapshot_dir），
+#     无实现或由面板外机制控制者隐藏入口（HIDDEN_KEYS；仍登记于设置库保留审计）；
+#   - 安全系统「默认常开」项（security.enabled / safe_enabled / signature_verify）
+#     去 locked 灰化、标 danger：允许关闭，前端关闭前弹不可点击外部 / ESC 关闭的
+#     强制确认框；后端尊重开关（不再硬编码 True）；
+#   - 安全拦截告警常驻（取消自动消失）+ 同源聚合 + 一键清除；
+#   - 主题系统：ui.theme 单一 JSON 文档（mode / active / themes）+ 主题设计器 +
+#     内置预设与自定义主题（配色令牌 / 圆角字体 / 可选高级 CSS 校验）+ 导出 / 导入
+#     JSON 与 Markdown + localStorage 与设置库双镜像；
+#   - 界面语言收敛为 zh_CN / en（zh_TW 下线、历史值归一 zh_CN）；设置面板「界面
+#     语言」与顶栏语言按钮共用 np_lang 与设置库键 ui.language，两处同步；
+#   - 前端修复：ask_user 模态 Enter 发送 + Markdown 渲染；思考过程块可自由滚动；
+#   - 索引存储合并：workspace_index.db / context_index.db 合并为 unified_index.py
+#     单库单连接 + 统一维护，workspace_index.py / context_index.py 降为兼容转发层。
+__version__ = "2.2.2"
 __brand_cn__ = "远星"
 __brand_en__ = "FarStars"
 __display_name__ = "FarStars（远星）· norpagent"
@@ -301,6 +359,9 @@ __all__ = [
     "WebFrontend",
     # Central Nervous Bus (v1.0.7 内核集成)
     "cnb",
+    # 元框架态命名空间 + 成品态独立入口（架构书 §3.1 / O5）
+    "core",
+    "farstars_app",
     # runtime (np() entry)
     "launch",
     "current",
@@ -314,6 +375,7 @@ __all__ = [
     "EngineError",
     # work rollback (v0.9)
     "recovery",
+    "rescue",
     "RecoveryError",
     "snapshot_system",
     "undo",

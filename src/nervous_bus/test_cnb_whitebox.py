@@ -8,20 +8,20 @@ nervous_bus.test_cnb_whitebox — 全链路白盒专项验收（v2.0.0 同版本
 本套件逐条验收白盒强化（黑盒缺口修复）：
   WB-01 协议控制字段判定收窄：executor/exec_count 等业务字段不再被误伤；
          裸 exec / exec.* / cmd.* / perm.* 仍拒绝。
-  WB-02 皮层 exec/stop/reload 全程留皮层审计（谁向谁发了什么、结果如何）。
-  WB-03 节点端审计带 action 名（皮层 exec 的动作可检索）。
+  WB-02 中枢 exec/stop/reload 全程留中枢审计（谁向谁发了什么、结果如何）。
+  WB-03 节点端审计带 action 名（中枢 exec 的动作可检索）。
   WB-04 引擎变更动作（snapshot/rollback/undo/redo/mark_good/remount/
          stop_task）动作级节点审计（subpoena 取证可检索）。
   WB-05 心跳状态提供者故障不静默：降级 degraded + provider_error 上汇
-         皮层；故障/恢复各审计一次。
-  WB-06 上行投递失败（事件/审计/注册）本地节流审计（皮层缺事件有据可查）。
+         中枢；故障/恢复各审计一次。
+  WB-06 上行投递失败（事件/审计/注册）本地节流审计（中枢缺事件有据可查）。
   WB-07 心跳附加字段剥离不静默：被剥字段名 _dropped_control_fields 上汇
          可见。
   WB-08 总线层坏消息（坏 JSON/未知路径）留节点审计（协议层故障可见）。
   WB-09 cmd.ping 带真实冻结态（冻结节点探测不再误报 running）。
   WB-10 behavior_view 对无心跳节点补 no-data 行（分级视图不静默缺行）。
   WB-11 subpoena 签发支持 actor 身份（审计「谁签发的」完整）。
-  WB-12 皮层 on_ctrl sweep 触发留审计；版本号保持 2.0.0（不 bump）。
+  WB-12 中枢 on_ctrl sweep 触发留审计；版本号保持 2.0.0（不 bump）。
 
 运行：python -m nervous_bus.test_cnb_whitebox（需 PYTHONPATH=src）
 """
@@ -68,7 +68,7 @@ def wait_until(cond, timeout=8.0, interval=0.08):
 
 
 def audit_has(target, msg_part: str, **fields) -> bool:
-    """目标（节点/皮层）审计环内存在 msg 含 msg_part 且 extra 字段匹配的记录。"""
+    """目标（节点/中枢）审计环内存在 msg 含 msg_part 且 extra 字段匹配的记录。"""
     for rec in target.get_audit():
         if msg_part in str(rec.get("msg", "")):
             if all(rec.get(k) == v for k, v in fields.items()):
@@ -226,28 +226,28 @@ def main():
           wait_until(lambda: node1.parent_node_id == "cortex"))
     client = BusClient(timeout=6.0)
 
-    # ── WB-02 皮层 exec/stop/reload 审计 ──
-    print("\n── WB-02 皮层下行指令审计留痕 ──")
+    # ── WB-02 中枢 exec/stop/reload 审计 ──
+    print("\n── WB-02 中枢下行指令审计留痕 ──")
     r1 = cortex.exec_cmd("node1", "wb_echo")
     check("W201 exec wb_echo 执行成功", bool(r1.get("ok")),
           json.dumps(r1, ensure_ascii=False)[:200])
-    check("W202 皮层审计含 exec 记录（action/node）",
-          wait_until(lambda: audit_has(cortex, "皮层执行指令 exec",
+    check("W202 中枢审计含 exec 记录（action/node）",
+          wait_until(lambda: audit_has(cortex, "中枢执行指令 exec",
                                        action="wb_echo", node="node1")))
     r2 = cortex.exec_cmd("node1", "no_such_action")
     check("W203 未知动作被拒", (not r2.get("ok")) and "unknown" in str(r2.get("error", "")),
           json.dumps(r2, ensure_ascii=False)[:200])
-    check("W204 皮层审计含失败 exec（ok=False）",
+    check("W204 中枢审计含失败 exec（ok=False）",
           wait_until(lambda: any(
-              "皮层执行指令 exec" in str(a.get("msg", ""))
+              "中枢执行指令 exec" in str(a.get("msg", ""))
               and a.get("action") == "no_such_action"
               and "ok=False" in str(a.get("msg", ""))
               for a in cortex.get_audit())))
     cortex.stop_node("node1")
-    check("W205 皮层审计含 stop 指令", audit_has(cortex, "皮层下令停止",
+    check("W205 中枢审计含 stop 指令", audit_has(cortex, "中枢下令停止",
                                                 node="node1"))
     cortex.reload_node("node1")
-    check("W206 皮层审计含 reload 指令", audit_has(cortex, "皮层下令重载",
+    check("W206 中枢审计含 reload 指令", audit_has(cortex, "中枢下令重载",
                                                   node="node1"))
 
     # ── WB-03 节点端审计带 action 名 ──
@@ -273,8 +273,10 @@ def main():
     check("W801 坏 JSON 返回 400", resp.status == 400)
     check("W802 节点审计出现「总线拒绝消息: 坏 JSON」",
           wait_until(lambda: any(
-              "总线拒绝消息" in str(a.get("msg", ""))
-              and "坏 JSON" in str(a.get("msg", ""))
+              ("总线拒绝消息" in str(a.get("msg", ""))
+               or "rejected message" in str(a.get("msg", "")))
+              and ("坏 JSON" in str(a.get("msg", ""))
+                   or "bad JSON" in str(a.get("msg", "")))
               for a in node1.get_audit())))
     conn = http.client.HTTPConnection("127.0.0.1", node1.port, timeout=5)
     conn.request("POST", "/cnb/nope", body=b"{}",
@@ -285,8 +287,10 @@ def main():
     check("W803 未知路径返回 404", resp2.status == 404)
     check("W804 节点审计出现未知路径拒绝",
           wait_until(lambda: any(
-              "总线拒绝消息" in str(a.get("msg", ""))
-              and "未知路径" in str(a.get("msg", ""))
+              ("总线拒绝消息" in str(a.get("msg", ""))
+               or "rejected message" in str(a.get("msg", "")))
+              and ("未知路径" in str(a.get("msg", ""))
+                   or "unknown path" in str(a.get("msg", "")))
               for a in node1.get_audit())))
     check("W805 总线审计量只增错误记录（正常消息不入总线审计）",
           len(node1.get_audit()) >= before)  # 至少不丢记录
@@ -378,12 +382,12 @@ def main():
     check("W501 故障心跳仍成功上汇（降级不阻断心跳/不触发判 dead）",
           hb1.get("ok") is True, json.dumps(hb1, ensure_ascii=False)[:200])
     # 断言：_heartbeat_once 内部 report_heartbeat 的应答；故障体现在审计与
-    # 上汇载荷——通过皮层 reports 断言（下方 W502），此处先断言本地审计。
+    # 上汇载荷——通过中枢 reports 断言（下方 W502），此处先断言本地审计。
     check("W502 节点审计「心跳状态提供者故障」（翻转一次）",
           wait_until(lambda: audit_has(node1, "心跳状态提供者故障")))
     check("W503 故障标记置位", node1._provider_failed is True)
-    # 皮层 reports 应出现 degraded 心跳（node1 心跳上汇）
-    check("W504 皮层可见 degraded 心跳（provider_error 字段）",
+    # 中枢 reports 应出现 degraded 心跳（node1 心跳上汇）
+    check("W504 中枢可见 degraded 心跳（provider_error 字段）",
           wait_until(lambda: any(
               (rep.get("payload") or {}).get("status") == "degraded"
               and "wb-provider-down" in str(
@@ -402,7 +406,7 @@ def main():
     print("\n── WB-07 剥离字段不静默 ──")
     node1.report_heartbeat("running", exec_count=3, executor="wb",
                            cmd_evil=1, exec=2)
-    check("W701 皮层收到含业务字段心跳（exec_count/executor 未被误剥）",
+    check("W701 中枢收到含业务字段心跳（exec_count/executor 未被误剥）",
           wait_until(lambda: any(
               (rep.get("payload") or {}).get("exec_count") == 3
               and (rep.get("payload") or {}).get("executor") == "wb"
@@ -427,7 +431,7 @@ def main():
     print("\n── WB-12 手动 sweep 留痕 ──")
     sw = client.post_ctrl(cortex.base_url, {"op": "sweep"})
     check("W1201 ctrl sweep 执行成功", bool(sw.get("ok")))
-    check("W1202 皮层审计含手动清扫记录",
+    check("W1202 中枢审计含手动清扫记录",
           audit_has(cortex, "手动触发失联清扫"))
 
     # ── WB-06 上行投递失败本地审计 ──
@@ -453,10 +457,10 @@ def main():
     check("W605 节流审计：同类型 30s 窗口内只记首条",
           cnt == 1, f"count={cnt}")
 
-    # ── 版本号不动 ──
-    print("\n── 版本号保持 2.0.1 ──")
-    check("W-ver 版本号仍为 2.0.1（不 bump）",
-          norpagent.__version__ == "2.0.1", norpagent.__version__)
+    # ── 版本号（2.2.2：设置治理 / 安全可关闭 / 主题系统专项）──
+    print("\n── 版本号 2.2.2 ──")
+    check("W-ver 版本号为 2.2.2",
+          norpagent.__version__ == "2.2.2", norpagent.__version__)
 
     # ── 清理 ──
     node2.stop()

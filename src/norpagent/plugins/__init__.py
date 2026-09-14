@@ -22,12 +22,18 @@ HookVeto can veto loading / registration with a single vote.
 
 from norpagent.plugins.loader import (
     HOOK_NAMES,
+    LEGACY_HOOK_NAMES,
+    NATIVE_HOOK_NAMES,
     PIPELINE_HOOK_NAMES,
     PLUGIN_MODULE_PREFIX,
+    PluginAPI,
+    PluginCapabilityError,
     PluginContext,
     PluginInfo,
     PluginLoader,
+    PluginLogger,
     install_plugin_dirs,
+    install_plugin_file,
 )
 from norpagent.plugins.manager import (
     PLUGIN_PIPELINE_LAYER,
@@ -50,12 +56,18 @@ from norpagent.plugins.isolation import (
 
 __all__ = [
     "HOOK_NAMES",
+    "LEGACY_HOOK_NAMES",
+    "NATIVE_HOOK_NAMES",
     "PIPELINE_HOOK_NAMES",
     "PLUGIN_MODULE_PREFIX",
+    "PluginAPI",
+    "PluginCapabilityError",
     "PluginContext",
     "PluginInfo",
     "PluginLoader",
+    "PluginLogger",
     "install_plugin_dirs",
+    "install_plugin_file",
     "PluginSystem",
     "PLUGIN_PIPELINE_LAYER",
     "before_plugin_discover",

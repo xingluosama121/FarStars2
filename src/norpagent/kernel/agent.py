@@ -22,6 +22,7 @@ security has been stripped out as a whole plug.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -31,7 +32,13 @@ from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional
 from norpagent.arch.address import is_address_like, resolve_address
 from norpagent.arch.layer import call_factory
 from norpagent.hooks.core import HookVeto
-from norpagent.kernel.context import RunContext
+from norpagent.kernel.context import (
+    RunContext,
+    clamp_history,
+    estimate_text_tokens,
+    estimate_tokens,
+    repair_tool_pairs,
+)
 from norpagent.kernel.events import EventBus
 from norpagent.kernel.presets import Preset
 from norpagent.kernel.registry import ComponentError, Registry
@@ -48,6 +55,65 @@ if TYPE_CHECKING:
 # interrupt the task after this many consecutive empty outputs, preventing
 # model degradation from causing an infinite loop
 _EMPTY_OUTPUT_LIMIT = 3
+
+
+def _usage_is_empty(usage: Any) -> bool:
+    """True when a provider reported no usable usage (absent or all zero).
+
+    Some OpenAI-compatible endpoints accept ``stream_options.include_usage`` but
+    answer with an all-zero usage block; treat that the same as "no usage" so the
+    raw-text estimate can fill in instead of reporting a misleading 0.
+    """
+    if not usage:
+        return True
+    total = (
+        int(getattr(usage, "input_tokens", 0) or 0)
+        + int(getattr(usage, "output_tokens", 0) or 0)
+        + int(getattr(usage, "total_tokens", 0) or 0)
+    )
+    return total <= 0
+
+# Boundary marker injected before the first message of the *current* turn when
+# the session already contains completed earlier turns (2026-09-13). It tells
+# the model that everything above is finished history kept only as background
+# context, so the model never confuses the historical transcript with this
+# turn's input. The wording is bilingual on purpose (the Chinese phrase is the
+# one requested by the product owner); this string is model-facing prompt
+# content and is never shown in the UI. The marker is a synthetic message: it
+# is added when assembling the request and is never persisted to the session.
+HISTORY_BOUNDARY_MARKER = (
+    "[Completed historical messages — not input for the current turn] "
+    "All messages above this boundary are finished history, provided only as "
+    "background context. Do not answer them and do not treat them as the "
+    "current request; only the message(s) after this boundary are this turn's "
+    "input. (已完成的历史消息，不作为本轮对话输入内容)"
+)
+
+
+def _inject_history_boundary(messages: List[ChatMessage]) -> List[ChatMessage]:
+    """Insert the completed-history marker before the current turn.
+
+    The current turn starts at the *last* user message; everything before it is
+    finished history. A marker is added only when that history really exists
+    (otherwise the very first turn would be mislabelled). The marker is a
+    synthetic ``system`` message that lives only in the request payload — the
+    session store is never touched, so tool_call / tool_call_id pairs and the
+    persisted transcript stay byte-for-byte intact.
+    """
+    turn_start = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if (getattr(messages[i], "role", "") or "") == "user":
+            turn_start = i
+            break
+    if turn_start <= 0:
+        return messages
+    has_prior = any(
+        (getattr(m, "role", "") or "") != "system" for m in messages[:turn_start]
+    )
+    if not has_prior:
+        return messages
+    marker = ChatMessage(role="system", content=HISTORY_BOUNDARY_MARKER)
+    return messages[:turn_start] + [marker] + messages[turn_start:]
 
 # keys allowed for task-level slot injection (3.9): consistent with np()'s slot
 # parameters, but excluding global / presentation-layer slots (frontend / ui /
@@ -86,12 +152,55 @@ class RunResult:
     steps: int = 0
     tool_call_count: int = 0
     usage: ModelUsage = field(default_factory=ModelUsage)
+    # cumulative model-call duration of this task (seconds; excludes tool
+    # execution) — the denominator of the frontend token-speed display
+    gen_seconds: float = 0.0
     final_content: str = ""
     error: str = ""
 
     @property
     def ok(self) -> bool:
         return self.status == "done"
+
+
+def _normalize_attachments(raw: Any) -> List[Dict[str, Any]]:
+    """Validate and normalize ``task_params["attachments"]`` (multimodal passthrough).
+
+    Accepted item shape (extra keys are dropped)::
+
+        {"kind": "image" | "audio" | "video" | "text",
+         "name": str, "mime": str, "ext": str,
+         "route": "direct" (base64 ``data`` is passed to the model) |
+                  "service" (``text`` holds the file content / service transcription),
+         "data": str, "text": str}
+
+    Returns a cleaned list; malformed items are ignored (never raises).
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "")
+        if kind not in ("image", "audio", "video", "text"):
+            continue
+        clean: Dict[str, Any] = {
+            "kind": kind,
+            "name": str(item.get("name") or ""),
+            "mime": str(item.get("mime") or item.get("type") or ""),
+            "ext": str(item.get("ext") or ""),
+            "route": str(item.get("route") or "direct"),
+        }
+        if clean["route"] == "service":
+            clean["text"] = str(item.get("text") or "")
+        else:
+            data = str(item.get("data") or "")
+            if not data:
+                continue
+            clean["data"] = data
+        out.append(clean)
+    return out
 
 
 def _release_task_layer(task_layer: Any) -> None:
@@ -645,7 +754,11 @@ class AgentRuntime:
                 task_layer.set_task_session_id(sess.id)
             self.append_message(
                 session_manager, sess.id,
-                ChatMessage(role="user", content=user_input),
+                ChatMessage(
+                    role="user", content=user_input,
+                    attachments=_normalize_attachments(
+                        params.get("attachments")) or None,
+                ),
                 task_id,
             )
         except HookVeto as veto:
@@ -694,6 +807,12 @@ class AgentRuntime:
 
         max_steps = int(params.get("max_steps", 32))
         task_timeout = float(params.get("task_timeout", 0) or 0)
+        # context window budget (2026-09-13): > 0 clamps the request to the
+        # oldest-whole-turn rule; 0 (default) keeps the full history.
+        try:
+            ctx_token_budget = int(params.get("context_token_budget", 0) or 0)
+        except (TypeError, ValueError):
+            ctx_token_budget = 0
         # component resolution path: the task-level slot layer first (3.9), then
         # the runtime defaults. Task-level model / tools overrides are lazily
         # resolved and held by _TaskSlotLayer, never written to the registry —
@@ -712,6 +831,20 @@ class AgentRuntime:
         # user stop check (a callable injected by the Web frontend "stop" button
         # etc.): checked at every turn boundary; True ends the task as stopped.
         stop_check = params.get("_stop_check")
+
+        # ordered display segments of this work (2026-09-12 round 9): one work
+        # may produce many thinking blocks / output blocks / tool calls; they are
+        # attached to the persisted assistant messages (incrementally per message)
+        # so the front can render the interleaved timeline and keep it across
+        # reloads. See protocols.model.ChatMessage.segments.
+        pending_segments: List[Dict[str, Any]] = []
+
+        def _take_segments() -> Optional[List[Dict[str, Any]]]:
+            if not pending_segments:
+                return None
+            segs = [dict(item) for item in pending_segments]
+            pending_segments.clear()
+            return segs
 
         empty_streak = 0
         try:
@@ -755,13 +888,15 @@ class AgentRuntime:
                     system_prompt, sess.id, step=step, task_id=task_id,
                     tool_names=list(tool_names),
                     session_manager=session_manager,
+                    token_budget=ctx_token_budget,
                 )
 
                 # ── L6 before_step: can rewrite this round's messages / skip the round ──
-                self.hooks.before_step.emit(
-                    task_id=task_id, step=step,
-                    context=ctx, params=params,
-                )
+                # single mutating dispatch (2026-09-11 fix: the old emit+intercept
+                # pair invoked every subscriber twice and let the first non-None
+                # value truncate the rest; intercept now traverses all subscribers
+                # exactly once — observers included — and the first non-None
+                # rewrite wins)
                 try:
                     modified = self.hooks.before_step.intercept(
                         task_id=task_id, step=step,
@@ -778,9 +913,51 @@ class AgentRuntime:
                     task_id, result, step,
                 )
 
+                # immediate stop (Web "stop" button): the model stream was aborted
+                # mid-generation. Persist whatever part was produced as a partial
+                # reply (so it survives a reload), then end the task as stopped —
+                # instead of waiting for this turn to finish.
+                if callable(stop_check):
+                    try:
+                        _stopped_now = bool(stop_check())
+                    except Exception:  # noqa: BLE001 — a broken checker must not terminate the task
+                        _stopped_now = False
+                    if _stopped_now:
+                        _part = (getattr(output, "content", "") or "").strip()
+                        _reason = getattr(output, "reasoning", "") or ""
+                        if _part or _reason:
+                            if _reason:
+                                pending_segments.append({"type": "think", "text": _reason})
+                            if _part:
+                                pending_segments.append({"type": "output", "text": _part})
+                            self.append_message(
+                                session_manager, sess.id,
+                                ChatMessage(
+                                    role="assistant", content=_part,
+                                    reasoning=_reason,
+                                    has_reasoning=bool(getattr(output, "has_reasoning", False)),
+                                    segments=_take_segments(),
+                                ),
+                                task_id,
+                            )
+                        result.status = "stopped"
+                        result.error = "task stopped by the user"
+                        self.hooks.on_task_stopped.emit(
+                            task_id=task_id, reason=result.error,
+                        )
+                        break
+
                 result.steps = step
                 content = (output.content or "").strip()
                 tool_calls = output.tool_calls or []
+
+                # ordered display segments: chain-of-thought block first, then
+                # this round's output block (may be empty on pure tool rounds)
+                reasoning_text = getattr(output, "reasoning", "") or ""
+                if reasoning_text:
+                    pending_segments.append({"type": "think", "text": reasoning_text})
+                if content:
+                    pending_segments.append({"type": "output", "text": content})
 
                 if content:
                     empty_streak = 0
@@ -790,9 +967,15 @@ class AgentRuntime:
                     )
 
                 if tool_calls:
+                    # payload carries the full tool-call list (legacy plugins expect a
+                    # list; tool_call_count keeps the count; reasoning added for the
+                    # legacy after_step signature). 2026-09-11: was len() count only.
                     self.hooks.after_step.emit(
                         task_id=task_id, step=step,
-                        content=content, tool_calls=len(tool_calls),
+                        content=content,
+                        tool_calls=list(tool_calls),
+                        tool_call_count=len(tool_calls),
+                        reasoning=getattr(output, "reasoning", "") or "",
                     )
                     # record the assistant message (including tool-call intent and
                     # chain-of-thought text; reasoning endpoints like DeepSeek V4
@@ -804,12 +987,41 @@ class AgentRuntime:
                             tool_calls=tool_calls,
                             reasoning=getattr(output, "reasoning", "") or "",
                             has_reasoning=bool(getattr(output, "has_reasoning", False)),
+                            segments=_take_segments(),
                         ),
                         task_id,
                     )
                     for spec in tool_calls:
-                        tool_result = self.execute_tool_call(spec, ctx, task_id)
+                        # 2026-09-13 round 19: every tool_call MUST get a persisted
+                        # tool message. An exception escaping execute_tool_call (a
+                        # raising hook, the approval/UI path, ...) used to abort the
+                        # loop here, leaving the assistant tool-call message without
+                        # its result — which then fails every later request to this
+                        # session with HTTP 400. Coerce any escape into a normal
+                        # error result so the pair stays complete.
+                        try:
+                            tool_result = self.execute_tool_call(spec, ctx, task_id)
+                        except Exception as exc:  # noqa: BLE001 — never break the pair
+                            tool_result = tool_error(spec.name, exc)
+                            try:
+                                self.hooks.on_tool_error.emit(
+                                    task_id=task_id, tool_name=spec.name,
+                                    error=str(exc), args=spec.arguments,
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
                         result.tool_call_count += 1
+                        res_text = str(tool_result)
+                        if len(res_text) > 4000:
+                            res_text = res_text[:4000] + " …[truncated]"
+                        # ordered display segment for the tool call (filled with the
+                        # execution result; attached to the next appended message)
+                        pending_segments.append({
+                            "type": "tool", "id": spec.id, "name": spec.name,
+                            "args": spec.arguments or {},
+                            "status": "ok" if getattr(tool_result, "success", True) else "fail",
+                            "result": res_text,
+                        })
                         self.append_message(
                             session_manager, sess.id,
                             ChatMessage(
@@ -835,18 +1047,21 @@ class AgentRuntime:
                     continue
 
                 result.final_content = content
+                stats = self._message_stats(result)
                 self.append_message(
                     session_manager, sess.id,
                     ChatMessage(
                         role="assistant", content=content,
                         reasoning=getattr(output, "reasoning", "") or "",
                         has_reasoning=bool(getattr(output, "has_reasoning", False)),
+                        stats=stats,
+                        segments=_take_segments(),
                     ),
                     task_id,
                 )
                 self.hooks.on_task_done.emit(
                     task_id=task_id, session_id=sess.id,
-                    content=content, steps=step, context=ctx,
+                    content=content, steps=step, context=ctx, stats=stats,
                 )
                 return self.finalize_result(result, task_id)
 
@@ -882,6 +1097,7 @@ class AgentRuntime:
         if result.final_content:
             self.hooks.on_task_done.emit(
                 task_id=task_id, content=result.final_content,
+                stats=self._message_stats(result),
             )
         return self.finalize_result(result, task_id)
 
@@ -995,11 +1211,17 @@ class AgentRuntime:
         task_id: str,
         tool_names: Optional[List[str]] = None,
         session_manager: Any = None,
+        token_budget: int = 0,
     ) -> List[ChatMessage]:
         """L5 message assembly: system prompt + history merge; both-end hooks are rewritable.
 
         ``session_manager`` defaults to the runtime's; with a task-level session
         override, run() injects the standalone temporary session store (3.9).
+
+        ``token_budget`` (2026-09-13): when > 0, the oldest whole turns are
+        dropped so the estimated request size fits the budget (keep-all-or-drop-
+        all; tool_call / tool_call_id pairs never split — see
+        ``kernel.context.clamp_history``). 0 disables the clamp.
         """
         try:
             modified = self.hooks.before_build_messages.intercept(
@@ -1015,10 +1237,25 @@ class AgentRuntime:
             system_prompt = modified["system_prompt"]
 
         history = list((session_manager or self.session_manager).history(session_id))
+        # 2026-09-13: optional context-budget clamp. Drops the oldest whole turns
+        # (never splitting tool_call / tool_call_id pairs); 0 disables it.
+        if token_budget and token_budget > 0:
+            history = clamp_history(history, int(token_budget))
+        # 2026-09-13 round 19: an interrupted run can leave an assistant
+        # tool-call message without its tool results (process killed mid-tool,
+        # a hook dropped the result, ...). Compatible endpoints reject such a
+        # request with HTTP 400 ("a tool_calls message must be followed by tool
+        # messages"), which then fails EVERY later request to that session —
+        # the failure mode behind "regenerate returns 400". Repair the request
+        # payload only; the persisted transcript is untouched.
+        history = repair_tool_pairs(history)
         messages = (
             [ChatMessage(role="system", content=system_prompt)] + history
             if system_prompt else history
         )
+        # 2026-09-13: label completed history so the model never confuses the
+        # historical transcript with this turn's input. Synthetic, request-only.
+        messages = _inject_history_boundary(messages)
         try:
             modified2 = self.hooks.after_build_messages.intercept(
                 messages=messages, system_prompt=system_prompt,
@@ -1096,6 +1333,11 @@ class AgentRuntime:
         cancel_event = threading.Event()
         call_params = dict(params)
         call_params["_cancel_event"] = cancel_event
+        # an externally supplied cancel event (Web "stop" button / engine stop) must
+        # also abort a call executed under call_timeout: poll it while waiting and
+        # relay it onto the internal event.
+        external = params.get("_cancel_event")
+        external = external if isinstance(external, threading.Event) else None
         box: Dict[str, Any] = {}
 
         def worker() -> None:
@@ -1111,11 +1353,29 @@ class AgentRuntime:
             target=worker, daemon=True, name=f"norpagent-model-{task_id[:8]}"
         )
         thread.start()
-        thread.join(call_timeout)
+        if external is None:
+            thread.join(call_timeout)
+        else:
+            # wait for completion, the timeout, or an external stop — whichever
+            # comes first. An external stop relays onto cancel_event so the
+            # streaming loop unwinds and the worker returns promptly.
+            deadline = time.monotonic() + call_timeout
+            while thread.is_alive():
+                if external.is_set():
+                    cancel_event.set()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                thread.join(min(0.2, remaining))
         if thread.is_alive():
-            cancel_event.set()
-            self._orphan_threads.append(thread)
-            raise ModelCallTimeout(call_timeout)
+            # external stop: give the aborted worker a brief grace period so the
+            # task ends as "stopped" (empty output) rather than a hard timeout
+            if external is not None and external.is_set():
+                thread.join(2.0)
+            if thread.is_alive():
+                cancel_event.set()
+                self._orphan_threads.append(thread)
+                raise ModelCallTimeout(call_timeout)
         if "error" in box:
             raise box["error"]
         return box["output"]
@@ -1150,9 +1410,23 @@ class AgentRuntime:
             tool_map: Dict[str, ToolCallSpec] = {}
             usage = ModelUsage()
             finish = ""
+            # 2026-09-12: per-call wall time (measured around the full stream
+            # iteration) feeds the frontend token-speed / generation-time
+            # display; accumulated on the RunResult, excluding tool execution.
+            # perf_counter: high resolution on Windows (time.time() can return
+            # the same coarse tick for sub-15ms mock/debug calls, collapsing the
+            # speed to None).
+            call_t0 = time.perf_counter()
             for chunk in stream(history, tool_schemas or None, params):
                 if _abandoned():
-                    return ModelOutput()
+                    # user stop / timeout: stop consuming but hand back the part
+                    # already produced (no further events are emitted)
+                    return ModelOutput(
+                        content="".join(content_parts),
+                        reasoning="".join(reasoning_parts),
+                        has_reasoning=has_reasoning,
+                        tool_calls=list(tool_map.values()) if tool_map else None,
+                    )
                 if chunk.has_reasoning:
                     has_reasoning = True
                 if chunk.reasoning:
@@ -1173,9 +1447,16 @@ class AgentRuntime:
                 if chunk.finish_reason:
                     finish = chunk.finish_reason
             if _abandoned():
-                return ModelOutput()
-            self._accumulate_usage(result, usage, task_id)
-            return ModelOutput(
+                # user stop / timeout: hand back the part already produced so the
+                # caller can persist it as a partial reply (no further events emitted)
+                return ModelOutput(
+                    content="".join(content_parts),
+                    reasoning="".join(reasoning_parts),
+                    has_reasoning=has_reasoning,
+                    tool_calls=list(tool_map.values()) if tool_map else None,
+                )
+            result.gen_seconds += max(0.0, time.perf_counter() - call_t0)
+            output = ModelOutput(
                 content="".join(content_parts),
                 reasoning="".join(reasoning_parts),
                 has_reasoning=has_reasoning,
@@ -1183,16 +1464,64 @@ class AgentRuntime:
                 usage=usage,
                 finish_reason=finish or ("tool_calls" if tool_map else "stop"),
             )
+            self._accumulate_usage(
+                result,
+                self._synth_usage(history, output) if _usage_is_empty(usage) else usage,
+                task_id,
+            )
+            return output
+        call_t0 = time.perf_counter()
         output = model_provider.generate(history, tool_schemas or None, params)
         if _abandoned():
-            return ModelOutput()
+            # keep the produced output so a user stop can persist it as a partial
+            # reply; a post-timeout orphan's value is discarded by the caller
+            return output
+        result.gen_seconds += max(0.0, time.perf_counter() - call_t0)
         if getattr(output, "reasoning", ""):
             # non-streaming output: the whole chain of thought is broadcast as one delta
             self.hooks.on_reasoning.emit(
                 task_id=task_id, content=output.reasoning, stream=False,
             )
-        self._accumulate_usage(result, output.usage, task_id)
+        self._accumulate_usage(
+            result,
+            self._synth_usage(history, output)
+            if _usage_is_empty(output.usage) else output.usage,
+            task_id,
+        )
         return output
+
+    @staticmethod
+    def _synth_usage(history: Any, output: Any) -> Optional[ModelUsage]:
+        """Estimate token usage from the **raw** text when the endpoint returns none.
+
+        R-032: the counter must reflect the raw source text (markdown / LaTeX
+        delimiters included) for both the prompt (input) and the model's generated
+        text (output = content + chain of thought + tool-call arguments). Counting
+        only a rendered / stripped view — or omitting the prompt entirely — made
+        the reported total systematically low. The result is flagged
+        ``estimated=True`` so the UI can mark it as approximate.
+        """
+        try:
+            inp = estimate_tokens(list(history or []))
+            out = estimate_text_tokens(str(getattr(output, "content", "") or ""))
+            out += estimate_text_tokens(str(getattr(output, "reasoning", "") or ""))
+            for tc in getattr(output, "tool_calls", None) or []:
+                out += 8
+                out += estimate_text_tokens(str(getattr(tc, "name", "") or ""))
+                try:
+                    args = json.dumps(getattr(tc, "arguments", None) or {},
+                                      ensure_ascii=False)
+                except Exception:  # noqa: BLE001 — fall back to str on odd args
+                    args = str(getattr(tc, "arguments", "") or "")
+                out += estimate_text_tokens(args)
+            if inp <= 0 and out <= 0:
+                return None
+            return ModelUsage(
+                input_tokens=inp, output_tokens=out,
+                total_tokens=inp + out, estimated=True,
+            )
+        except Exception:  # noqa: BLE001 — estimation is best-effort
+            return None
 
     def _accumulate_usage(self, result: RunResult, usage: Any, task_id: str) -> None:
         if not usage:
@@ -1202,12 +1531,48 @@ class AgentRuntime:
         result.usage.total_tokens += usage.total_tokens or (
             usage.input_tokens or 0
         ) + (usage.output_tokens or 0)
+        if getattr(usage, "estimated", False):
+            result.usage.estimated = True
         self.hooks.on_usage_update.emit(
             task_id=task_id,
             input=result.usage.input_tokens,
             output=result.usage.output_tokens,
             total=result.usage.total_tokens,
+            estimated=bool(getattr(result.usage, "estimated", False)),
+            # cumulative model-call time (seconds) — lets the frontend compute
+            # the live token speed even before the task finishes
+            gen_seconds=round(float(getattr(result, "gen_seconds", 0.0) or 0.0), 3),
         )
+
+    @staticmethod
+    def _message_stats(result: RunResult) -> Optional[Dict[str, Any]]:
+        """Per-message generation stats (token speed / total tokens / generation time).
+
+        Attached to final assistant messages (persisted by the session store) and
+        carried by ``on_task_done`` so the frontend can render the same numbers
+        live and after a reload. Best-effort: a malformed RunResult yields None
+        instead of breaking the task.
+        """
+        try:
+            gen = float(getattr(result, "gen_seconds", 0.0) or 0.0)
+            out = int(getattr(result.usage, "output_tokens", 0) or 0)
+            inp = int(getattr(result.usage, "input_tokens", 0) or 0)
+            total = int(getattr(result.usage, "total_tokens", 0) or 0)
+            speed = round(out / gen, 1) if (gen > 0 and out > 0) else None
+            return {
+                "gen_seconds": round(gen, 3),
+                "speed": speed,
+                "output_tokens": out,
+                "input_tokens": inp,
+                "total_tokens": total,
+                # R-032: True when the numbers came from a local raw-text estimate
+                # (the endpoint returned no usage) — lets the UI show them as
+                # approximate rather than exact.
+                "estimated": bool(getattr(result.usage, "estimated", False)),
+                "ts": time.time(),
+            }
+        except Exception:  # noqa: BLE001 — stats are best-effort
+            return None
 
     # ── L8 tool call ──────────────────────────────────────
 
@@ -1220,13 +1585,10 @@ class AgentRuntime:
         through the after_tool_call hook — an "execution structure" passes through
         the hook regardless of the outcome.
         """
-        self.hooks.before_tool_call.emit(
-            task_id=task_id,
-            tool_name=spec.name, args=spec.arguments, context=ctx,
-        )
+        # single mutating dispatch (2026-09-11 fix: emit+intercept pair removed —
+        # one traversal, every subscriber exactly once; the first non-None
+        # rewrite (dict) wins, False / HookVeto block the call)
         result: Optional[ToolResult] = None
-
-        # mutating hook: modify arguments (dict), block the call (False), veto (HookVeto)
         try:
             modified = self.hooks.before_tool_call.intercept(
                 task_id=task_id,
@@ -1273,6 +1635,8 @@ class AgentRuntime:
                 )
 
         # mutating hook: external plugins can rewrite the tool result (str / ToolResult effective)
+        # single mutating dispatch (2026-09-11 fix: the trailing emit removed —
+        # one traversal, every subscriber exactly once, first non-None rewrite wins)
         try:
             modified_result = self.hooks.after_tool_call.intercept(
                 task_id=task_id,
@@ -1286,11 +1650,6 @@ class AgentRuntime:
         elif isinstance(modified_result, str) and modified_result != str(result):
             result = ToolResult(output=modified_result, success=result.success)
 
-        self.hooks.after_tool_call.emit(
-            task_id=task_id,
-            tool_name=spec.name, args=spec.arguments,
-            result=result, success=result.success, context=ctx,
-        )
         return result
 
     def _check_approval(self, spec: ToolCallSpec, ctx: RunContext) -> Any:
@@ -1323,10 +1682,15 @@ class AgentRuntime:
             return None
         if not requires:
             return None
+        # kind="approval" tells the UI this is a binary decision, so the web modal
+        # renders reject/approve buttons instead of a free-text box (which users
+        # mistype, e.g. "1", and get silently denied). The "[y/n]" hint is no longer
+        # part of the text: the console adapter adds it, the web UI shows buttons.
         answer = ctx.ask_user(
             f"tool {spec.name} call requires human approval (level {level.value}); continue?"
-            f"\nargs: {spec.arguments}\n[y/n]",
+            f"\nargs: {spec.arguments}",
             default="n",
+            kind="approval",
         ).strip().lower()
         if answer in ("y", "yes", "ok"):
             return None

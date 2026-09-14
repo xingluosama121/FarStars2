@@ -119,8 +119,10 @@ class FTS5ContextStore:
     """
 
     def __init__(self, path: Optional[str] = None) -> None:
-        self.path = path or os.path.join(
-            os.path.expanduser("~"), ".norpagent", "context.db"
+        self.path = (
+            path
+            or (os.environ.get("NORPAGENT_CONTEXT_DB") or "").strip()
+            or os.path.join(os.path.expanduser("~"), ".norpagent", "context.db")
         )
         parent = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(parent, exist_ok=True)

@@ -2,9 +2,9 @@
 """norpagent.cnb.engine — CNB 引擎绑定层（v1.0.7 内核集成核心）。
 
 职责：把 norpagent 内核（NorpEngine）的公开能力注册为神经节点的内核动作面。
-CNB 从此不再只是「站在节点外下发 HTTP 的外挂传输层」——皮层 cmd.exec 的
+CNB 从此不再只是「站在节点外下发 HTTP 的外挂传输层」——中枢 cmd.exec 的
 动作直接路由到本层注册的处理器，处理器直连 NorpEngine 公开 API（任务 /
-快照 / 回滚 / 重载 / 运维），执行结果作为回执经神经树逐级返回皮层。
+快照 / 回滚 / 重载 / 运维），执行结果作为回执经神经树逐级返回中枢。
 
 两种装配入口共用本层（同一套内核动作面）：
 1. env 自动挂载（手册 §30.8）：设 NORP_CNB_NODE 等 env 后启动
@@ -13,7 +13,7 @@ CNB 从此不再只是「站在节点外下发 HTTP 的外挂传输层」——�
 2. CLI 神经进程（norpagent cortex/node 子命令）：默认装配完整内核引擎，
    由 norpagent.cnb.cli 构造引擎后经 CnbAdapter 绑定到 Cortex/NervousNode。
 
-内核动作面（皮层可对任意层级任意原子下发；perm=process_exec，皮层 revoke
+内核动作面（中枢可对任意层级任意原子下发；perm=process_exec，中枢 revoke
 后整体失去 exec 能力——explorer 剥夺语义不变）：
   任务面   run_task / status / stop_task
   状态面   engine_state / inspect
@@ -23,18 +23,18 @@ CNB 从此不再只是「站在节点外下发 HTTP 的外挂传输层」——�
     热重载插件——引擎保持 RUNNING）
 
 心跳融合：mount 后节点心跳自动携带 engine_state / active_tasks / 版本号，
-经父链逐级汇聚到皮层（皮层 reports 可见各原子内核忙闲与任务数）。
+经父链逐级汇聚到中枢（中枢 reports 可见各原子内核忙闲与任务数）。
 
 设计边界（如实记录，无虚构声称）：
 - kind / level / parent / port 注册时固定（神经树身份保护），reload 只热更新
   运行旋钮（心跳间隔 / desc）；
-- 权限表管辖 CNB 指令面（cmd.exec 前置查表）；皮层权限同步进进程内工具调用
+- 权限表管辖 CNB 指令面（cmd.exec 前置查表）；中枢权限同步进进程内工具调用
   链属未来 permission_cascade 集成（perm_changed 回调即钩子，留 1.0.8）；
 - 本模块只经 NorpEngine 公开成员（start/stop 生命周期、submit_async、
   cancel_task、stop_all_tasks、active_tasks、forget_task、remount、
   snapshot/rollback/undo/redo/list_snapshots/mark_good、layer、state）通信，
   不触碰 engine 内部（_cnb 字段除外，由 engine._setup_cnb/_teardown_cnb 契约使用）。
-- 皮层权限同步进进程内工具调用链（permission_cascade）留后续版本接入
+- 中枢权限同步进进程内工具调用链（permission_cascade）留后续版本接入
   （perm_changed 回调即预留钩子）。
 """
 
@@ -44,7 +44,7 @@ import os
 import threading
 import time
 from collections import deque
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # ── env keys & defaults (mirrored in docs/DEVELOPER_MANUAL.md §30.8) ──
 
@@ -57,10 +57,11 @@ ENV_HEARTBEAT = "NORP_CNB_HEARTBEAT"  # heartbeat interval in seconds
 ENV_DESC = "NORP_CNB_DESC"            # optional node meta description
 ENV_MANAGED = "NORP_CNB_MANAGED"      # 1 = kernel skips mounting (upper layer builds its own node)
 ENV_CLI = "NORP_CNB_CLI"              # set by the CNB CLI (norpagent node/cortex) on its engine
+ENV_TREE = "NORP_CNB_TREE"            # 神经树定义（显式形状）：JSON/PY 文件路径或 JSON 文本
 
 CNB_ENV_KEYS = (
     ENV_NODE, ENV_KIND, ENV_LEVEL, ENV_PARENT,
-    ENV_PORT, ENV_HEARTBEAT, ENV_DESC, ENV_MANAGED, ENV_CLI,
+    ENV_PORT, ENV_HEARTBEAT, ENV_DESC, ENV_MANAGED, ENV_CLI, ENV_TREE,
 )
 
 DEFAULT_KIND = "agent"
@@ -69,15 +70,24 @@ DEFAULT_PARENT = "http://127.0.0.1:17800"
 DEFAULT_PORT = 17801
 DEFAULT_HEARTBEAT = 5.0
 
+
+class CnbConfigError(RuntimeError):
+    """CNB 显式启用但配置不完整（缺端口 / 缺节点标识 / 非法字段）。
+
+    R-025（2026-09-09 裁决）：启用 CNB 时端口号必须手动配置，不写死默认；
+    没有配置端口号直接抛错并给出明确信息。R-023（2026-09-09 裁决）：
+    默认启动不携带 CNB，显式传入 {"cnb": True} 等配置才启用。
+    """
+
 # registration retry budget (≈ 30 s) before a node with an unreachable parent
 # degrades to a plain instance
 REGISTER_RETRY_SECONDS = 5.0
 REGISTER_ATTEMPTS = 6
 
-# 内核动作面（v1.0.7）：皮层 cmd.exec action 白名单。全部直连 NorpEngine
+# 内核动作面（v1.0.7）：中枢 cmd.exec action 白名单。全部直连 NorpEngine
 # 公开 API；纯神经 CLI（--bare）没有引擎，不受本表约束（可注册占位动作）。
 # v2.0.0：新增 task_records —— 任务分子（mol）结构化载荷与验收
-# 回执查询动作（皮层对任意原子可见「吸收位收到的完整 mol 六要素 + 结果」）。
+# 回执查询动作（中枢对任意原子可见「吸收位收到的完整 mol 六要素 + 结果」）。
 KERNEL_ACTIONS = frozenset({
     # 任务面
     "run_task", "status", "stop_task",
@@ -125,20 +135,158 @@ def _env_float(name: str, default: float, floor: float, ceiling: float) -> float
         return default
 
 
-def read_env_config() -> Dict[str, Any]:
-    """Read the NORP_CNB_* env config (the single source of truth for auto-mount)."""
+def read_env_config(strict: bool = False) -> Dict[str, Any]:
+    """Read the NORP_CNB_* env config (the single source of truth for auto-mount).
+
+    R-023：默认不携带 CNB——只有显式配置（NORP_CNB_NODE + 必要的端口）才启用。
+    R-025：端口号不写死（``port_configured`` 标记是否手动配置）；``strict=True``
+    时启用但缺端口立即抛 :class:`CnbConfigError`。
+    2026-09-12 反馈轮：``NORP_CNB_TREE`` 显式给出神经树定义时，端口/节点标识
+    由定义携带（必要参数由树定义校验把关），同样视为显式启用通道。
+    """
     node_id = (os.environ.get(ENV_NODE) or "").strip()
+    tree_raw = (os.environ.get(ENV_TREE) or "").strip()
+    enabled = bool(node_id) or bool(tree_raw)
+    port_raw = (os.environ.get(ENV_PORT) or "").strip()
+    port_configured = bool(port_raw)
+    if strict and enabled and not port_configured and not tree_raw:
+        raise CnbConfigError(
+            "CNB is enabled (NORP_CNB_NODE is set) but no node port is "
+            "configured: set NORP_CNB_PORT explicitly. R-025: the node port "
+            "is never hardcoded; a missing port raises immediately.")
     return {
-        "enabled": bool(node_id),
+        "enabled": enabled,
         "managed": _env_flag(ENV_MANAGED),
         "node_id": node_id,
         "kind": (os.environ.get(ENV_KIND) or DEFAULT_KIND).strip() or DEFAULT_KIND,
         "level": _env_int(ENV_LEVEL, DEFAULT_LEVEL, 1, 63),
         "parent": (os.environ.get(ENV_PARENT) or DEFAULT_PARENT).strip() or DEFAULT_PARENT,
         "port": _env_int(ENV_PORT, DEFAULT_PORT, 1, 65535),
+        "port_configured": port_configured,
         "heartbeat": _env_float(ENV_HEARTBEAT, DEFAULT_HEARTBEAT, 0.5, 3600.0),
         "desc": (os.environ.get(ENV_DESC) or "").strip(),
+        "tree": tree_raw or None,
     }
+
+
+def apply_explicit_config(cfg: Dict[str, Any],
+                          explicit: Any = None) -> Dict[str, Any]:
+    """把 ``np(cnb=...)`` / ``launch(cnb=...)`` 的显式配置并入 env 配置。
+
+    支持三种形态：
+    - bool：True/False —— 显式开关（其余细节仍从 env / 默认取）；
+    - str："on"/"off"/"true"/"false"（便捷写法）；
+    - dict：自描述配置，如
+      ``{"cnb": True, "node_id": "atom-01", "parent": "...", "port": 17811}``；
+      键：cnb / enabled / node_id / id / kind / level / parent / port /
+      heartbeat / desc / managed。未知键如实报错（CnbConfigError）。
+    ``port`` 一旦以显式配置给出即视为「手动配置端口」；端口缺省（env 与
+    显式配置都没有）在启用时由 setup_cnb 抛 CnbConfigError（R-025）。
+    """
+    if explicit is None:
+        return dict(cfg)
+    out = dict(cfg)
+    if isinstance(explicit, bool):
+        out["enabled"] = bool(explicit)
+        return out
+    if isinstance(explicit, str):
+        raw = explicit.strip().lower()
+        if raw in ("on", "1", "true", "yes"):
+            out["enabled"] = True
+            return out
+        if raw in ("off", "0", "false", "no"):
+            out["enabled"] = False
+            return out
+        raise CnbConfigError(
+            f"invalid cnb config string {explicit!r} (use True / False / dict)")
+    if not isinstance(explicit, dict):
+        raise CnbConfigError(
+            f"invalid cnb config {explicit!r} (use True / False / dict)")
+    ex = dict(explicit)
+    flag = ex.pop("cnb", None)
+    if flag is not None:
+        out["enabled"] = bool(flag)
+    if "enabled" in ex:
+        out["enabled"] = bool(ex.pop("enabled"))
+    if "node_id" in ex or "id" in ex:
+        node_id = ex.pop("node_id", None)
+        if node_id is None:
+            node_id = ex.pop("id", "")
+        node_id = str(node_id or "").strip()
+        out["node_id"] = node_id
+        if node_id:
+            out["enabled"] = True
+    if "kind" in ex:
+        out["kind"] = str(ex.pop("kind") or DEFAULT_KIND)
+    if "level" in ex:
+        try:
+            out["level"] = max(1, min(int(ex.pop("level")), 63))
+        except (TypeError, ValueError) as exc:
+            raise CnbConfigError(f"invalid cnb level: {exc}") from exc
+    if "parent" in ex:
+        out["parent"] = str(ex.pop("parent") or DEFAULT_PARENT)
+    if "port" in ex:
+        try:
+            port = int(ex.pop("port"))
+        except (TypeError, ValueError) as exc:
+            raise CnbConfigError(f"invalid cnb port: {exc}") from exc
+        if not (1 <= port <= 65535):
+            raise CnbConfigError(f"invalid cnb port: {port} (must be 1-65535)")
+        out["port"] = port
+        out["port_configured"] = True
+    if "heartbeat" in ex:
+        try:
+            out["heartbeat"] = max(0.5, min(float(ex.pop("heartbeat")), 3600.0))
+        except (TypeError, ValueError) as exc:
+            raise CnbConfigError(f"invalid cnb heartbeat: {exc}") from exc
+    if "desc" in ex:
+        out["desc"] = str(ex.pop("desc") or "")
+    if "managed" in ex:
+        out["managed"] = bool(ex.pop("managed"))
+    if "tree" in ex:
+        # 2026-09-12 反馈轮：神经树显式定义（dict / JSON 文本 / JSON 路径 /
+        # PY 路径）。定义给定时端口 / 节点标识由定义携带，此处不要求。
+        tree = ex.pop("tree")
+        if tree is None:
+            out["tree"] = None
+        else:
+            out["tree"] = tree
+            out["enabled"] = True
+    if ex:
+        raise CnbConfigError(f"unknown cnb config keys: {sorted(ex)}")
+    return out
+
+
+def validate_cnb_config(explicit: Any = None) -> Dict[str, Any]:
+    """启动前预校验（R-023 / R-025）：返回生效配置；非法配置直接抛错。
+
+    - 默认（无 env、无显式配置）：返回 enabled=False —— 零进程零端口；
+    - managed 模式：直接通过（上层自行装配节点，见 NORP_CNB_MANAGED）；
+    - 神经树定义（tree）：端口 / 节点标识由定义携带；定义本身的必要参数与
+      引用校验交由 ``norpagent.cnb.tree.parse_tree_definition`` 把关；
+    - 启用但缺端口 / 缺节点标识：抛 :class:`CnbConfigError`（信息明确）。
+
+    2026-09-12 反馈轮（错误语义调整）：本函数保持「直接调用即抛错」的严格
+    语义（供校验 API 与 remount 使用）；``np()`` 启动路径由
+    ``NorpEngine._setup_cnb`` 捕获配置错误——显式报错、不阻塞主线程启动、
+    神经树不加载（错误经 ``engine.cnb_error`` 可查）。
+    """
+    cfg = apply_explicit_config(read_env_config(), explicit)
+    if cfg.get("managed") or not cfg.get("enabled"):
+        return cfg
+    if cfg.get("tree") is not None:
+        return cfg
+    if not cfg.get("port_configured"):
+        raise CnbConfigError(
+            "CNB is enabled but no node port is configured: the port is never "
+            "hardcoded and must be set manually. Set NORP_CNB_PORT, or pass "
+            "cnb={\"cnb\": True, \"port\": <1-65535>, ...} at startup. "
+            "(R-025: a missing port raises immediately)")
+    if not str(cfg.get("node_id") or "").strip():
+        raise CnbConfigError(
+            "CNB is enabled but no node id is configured: set NORP_CNB_NODE, "
+            "or pass cnb={\"cnb\": True, \"node_id\": \"...\", ...}.")
+    return cfg
 
 
 # ── JSON 序列化保护 ─────────────────────────────────────
@@ -181,7 +329,7 @@ class CnbAdapter:
     用法（三种入口共用）：
       - env 自动挂载：setup_cnb(engine)（engine.start -> _setup_cnb 调用）；
       - CLI 节点：engine 装配后 CnbAdapter(engine, node, cfg).mount()；
-      - CLI 皮层：CnbAdapter.bind_actions(engine, cortex)（根节点无父，不注册）。
+      - CLI 中枢：CnbAdapter.bind_actions(engine, cortex)（根节点无父，不注册）。
     """
 
     def __init__(self, engine: Any, node: Any, cfg: Dict[str, Any]) -> None:
@@ -191,12 +339,13 @@ class CnbAdapter:
         self.status = "mounting"  # mounting / mounted / failed / stopped
         self.error: Optional[str] = None
         self.perm_summary: Dict[str, Any] = {}
+        self.slot_mounted = False  # 完整实例模块是否已挂入节点槽位（R-024）
         self._lock = threading.Lock()
         self._stopped = threading.Event()
         self._mount_thread: Optional[threading.Thread] = None
         self._actions_bound = False
         # 已受理任务记录（task_params 结构化载荷原样 + 完成结果）。
-        # 皮层 exec task_records 即可读取「原子吸收位收到的完整 mol 六要素 +
+        # 中枢 exec task_records 即可读取「原子吸收位收到的完整 mol 六要素 +
         # 验收回执」——任务分子通道的端到端可追溯（audit 中 mol_id 贯穿）。
         self._task_records: deque = deque(maxlen=100)
         self._task_records_lock = threading.Lock()
@@ -211,7 +360,7 @@ class CnbAdapter:
         - exec 动作：注册到 node 动作注册表，cmd.exec 直达 NorpEngine API；
         - stop：cmd.stop 下行（停全部会话任务，引擎保持 RUNNING）；
         - reload：cmd.reload 下行（重读 env + 热重载外部插件）；
-        - perm_changed：皮层改写本节点权限表后的审计记录。
+        - perm_changed：中枢改写本节点权限表后的审计记录。
         """
         if self._actions_bound:
             return
@@ -226,21 +375,53 @@ class CnbAdapter:
                 node.register_action(action, handler)
         # 心跳携带内核深度状态
         node.set_heartbeat_provider(self._heartbeat_info)
+        # ── 通用槽位（R-024 修订，2026-09-11）：完整 norpagent 实例 = 标准模块 ──
+        # 把本适配器绑定的引擎实例包装为 NorpAgentModule，挂入节点默认槽位
+        # "norpagent"。实例模块同时导出内核动作面（槽位二级路由面）：即便
+        # 本适配器不做直接注册（手工装配场景），挂载后节点仍具备完整实例
+        # 操作面；直接注册优先（source="kernel"），槽位面为兜底（source="slot"）。
+        try:
+            from .slots import NorpAgentModule
+
+            node.mount_module(
+                "norpagent",
+                NorpAgentModule(engine, adapter=self),
+                meta={"auto": True, "source": "CnbAdapter"},
+            )
+            self.slot_mounted = True
+        except Exception as exc:  # noqa: BLE001 — 槽位挂载失败不阻断动作面
+            self.slot_mounted = False
+            try:
+                node.audit(f"slots: engine module mount failed: {exc}")
+            except Exception:  # noqa: BLE001
+                pass
         self._actions_bound = True
 
     def _heartbeat_info(self) -> Any:
         """心跳 provider：返回 (status, extra)。故障不静默——返回
-        degraded + provider_error（皮层可见「状态源故障」，非无状态）。"""
+        degraded + provider_error（中枢可见「状态源故障」，非无状态）。
+
+        携带项含通用槽位用量（R-024）：slots.count / slots.free，中枢
+        可见各原子的槽位占用与空位。
+        """
         try:
             engine = self.engine
             state = engine.state.value
             tasks = engine.active_tasks()
+            slots_info = None
+            try:
+                if self.node is not None:
+                    slots_info = {"count": self.node.slots.count(),
+                                  "free": self.node.slots.free()}
+            except Exception:  # noqa: BLE001 — 槽位信息尽力而为
+                slots_info = None
             return state, {
                 "engine_state": state,
                 "active_tasks": len(tasks),
                 "version": _np_version(),
                 "mount": self.status,
                 "actions": len(node_actions(self.node)),
+                "slots": slots_info,
             }
         except Exception as exc:  # noqa: BLE001 — 显式降级而非静默无状态
             return "degraded", {
@@ -406,7 +587,7 @@ class CnbAdapter:
             return detail
         rec["task_id"] = handle.task_id
         self._remember_task(rec)
-        # 任务已受理 -> 上行事件（皮层可见任务开始；事件带 mol_id 贯穿
+        # 任务已受理 -> 上行事件（中枢可见任务开始；事件带 mol_id 贯穿
         # 可追溯）
         if node is not None:
             ev = {
@@ -448,7 +629,7 @@ class CnbAdapter:
     def _action_task_records(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """验收回执查询：本原子吸收位受理过的任务分子记录。
 
-        皮层对任意原子 exec task_records，即可读取：
+        中枢对任意原子 exec task_records，即可读取：
           - task_params 原样（完整 mol 六要素，无字段丢失——通道承载实证）；
           - 任务完成结果摘要（status / error / content_len——acceptance
             自检依据）；
@@ -560,6 +741,8 @@ class CnbAdapter:
             ),
             "last_result": last,
             "actions": node_actions(node),
+            "slots": _slots_summary(node),
+            "slot_max": getattr(getattr(node, "slots", None), "max_slots", None),
         }
 
     # ── 快照面动作（work rollback / crash rescue） ──────
@@ -661,7 +844,7 @@ class CnbAdapter:
     # ── 运维面动作 ───────────────────────────────────────
 
     def _action_remount(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """皮层热改本原子引擎槽：args 直接作为 slot_values 透传 engine.remount。
+        """中枢热改本原子引擎槽：args 直接作为 slot_values 透传 engine.remount。
 
         例：{"model": "openai_compat", "plugins": ["my_plugin.py"]}
         """
@@ -705,9 +888,9 @@ class CnbAdapter:
                 "engine_state": engine.state.value}
 
     def _action_stop_engine(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """皮层下令停止本原子引擎（优雅关闭：停全部任务 -> 注销节点 -> 停引擎）。
+        """中枢下令停止本原子引擎（优雅关闭：停全部任务 -> 注销节点 -> 停引擎）。
 
-        应答先返回皮层，引擎关闭延迟 1s 执行（保证回执送达）；
+        应答先返回中枢，引擎关闭延迟 1s 执行（保证回执送达）；
         CLI 神经进程收到后自然退出进程（主循环监控 should_stop）。
         """
         engine = self.engine
@@ -734,7 +917,7 @@ class CnbAdapter:
         """Wait for an async task to finish; audit + report the result uplink.
 
         task_done 事件与审计携带 mol_id / acceptance（验收回执沿
-        树回传皮层）；任务记录回填完成状态（task_records 可查）。
+        树回传中枢）；任务记录回填完成状态（task_records 可查）。
         任务成败计入节点行为基线（任务失败率聚合数据源）。
         """
 
@@ -753,7 +936,7 @@ class CnbAdapter:
                 "error": error or None,
                 "content_len": len(content),
             }
-            # 任务成败计入行为基线（皮层分级消费）
+            # 任务成败计入行为基线（中枢分级消费）
             node = self.node
             if node is not None:
                 try:
@@ -787,7 +970,7 @@ class CnbAdapter:
                         ev["mol_id"] = mol_id
                     if acceptance is not None:
                         # 验收规格原样回传（acceptance 自检依据；是否判定
-                        # 通过由皮层/上层策略消费，内核不替裁决）
+                        # 通过由中枢/上层策略消费，内核不替裁决）
                         ev["acceptance"] = acceptance
                     node.report_event("task_done", ev)
                 except Exception:  # noqa: BLE001 — uplink is best-effort
@@ -870,7 +1053,7 @@ class CnbAdapter:
     def _node_audit(self, msg: str, **extra) -> None:
         """节点本地审计（node 可能为 None 时安全跳过）。
 
-        供各变更动作记录「执行了什么、结果如何」——皮层 exec 的变更
+        供各变更动作记录「执行了什么、结果如何」——中枢 exec 的变更
         动作在节点审计环留痕，subpoena 取证（audit scope）可检索。
         """
         node = self.node
@@ -892,7 +1075,7 @@ class CnbAdapter:
 
 
 def node_actions(node: Optional[Any]) -> list:
-    """节点已注册的内核动作名（皮层 inspect 可见原子能力面）。"""
+    """节点已注册的内核动作名（中枢 inspect 可见原子能力面）。"""
     if node is None:
         return []
     try:
@@ -901,15 +1084,46 @@ def node_actions(node: Optional[Any]) -> list:
         return []
 
 
+def _slots_summary(node: Optional[Any]) -> List[Dict[str, Any]]:
+    """槽位摘要（inspect 用；轻量三元组，重描述走 slot_describe 动作）。"""
+    if node is None:
+        return []
+    try:
+        return [
+            {"slot_id": s.get("slot_id"), "kind": s.get("kind"),
+             "label": s.get("label")}
+            for s in node.describe_slots()
+        ]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 # ── engine hook ─────────────────────────────────────────
 
-def setup_cnb(engine: Any) -> None:
+def setup_cnb(engine: Any, explicit: Any = None) -> None:
     """Auto-mount hook called by NorpEngine.start() (runtime.engine._setup_cnb).
 
-    Returns immediately; mounting runs on a background thread inside CnbAdapter.
-    Never raises — every failure path degrades to a plain single instance.
+    R-023：默认不携带 CNB——env（NORP_CNB_NODE）或显式配置（``np(cnb=...)``）
+    未启用时本函数立即返回，零进程零端口。
+    R-025：启用但未手动配置端口 => 抛 :class:`CnbConfigError`（信息明确），
+    不再静默退化到默认端口。
+
+    2026-09-12 反馈轮（神经树显式定义）：显式配置携带 ``tree`` 时，按定义
+    装配整棵进程内神经树（中枢 + 各层节点），宿主引擎绑定为根节点模块；
+    定义由 ``norpagent.cnb.tree.parse_tree_definition`` 严格校验（缺必要
+    参数逐条显式报错）。
+
+    错误语义（2026-09-12 反馈轮定稿）：本函数保持「直接调用即抛错」的严格
+    语义；``np()`` 启动路径由 ``NorpEngine._setup_cnb`` 捕获配置错误——
+    显式报错、不阻塞主线程启动、神经树不加载（``engine.cnb_error`` 可查）。
+
+    其余失败路径（父节点不可达、端口被占用等）保持降级策略：打印告警，
+    实例以普通单机形态继续运行；挂载在后台线程完成，不阻塞启动。
+
+    显式配置经 ``apply_explicit_config`` 并入 env 配置；``explicit`` 由
+    NorpEngine 从 ``np(cnb=...)`` / ``launch(cnb=...)`` 透传。
     """
-    cfg = read_env_config()
+    cfg = validate_cnb_config(explicit)
     if cfg.get("managed"):
         engine._cnb_managed = True
         print(
@@ -918,6 +1132,18 @@ def setup_cnb(engine: Any) -> None:
         )
         return
     if not cfg.get("enabled"):
+        return
+    if cfg.get("tree") is not None:
+        # 神经树显式定义：解析（必要参数校验，失败抛 TreeDefinitionError，
+        # 由调用方按「非阻塞报错」语义处理）→ 后台装配整树 → 宿主引擎绑定
+        # 到根节点（中枢）。装配失败降级为普通实例（打印告警、状态可查）。
+        from norpagent.cnb.tree import TreeMount, parse_tree_definition
+
+        plan = parse_tree_definition(cfg["tree"])
+        mount = TreeMount(engine, plan, cfg, mode="inproc")
+        with engine._cnb_lock:
+            engine._cnb = mount
+        mount.mount()
         return
     try:
         from norpagent.cnb import NervousNode
@@ -946,10 +1172,188 @@ def setup_cnb(engine: Any) -> None:
     adapter.mount()
 
 
+# ── 运行时热挂载 / 卸载（np.remount(cnb=...)，2026-09-12） ─────────────
+# 架构书「内核动点全量设置化 + 热挂载面」：CNB 不止于启动装配（env / np(cnb=...)），
+# 运行中的实例可经 np.remount(cnb=...) 现场挂上 / 替换 / 摘下——引擎全程保活。
+
+def detach_cnb(engine: Any, reason: str = "") -> Dict[str, Any]:
+    """卸载当前 CNB 适配器（引擎保持 RUNNING；无适配器时空操作成功）。
+
+    适配器形态兼容单节点 ``CnbAdapter`` 与整树 ``TreeMount``。
+    返回 {'ok': True, 'status': 'detached'|'off', 'node_id': ...}。
+    """
+    with engine._cnb_lock:
+        adapter = engine._cnb
+        engine._cnb = None
+    if adapter is None:
+        return {"ok": True, "status": "off", "detail": "no active CNB adapter"}
+    node_id = None
+    try:
+        node = getattr(adapter, "node", None)
+        if node is not None:
+            node_id = getattr(node, "node_id", None)
+        if node_id is None:
+            node_id = getattr(adapter, "node_id", None)
+        adapter.shutdown()
+    except Exception as exc:  # noqa: BLE001 — 卸载失败如实回报（不静默）
+        return {"ok": False, "status": "detach_failed",
+                "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "status": "detached", "node_id": node_id,
+            "detail": reason or "remount"}
+
+
+def _remount_tree(engine: Any, spec: Dict[str, Any], *,
+                  wait: float) -> Dict[str, Any]:
+    """神经树形态的 remount：运行中改形（同类保留 / 增删变更）。
+
+    - spec 键：``tree``（必填：定义 dict / JSON 文本 / JSON 路径 / PY 路径）、
+      ``mode``（inproc / spawn，默认 inproc）、``rebuild``（true = 整树重建，
+      默认 false：当前已挂载同类树时做差分改形）；
+    - 定义校验失败抛 :class:`TreeDefinitionError`（缺必要参数逐条列出）；
+    - 新挂载在后台线程完成；wait>0 时最多等待 wait 秒观察 mounted / failed。
+    """
+    from norpagent.cnb.tree import TreeMount, parse_tree_definition
+
+    allowed = {"tree", "mode", "rebuild", "cnb"}
+    unknown = sorted(set(spec) - allowed)
+    if unknown:
+        raise CnbConfigError(
+            f"unknown cnb tree remount keys: {unknown} (allowed: {sorted(allowed)})")
+    mode = str(spec.get("mode") or "inproc").strip().lower()
+    if mode not in ("inproc", "spawn"):
+        raise CnbConfigError(
+            f"unknown cnb tree assembly mode {mode!r} (use inproc / spawn)")
+    plan = parse_tree_definition(spec.get("tree"))
+
+    with engine._cnb_lock:
+        old = engine._cnb
+    if (isinstance(old, TreeMount) and old.mode == mode
+            and not bool(spec.get("rebuild"))):
+        summary = old.reshape(plan)
+        out = {"ok": True, "status": "applied", "mode": mode,
+               "node_id": old.node_id, "port": old.port,
+               "replaced": False, "rebuilt": bool(summary.get("rebuilt")),
+               "summary": summary}
+        return out
+
+    mount = TreeMount(engine, plan, spec, mode=mode)
+    with engine._cnb_lock:
+        engine._cnb = mount
+    replaced = old is not None
+    if old is not None:
+        try:
+            old.shutdown()
+        except Exception:  # noqa: BLE001 — 旧适配器卸载失败不影响新挂载
+            pass
+    mount.mount()
+    if wait and float(wait) > 0:
+        deadline = time.time() + float(wait)
+        while time.time() < deadline and mount.status == "mounting":
+            time.sleep(0.05)
+    out: Dict[str, Any] = {
+        "ok": mount.status != "failed",
+        "status": mount.status,
+        "mode": mode,
+        "replaced": replaced,
+        "node_id": mount.node_id,
+        "port": mount.port,
+        "nodes": len(plan["nodes"]),
+    }
+    if mount.error:
+        out["error"] = mount.error
+    return out
+
+
+def remount_cnb(engine: Any, spec: Any = None, *,
+                wait: float = 0.0) -> Dict[str, Any]:
+    """运行时热挂载 / 替换 / 卸载 CNB（np.remount(cnb=...) 的实现）。
+
+    语义：
+    - spec 为 False / "off" / "0" / "false" / "no"：卸载当前适配器（detach_cnb）；
+    - spec 为 dict 且携带 ``tree``：神经树形态——当前已挂载同类树时做差分
+      改形（运行中手动改形态；``rebuild=true`` 强制整树重建），否则装配新树
+      （inproc 整树 / spawn 多进程树，端口由定义携带）；
+    - spec 为 True / "on" / 其它 dict：按显式配置装配并挂载单节点——
+        * 端口必须手动配置（R-025：缺端口 CnbConfigError 抛错，不静默退化）；
+        * 已有挂载先卸载再挂新（替换语义）；挂载在后台线程完成，不阻塞调用；
+    - wait>0：最多等待 wait 秒直到 mounted / failed（脚本与测试友好）。
+
+    返回 {'ok', 'status', 'replaced', 'node_id', 'port', 'error'?}。
+    """
+    raw = str(spec).strip().lower() if isinstance(spec, str) else spec
+    if raw is False or raw in ("off", "0", "false", "no"):
+        result = detach_cnb(engine, reason="remount: cnb off")
+        if result.get("ok"):
+            engine._cnb_error = None
+        return result
+
+    if isinstance(spec, dict) and "tree" in spec and spec.get("tree") is not None:
+        result = _remount_tree(engine, dict(spec), wait=wait)
+        if result.get("ok"):
+            engine._cnb_error = None
+        return result
+
+    cfg = validate_cnb_config(spec if spec is not None else True)
+    if not cfg.get("enabled"):
+        return {"ok": False, "status": "not_enabled",
+                "error": "CNB spec did not enable the bus "
+                         "(pass cnb=True / {\"cnb\": True, \"port\": ...})"}
+
+    from norpagent.cnb import NervousNode
+
+    meta: Dict[str, Any] = {"engine": "norpagent", "remount": True}
+    if cfg.get("desc"):
+        meta["desc"] = cfg["desc"]
+    node = NervousNode(
+        node_id=cfg["node_id"],
+        kind=cfg["kind"],
+        level=cfg["level"],
+        parent_url=cfg["parent"],
+        port=cfg["port"],
+        meta=meta,
+        heartbeat_interval=cfg["heartbeat"],
+    )
+    adapter = CnbAdapter(engine, node, cfg)
+
+    with engine._cnb_lock:
+        old = engine._cnb
+        engine._cnb = adapter
+    replaced = old is not None
+    if old is not None:
+        try:
+            old.shutdown()
+        except Exception:  # noqa: BLE001 — 旧适配器卸载失败不影响新挂载（如实续行）
+            pass
+    adapter.mount()
+
+    if wait and float(wait) > 0:
+        deadline = time.time() + float(wait)
+        while time.time() < deadline and adapter.status == "mounting":
+            time.sleep(0.05)
+
+    out: Dict[str, Any] = {
+        "ok": adapter.status != "failed",
+        "status": adapter.status,
+        "replaced": replaced,
+        "node_id": cfg["node_id"],
+        "port": cfg["port"],
+    }
+    if adapter.error:
+        out["error"] = adapter.error
+    if out["ok"]:
+        engine._cnb_error = None
+    return out
+
+
 __all__ = [
     "CnbAdapter",
+    "CnbConfigError",
     "setup_cnb",
+    "remount_cnb",
+    "detach_cnb",
     "read_env_config",
+    "apply_explicit_config",
+    "validate_cnb_config",
     "KERNEL_ACTIONS",
     "CNB_ENV_KEYS",
     "ENV_NODE",
@@ -961,4 +1365,5 @@ __all__ = [
     "ENV_DESC",
     "ENV_MANAGED",
     "ENV_CLI",
+    "ENV_TREE",
 ]

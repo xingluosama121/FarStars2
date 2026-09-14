@@ -54,6 +54,16 @@ Replacement semantics grouped by slot:
    startup passthrough). When the user registers a same-named custom slot via
    register_slot, the slot table takes priority (handled per slot semantics).
 
+7. **engine service keys** (cnb, 2026-09-12): ``np.remount(cnb=...)`` hot-mounts /
+   replaces / detaches the Central Nervous Bus while the engine stays RUNNING —
+   ``cnb=False/"off"`` detaches, ``cnb=True/"on"/dict`` assembles and mounts a new
+   node (R-025: the port must be configured manually or a clear error is raised;
+   an existing mount is replaced after shutting the old adapter down). Mounting
+   happens on a background thread and never blocks the caller; pass
+   ``wait=<seconds>`` via the dedicated norpagent.cnb.engine.remount_cnb() call
+   for script/tests that need to observe mounted/failed. When the user registers
+   a same-named custom slot via register_slot, the slot table takes priority.
+
 Any slot can be remounted — this is the runtime embodiment of "everything except
 the minimal bottom kernel is a slot": assemblies can swap parts while running;
 the slot table itself can also plug in new slots while running (register_slot).
@@ -94,6 +104,9 @@ _AGENT_REBUILD_SLOTS: FrozenSet[str] = frozenset((
 # semantics; see remount_engine).
 _WEB_PAGE_KEYS: FrozenSet[str] = frozenset(("html", "flow_html", "farstars_html"))
 
+# sentinel: distinguishes "cnb key not passed" from "cnb=None/False" (detach)
+_CNB_MISSING = object()
+
 
 def remount_engine(engine: Any, **slot_values: Any) -> Any:
     """Execute a hot mount on the running engine (see the slot-group semantics in the module docstring).
@@ -112,7 +125,12 @@ def remount_engine(engine: Any, **slot_values: Any) -> Any:
         if k in slot_values and k not in known
     }
     slot_values = {k: v for k, v in slot_values.items() if k not in web_vals}
-    if not slot_values and not web_vals:
+    # cnb（2026-09-12）：CNB 热挂载 / 卸载键（引擎服务键，与页面热替换键同层）。
+    # 自定义同名槽位注册时槽位表优先（与 web keys 同规则）。
+    cnb_spec: Any = _CNB_MISSING
+    if "cnb" in slot_values and "cnb" not in known:
+        cnb_spec = slot_values.pop("cnb")
+    if not slot_values and not web_vals and cnb_spec is _CNB_MISSING:
         raise EngineError("hot mount needs at least one slot parameter")
     unknown = [k for k in slot_values if k not in known]
     if unknown:
@@ -170,6 +188,22 @@ def remount_engine(engine: Any, **slot_values: Any) -> Any:
     #    page and parameters consistent.
     _apply_web_keys(engine, web_vals)
 
+    # 5.5 CNB engine service key (2026-09-12): hot mount / replace / detach the
+    #     Central Nervous Bus while the engine stays RUNNING; mounting continues
+    #     on a background thread (R-025 validation already raised on bad specs).
+    if cnb_spec is not _CNB_MISSING:
+        from norpagent.cnb.engine import remount_cnb
+
+        cnb_result = remount_cnb(engine, cnb_spec)
+        if logger is not None:
+            try:
+                logger.info(
+                    "norpagent cnb remount: status=%s node=%s port=%s",
+                    cnb_result.get("status"), cnb_result.get("node_id"),
+                    cnb_result.get("port"))
+            except Exception:  # noqa: BLE001
+                pass
+
     # 6. infrastructure slots: frontend / event loop stop-old-start-new.
     if "frontend" in slot_values:
         _swap_frontend(engine)
@@ -178,7 +212,8 @@ def remount_engine(engine: Any, **slot_values: Any) -> Any:
 
     if logger is not None:
         try:
-            names = sorted(set(slot_values) | set(web_vals))
+            names = sorted(set(slot_values) | set(web_vals)
+                           | ({"cnb"} if cnb_spec is not _CNB_MISSING else set()))
             logger.info("norpagent hot mount done: %s", ", ".join(names))
         except Exception:  # noqa: BLE001
             pass
@@ -191,7 +226,8 @@ def remount_engine(engine: Any, **slot_values: Any) -> Any:
         notify_system_change(
             engine,
             description="hot mount: " + ", ".join(
-                sorted(set(slot_values) | set(web_vals))),
+                sorted(set(slot_values) | set(web_vals)
+                       | ({"cnb"} if cnb_spec is not _CNB_MISSING else set()))),
         )
     except Exception:  # noqa: BLE001 — snapshot failure must not break the hot mount
         pass

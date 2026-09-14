@@ -24,8 +24,13 @@ class UIAdapter(Protocol):
         """Receive and render an AgentEvent."""
         ...
 
-    def ask_user(self, question: str, default: str = "") -> str:
-        """Ask the user a question and return the answer (used for human approval, clarification, etc.)."""
+    def ask_user(self, question: str, default: str = "", kind: str = "") -> str:
+        """Ask the user a question and return the answer (used for human approval, clarification, etc.).
+
+        ``kind`` lets the adapter choose the right control instead of guessing from
+        the text: ``"approval"`` is a binary approve/reject decision (no free-text
+        box), ``"clarify"`` (or empty) is an open question that needs typed input.
+        """
         ...
 
     def notify(self, message: str, level: str = "info") -> None:

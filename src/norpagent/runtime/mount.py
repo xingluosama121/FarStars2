@@ -89,7 +89,7 @@ def _apply_model_options(reg: Registry, overrides: Dict[str, Any],
     When the final model is a built-in adapter name (openai_compat / anthropic),
     reconstruct the provider with these parameters and override the registration,
     making np() and CLI behave the same:
-    np(model="openai_compat", model_name="deepseek-v4-flash", api_key="...").
+    np(model="openai_compat", model_name="<remote-model>", api_key="...").
     """
     model_name = overrides.get("model")
     if model_name not in ("openai_compat", "anthropic"):
@@ -447,17 +447,13 @@ def apply_slot_overrides(reg: Registry, layer: Any,
 def _unload_arch_plugins(reg: Registry, loader: Any) -> None:
     """Unload the plugins installed by the architecture layer (prerequisite for hot-remounting the plugins slot).
 
-    - unsubscribe every plugin's hook subscriptions (Registry.unregister_plugin);
-    - pop plugins' sys.modules caches (loader.unload);
-    - release process-isolation host child processes (loader.shutdown).
-
-    Tool entries stay in the registry (name-overwrite semantics: a same-named
-    plugin reinstalled naturally overwrites; old tool names no longer loaded stay
-    in the table but are unreachable since they are not in the preset tool set).
+    2026-09-11 (clean hot reload): delegates to ``loader.unload`` per plugin —
+    hook subscriptions are unsubscribed for real, tools are removed from the tool
+    table, setup(api) registrations are torn down, on_unload runs (clean hot
+    reload); the process-isolation host child is released afterwards.
     """
     try:
         for info in list(getattr(loader, "plugins", ()) or ()):
-            reg.unregister_plugin(getattr(info, "name", ""))
             try:
                 loader.unload(reg, getattr(info, "name", ""))
             except Exception:  # noqa: BLE001

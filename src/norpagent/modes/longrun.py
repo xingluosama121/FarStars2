@@ -28,6 +28,8 @@ def build_longrun_preset(model: str = "openai_compat") -> Preset:
         description="Long-run: long-period complex tasks (larger step cap + persistent scheduling + checkpoint resume)",
         model=model,
         tools=[
+            # interaction (P0): let the model itself ask the user to clarify / confirm
+            "ask_user",
             # file operations (P2)
             "file_read",
             "file_write",
