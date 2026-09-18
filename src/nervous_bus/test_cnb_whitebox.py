@@ -458,9 +458,9 @@ def main():
           cnt == 1, f"count={cnt}")
 
     # ── 版本号（2.2.2：设置治理 / 安全可关闭 / 主题系统专项）──
-    print("\n── 版本号 2.2.2 ──")
-    check("W-ver 版本号为 2.2.2",
-          norpagent.__version__ == "2.2.2", norpagent.__version__)
+    print("\n── 版本号 2.2.4 ──")
+    check("W-ver 版本号为 2.2.4",
+          norpagent.__version__ == "2.2.4", norpagent.__version__)
 
     # ── 清理 ──
     node2.stop()

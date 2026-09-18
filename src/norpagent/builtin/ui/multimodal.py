@@ -35,7 +35,7 @@ import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-_UA = "norpagent-multimodal/2.2.2 (FarStars)"
+_UA = "norpagent-multimodal/2.2.4 (FarStars)"
 
 
 class MultimodalError(Exception):
@@ -150,7 +150,7 @@ def describe_image(
     ``service_url`` with ``{image_base64, ext, mime, prompt}``; the service
     replies ``{"description": "..."}`` (``{"ok": true, "description": ...}`` and
     ``{"text": ...}`` are also accepted). Optional ``api_key`` is sent as a
-    ``Bearer`` Authorization header (R-022: the vision configuration carries an
+    ``Bearer`` Authorization header (the vision configuration carries an
     API key slot).
     """
     service_url = (service_url or "").strip()
@@ -195,14 +195,14 @@ def media_describe(
     """Send an audio / video payload to an external media service, return its text.
 
     Generalizes the vision protocol so each modality can route through an
-    external service (R-021: per-modality ``direct`` / ``service`` routing):
+    external service (per-modality ``direct`` / ``service`` routing
 
     - request: POST JSON ``{"kind": "audio"|"video", "data_base64": ...,
       "ext": ..., "mime": ..., "prompt": ...}``;
     - response accepts ``description`` / ``text`` / ``transcript`` /
       ``content`` / ``result`` (first non-empty wins; ``data`` sub-dict also
       accepted), covering both speech transcription and non-speech audio
-      understanding (music / environment - R-022: audio is not limited to
+      understanding (music / environment - audio is not limited to
       speech) as well as video understanding;
     - optional ``api_key`` is sent as a ``Bearer`` Authorization header.
     """

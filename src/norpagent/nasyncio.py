@@ -61,7 +61,7 @@ import time as _time
 import traceback as _traceback
 from collections import deque
 
-__version__ = "2.2.2"
+__version__ = "2.2.4"
 
 __all__ = [
     # exceptions

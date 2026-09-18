@@ -1,5 +1,5 @@
 # Copyright (c) 2026 xingluosama121, MIT Licensed
-"""norpagent.evolution.hotswap — 代码进化热重载管线（R-004，2026-09-09 裁决）。
+"""norpagent.evolution.hotswap — 代码进化热重载管线。
 
 铁律：**自进化应用变更不删除原文件逻辑**——不原地改写原文件、不删除原文件；
 一律「产出新文件 / 新版本逻辑 → 验证 → 热重载切换到新逻辑」，原逻辑保留、

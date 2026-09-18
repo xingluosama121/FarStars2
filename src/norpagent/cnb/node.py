@@ -100,7 +100,7 @@ class NervousNode:
         # engine.CnbAdapter）把 NorpEngine 公开 API 注册为内核动作面。
         self._actions: Dict[str, Callable[[Dict], Dict]] = {}
 
-        # ── 通用槽位（R-024 修订，2026-09-11）──
+        # ── 通用槽位──
         # 每节点最多 64 个通用槽位；槽位走神经总线，什么都可以挂载（model /
         # tools / plugins / 完整 norpagent 实例模块 / 任意自定义模块）。CNB
         # 因此成为「槽位连接器」的多实例延伸：单实例连本地部件，多实例经
@@ -390,7 +390,7 @@ class NervousNode:
         return sorted(set(self._actions) | set(self.slots.action_index()))
 
     # ------------------------------------------------------------------
-    # 通用槽位（R-024 修订：≤64 槽位；完整 norpagent 实例 = 标准模块）
+    # 通用槽位（修订：≤64 槽位；完整 norpagent 实例 = 标准模块）
     # ------------------------------------------------------------------
 
     def mount_module(self, slot_id: str, module: Any,
@@ -1160,7 +1160,7 @@ class NervousNode:
                         f"node frozen (quarantine): {action} rejected — "
                         f"read-only evidence actions only"}
             # 路由：内核动作注册表优先，槽位模块动作面次之，旧回调钩子兜底
-            # （v1.0.7 内核集成 + R-024 槽位面）。动作表命中 -> 直接执行；
+            # （v1.0.7 内核集成 + 槽位面）。动作表命中 -> 直接执行；
             # 未命中但槽位模块提供该动作 -> 经槽位面执行（source="slot"）；
             # 再未命中但有 exec 回调 -> 兼容旧绑定（bare echo / 第三方回调）；
             # 三者皆无 -> 拒绝并审计。

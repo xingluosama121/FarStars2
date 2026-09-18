@@ -297,9 +297,14 @@ class PluginInfo:
 class _ImportBlocker:
     """sys.meta_path import blocker: only affects plugin modules (stack-frame probing)."""
 
-    def __init__(self, blocked: Set[str], strict: bool = False) -> None:
+    def __init__(self, blocked: Set[str], strict: bool = False,
+                 warn_only: bool = False,
+                 warnings: Optional[List[str]] = None) -> None:
         self.blocked = blocked
         self.strict = strict
+        # soft 挡（2026-09-15）：命中受限导入时只记录、不拦截（放行并转成警告）
+        self.warn_only = warn_only
+        self.warnings: List[str] = warnings if warnings is not None else []
         self._registered = False
 
     def register(self) -> None:
@@ -343,6 +348,12 @@ class _ImportBlocker:
         if not should_block:
             return None
         if self._caller_is_plugin():
+            if self.warn_only:
+                self.warnings.append(
+                    f"restricted import '{fullname}' allowed "
+                    "(soft mode: recorded only, not blocked)"
+                )
+                return None
             raise ImportError(
                 f"plugin security: import of '{fullname}' is forbidden (plugin code may not use this module)"
             )
@@ -1408,7 +1419,7 @@ class PluginLoader:
             self.plugins.append(info)
             return
 
-        # R-020（2026-09-09 裁决）：未签名插件**仅警告**、默认不阻止加载。
+        # 未签名插件**仅警告**、默认不阻止加载。
         # 默认策略下 unsigned / untrusted / unavailable 一律放行但留警告
         # （info.warnings 随 /api/plugins 与 CLI 输出可见）；高安全档
         # （signature_required，上一分支）是显式收紧，不是默认。
@@ -1417,7 +1428,7 @@ class PluginLoader:
                 f"plugin {name!r} is {sig.status or 'unsigned'} "
                 f"(signature not trusted, reason: {sig.reason or 'n/a'}); "
                 f"loading is allowed by default — add a signature or a trusted "
-                f"key when ready (R-020: warn only, never block by default)"
+                f"key when ready (warn only, never block by default)"
             )
             info.warnings.append(warn)
             print(f"[plugin] warning: {warn}")
@@ -1429,7 +1440,9 @@ class PluginLoader:
         self._emit("before_plugin_audit", name=name, path=path,
                    audit_level=effective_audit)
         issues, allowed = self.auditor.audit_file(path, audit_level=effective_audit)
-        info.audit_issues = [i.to_dict() for i in issues]
+        # 四挡（2026-09-15）：off = 连记录都不留；notice 及以上才写入审计结果
+        if effective_audit != "off":
+            info.audit_issues = [i.to_dict() for i in issues]
         self._emit(
             "after_plugin_audit", name=name, path=path,
             allowed=allowed, issues=len(issues),
@@ -1798,18 +1811,24 @@ class PluginLoader:
         """Execute the plugin module under import-blocker protection."""
         # ★ static import precheck: the runtime meta_path blocker is ineffective
         #   for modules already cached by the main process (e.g. subprocess —
-        #   sys.modules hits directly), so under safe/strict modes the plugin
+        #   sys.modules hits directly), so under soft/safe/strict modes the plugin
         #   source's imports are first checked statically via AST; restricted
         #   modules reject loading outright.
-        if self.import_restriction in ("safe", "strict"):
+        if self.import_restriction in ("soft", "safe", "strict"):
             violation = self._static_import_violation(path)
             if violation:
-                info.enabled = False
-                info.error = (
-                    f"import blocked: '{violation}'"
-                    " (plugin security import restrictions forbid loading this module)"
-                )
-                return None
+                if self.import_restriction == "soft":
+                    # soft 挡：只记录、不拦截
+                    info.warnings.append(
+                        f"restricted import '{violation}' allowed (soft mode)"
+                    )
+                else:
+                    info.enabled = False
+                    info.error = (
+                        f"import blocked: '{violation}'"
+                        " (plugin security import restrictions forbid loading this module)"
+                    )
+                    return None
 
         mod_name = f"{PLUGIN_MODULE_PREFIX}{info.name}"
         spec = importlib.util.spec_from_file_location(mod_name, path)
@@ -1821,10 +1840,13 @@ class PluginLoader:
         sys.modules[spec.name] = module
 
         blocker: Optional[_ImportBlocker] = None
-        if self.import_restriction in ("safe", "strict"):
+        if self.import_restriction in ("soft", "safe", "strict"):
             blocked = set(DANGEROUS_IMPORTS_FOR_BLOCK)
             blocker = _ImportBlocker(
-                blocked, strict=(self.import_restriction == "strict")
+                blocked,
+                strict=(self.import_restriction == "strict"),
+                warn_only=(self.import_restriction == "soft"),
+                warnings=info.warnings,
             )
             blocker.register()
         try:

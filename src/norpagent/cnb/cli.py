@@ -382,7 +382,7 @@ def cmd_behavior(args):
 
 
 # ----------------------------------------------------------------------
-# 神经树显式定义（2026-09-12 反馈轮）：validate / show / up
+# 神经树显式定义：validate / show / up
 # ----------------------------------------------------------------------
 
 def cmd_tree_validate(args):
@@ -485,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--id", default="cortex", help="cortex node id (default: cortex)")
     pc.add_argument("--host", default=protocol.DEFAULT_HOST)
     pc.add_argument("--port", type=int, required=True,
-                    help="cortex bus port (R-025: never hardcoded, must be set manually; missing -> error)")
+                    help="cortex bus port (never hardcoded, must be set manually; missing -> error)")
     pc.add_argument("--desc", default="")
     pc.add_argument("--repl", action="store_true", help="start the interactive console")
     pc.add_argument("--bare", action="store_true",
@@ -643,7 +643,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_root(pbh)
     pbh.set_defaults(func=cmd_behavior)
 
-    # tree 神经树显式定义（2026-09-12 反馈轮）：不预设形状，启动时显式传入
+    # tree 神经树显式定义：不预设形状，启动时显式传入
     ptree = sub.add_parser(
         "tree", help="neural-tree explicit definition: validate / show / up (no tree shape is preset)")
     t_sub = ptree.add_subparsers(dest="tree_cmd", required=True)

@@ -494,7 +494,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "language": "en",                     # UI language (np(language=...) overrides)
     "model": "",                          # model (default = the engine preset model)
     "title_model": "",                    # optional model for auto session titles ("" = the session's current model; a separate one-off call)
-    "context_token_budget": 0,            # clamp the request to this estimated token budget by dropping the oldest whole turns (0 = unlimited)
+    "context_token_budget": 32000,   # 0 = unlimited; over budget: compress first, truncate last            # clamp the request to this estimated token budget by dropping the oldest whole turns (0 = unlimited)
     "session_isolation": "per_session",   # concurrency isolation between sessions: per_session (default) | isolated_instance
     "api_base": "https://api.deepseek.com",
     "api_key": "",
@@ -510,7 +510,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "plugin_dirs": [],
     "norp_safe_enabled": True,
     "security_enabled": True,
-    "security_level": "standard",         # norpagent.safe() level (basic/standard/high); the suite is always mounted
+    "security_level": "standard",         # norpagent.safe() level (relaxed/basic/standard/high); the suite is always mounted
     # native tool confirmation (settings panel): master OFF by default; the three
     # per-class switches default ON and only apply while the master is on.
     "native_confirm_enabled": False,
@@ -536,11 +536,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "custom_system_prompt": "",
     "custom_system_prompt_file": "",
     "jailbreak_guard_enabled": True,
-    "jailbreak_guard_action": "block",
+    "jailbreak_guard_action": "warn",
     "vision_enabled": False,
     "vision_service_url": "",
     "vision_service_api_key": "",
-    # v2.x multimodal native passthrough (R-021): each modality routes either
+    # v2.x multimodal native passthrough: each modality routes either
     # "direct" (the attachment itself is passed to the model as a native
     # multimodal part) or "service" (an external service converts it to text).
     "mm_image_route": "direct",
@@ -568,8 +568,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "stt_language": "en-US",      # native recognizer language (zh-CN needs a Windows language pack)
     "sound_notify_enabled": True, # new-message notification tone
     "auto_speak_enabled": False,  # auto-read assistant replies aloud
-    "plugin_security_audit": "block",
-    "plugin_security_import_restrict": "strict",
+    "plugin_security_audit": "warn",
+    "plugin_security_import_restrict": "soft",
     "plugin_security_require_permissions": True,
     "plugin_security_resource_limit": False,
     "plugin_signature_verify": True,
@@ -594,6 +594,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # of which subsystem produced it.
 _SEC_BLOCK_SIGNATURES = (
     "NORP安全系统拦截", "NORP 安全系统拦截", "安全系统拦截",
+    "NORP安全系统介入拦截", "NORP 安全系统介入拦截", "安全系统介入拦截",
     "[run_python security blocked]", "security blocked",
     "security restriction:",
     "blocked_by_hook", "tool call vetoed by a hook",
@@ -601,7 +602,99 @@ _SEC_BLOCK_SIGNATURES = (
     "approval_denied", "the user denied the approval request",
     "input blocked by security protection",
     "jailbreak/injection", "jailbreak_guard",
+    # 未签名/不受信插件：不是硬拦截，归 notice 挡（默认门槛 major 下不显示，
+    # 只有把 security.alert_level 放宽到 all 才会以一闪而过的小提示出现）
+    "unsigned plugin", "untrusted plugin", "未签名插件", "不受信插件",
 )
+
+# 定级依据（2026-09-14 修复）：**只看文本里有没有"拦截"二字会把"仅警告"误判成红色**。
+# 因此改为「结构化字段优先 → 明确警告词 → 明确拦截词 → 默认警告」。红色（danger）只
+# 用于"确实被拦住"，其余一律黄色（warn）——少吓人比多吓人安全。
+_SEC_WARN_MARKERS = (
+    "仅警告", "警告", "提醒", "warn", "warning", "advisory", "notice",
+)
+_SEC_DANGER_MARKERS = (
+    "blocked", "denied", "veto", "forbidden", "rejected", "refused",
+    "拦截", "阻断", "禁止", "已阻止",
+)
+_SEC_BLOCK_VALUES = ("block", "blocked", "deny", "denied", "danger", "reject",
+                     "rejected", "veto", "vetoed", "error", "forbid", "forbidden")
+_SEC_WARN_VALUES = ("warn", "warning", "advisory", "notice", "info",
+                    "allow", "allowed", "pass", "audit")
+# 严重度挡位（2026-09-15 分级）：把安全提示拆成四挡，默认只在「真被拦截」时提示。
+# 起因：此前判定不出时一律回落到 warn，任何沾边事件都弹常驻横幅，用户（尤其非
+# 开发者）会误以为"把电脑弄坏了"。挡位越高越少打扰：danger > warn > notice > silent。
+_SEC_SEVERITY = {"silent": 0, "notice": 1, "warn": 2, "danger": 3}
+
+# 界面提示门槛：security.alert_level 设置值 -> 最低显示挡位（99 = 全静默）
+_SEC_THRESHOLD = {"off": 99, "major": 3, "normal": 2, "all": 1}
+
+# 拦截类别 -> 默认挡位（显式「挡位表」；文本与结构化字段都没给出更明确信号时采用）
+_SEC_CODE_SEVERITY = {
+    "hook_veto": "danger",
+    "approval_denied": "danger",
+    "ssrf": "danger",
+    "jailbreak": "danger",
+    "sandbox": "danger",
+    "unsafe_command": "danger",
+    "plugin_untrusted": "notice",
+    "unknown": "silent",
+}
+_SEC_ALERT_CODES = (
+    ("hook_veto", ("blocked_by_hook", "vetoed by a hook",
+                   "blocked by a plugin hook", "hook veto")),
+    ("approval_denied", ("approval_denied", "denied the approval request")),
+    ("ssrf", ("security restriction:", "ssrf", "internal address")),
+    ("jailbreak", ("jailbreak", "injection")),
+    ("sandbox", ("[run_python security blocked]", "security blocked", "sandbox")),
+    ("unsafe_command", ("安全系统拦截", "norp safe", "危险命令", "uac",
+                        "path traversal", "路径穿越")),
+    ("plugin_untrusted", ("unsigned plugin", "未签名插件", "untrusted plugin")),
+)
+
+
+def _sec_alert_level(struct: Dict[str, Any], payload: Dict[str, Any],
+                     text: str, code: str = "") -> str:
+    """判定严重度挡位（四挡：danger / warn / notice / silent）。
+
+    2026-09-15 分级：此前判定不出时一律回落到 warn，导致任何沾边事件都弹常驻
+    横幅。现在四挡分明：只有「确实被拦住」是 danger；「仅警告」类降为 warn，而默认
+    门槛是 major（只提示真拦截），因此默认不会显示；判定不出来的归 silent，只进审计日志。
+    """
+    for src in (struct, payload):
+        if not isinstance(src, dict):
+            continue
+        for key in ("blocked", "denied", "blocked_by_hook", "vetoed"):
+            value = src.get(key)
+            if value is True:
+                return "danger"
+            if value is False:
+                return "warn"
+        for key in ("action", "level", "severity", "verdict", "decision",
+                    "audit_level", "mode"):
+            value = str(src.get(key) or "").strip().lower()
+            if value in _SEC_BLOCK_VALUES:
+                return "danger"
+            if value in _SEC_WARN_VALUES:
+                return "warn"
+    low = text.lower()
+    for marker in _SEC_WARN_MARKERS:
+        if marker in text or marker in low:
+            return "warn"
+    for marker in _SEC_DANGER_MARKERS:
+        if marker in text or marker in low:
+            return "danger"
+    return _SEC_CODE_SEVERITY.get(code or "", "silent")
+
+
+def _sec_alert_code(text: str) -> str:
+    """告警分类码（前端据此本地化文案，不再直接抛后端中文原文）。"""
+    low = text.lower()
+    for code, markers in _SEC_ALERT_CODES:
+        for marker in markers:
+            if marker in text or marker in low:
+                return code
+    return "unknown"
 
 _MAX_JSON = 1_000_000
 _MAX_UPLOAD_JSON = 64_000_000
@@ -930,6 +1023,7 @@ class WebUI:
                 self._config.update(self._init_config)
             self._load_fe_configs()
             self._load_flow_graph_from_disk()
+            self._load_session_meta()
             self._disk_loaded = True
 
     @staticmethod
@@ -1129,7 +1223,7 @@ class WebUI:
 
             def _attach(self, body: bytes, filename: str,
                         mime: str = "application/octet-stream") -> None:
-                """下载响应（进化包 / 设置快照导出用，R-010）。"""
+                """下载响应（进化包 / 设置快照导出用）。"""
                 self.send_response(200)
                 self.send_header("Content-Type", mime + "; charset=utf-8")
                 self.send_header("Content-Disposition",
@@ -1893,6 +1987,7 @@ class WebUI:
             call_timeout = self._config.get("call_timeout")
             max_tokens = self._config.get("max_tokens")
             ctx_budget = self._config.get("context_token_budget")
+            max_steps = self._config.get("max_steps")
         effort = _THINK_LEVEL_MAP.get(think, "high")
         defaults: Dict[str, Any] = {}
         if effort != "none":
@@ -1926,6 +2021,11 @@ class WebUI:
         try:
             if ctx_budget:
                 defaults["context_token_budget"] = int(ctx_budget)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if max_steps:
+                defaults["max_steps"] = int(max_steps)
         except (TypeError, ValueError):
             pass
         return defaults
@@ -2335,13 +2435,13 @@ class WebUI:
             self._publish({
                 "type": "security_alert",
                 "level": _alert[0],
-                "message": _alert[1],
+                "code": _alert[1],
+                "message": _alert[2],
                 "sid": sid or None,
                 "ts": time.time(),
             })
 
-    @staticmethod
-    def _security_alert_for(item: Dict[str, Any]) -> Optional[tuple]:
+    def _security_alert_for(self, item: Dict[str, Any]) -> Optional[tuple]:
         """Detect a security / sandbox interception in an agent event.
 
         Returns (level, message) where level is "danger" for a hard block and
@@ -2355,9 +2455,11 @@ class WebUI:
         if not isinstance(payload, dict):
             return None
         text = ""
+        struct: Dict[str, Any] = {}
         if etype == "after_tool_call":
             res = payload.get("result")
             if isinstance(res, dict):
+                struct = res
                 text = " ".join(str(res.get(k) or "") for k in ("output", "error"))
             else:
                 text = str(res or "")
@@ -2365,6 +2467,7 @@ class WebUI:
         elif etype == "on_tool_error":
             text = " ".join(str(payload.get(k) or "") for k in ("error", "tool_name"))
         elif etype in ("on_task_stopped", "on_task_error"):
+            struct = payload
             text = " ".join(str(payload.get(k) or "") for k in ("reason", "error", "detail"))
         else:
             return None
@@ -2374,10 +2477,31 @@ class WebUI:
         low = text.lower()
         for sig in _SEC_BLOCK_SIGNATURES:
             if sig.lower() in low:
-                danger = ("拦截" in text) or any(
-                    k in low for k in ("blocked", "denied", "jailbreak", "injection"))
-                return ("danger" if danger else "warn", text[:300])
+                code = _sec_alert_code(text)
+                level = _sec_alert_level(struct, payload, text, code)
+                if _SEC_SEVERITY.get(level, 0) < self._sec_alert_threshold():
+                    return None
+                return (level, code, text[:300])
         return None
+
+    def _sec_alert_threshold(self) -> int:
+        """界面提示门槛（security.alert_level）。
+
+        默认 major = 只提示「真被拦截」；off 全静默；normal / all 逐级放宽。
+        读取失败时回落到 major（宁可少打扰）。结果缓存 5 秒，避免每个事件
+        都去读设置库。
+        """
+        now = time.time()
+        cached = getattr(self, "_sec_thr_cache", None)
+        if cached and (now - cached[0]) < 5.0:
+            return cached[1]
+        try:
+            value = self._settings_store().get("security.alert_level", "major")
+            threshold = _SEC_THRESHOLD.get(str(value or "major"), 3)
+        except Exception:
+            threshold = 3
+        self._sec_thr_cache = (now, threshold)
+        return threshold
 
     def ask_user(self, question: str, default: str = "", kind: str = "") -> str:
         """Ask the user (human approval / clarification). Waits for the user to
@@ -2465,6 +2589,7 @@ class WebUI:
                 "workspace": ws,
                 "created_at": getattr(sess, "created_at", time.time()),
             }
+        self._save_session_meta()
         return self.session_info(sess.id)
 
     def session_info(self, sid: str) -> Dict[str, Any]:
@@ -2627,7 +2752,7 @@ class WebUI:
     def close_session(self, sid: str) -> Dict[str, Any]:
         """Close (delete) one session; reports whether it was really removed.
 
-        2026-09-12（反馈轮 2）：删除结果如实回传（deleted / existed / error），
+        2026-09-12：删除结果如实回传（deleted / existed / error），
         供「清空全部 / 清除记忆」等路径如实记账，不再无条件默认成功。
         """
         self.stop_task(sid)
@@ -2640,6 +2765,7 @@ class WebUI:
             error = f"{type(exc).__name__}: {exc}"
         with self._lock:
             had_meta = self._session_meta.pop(sid, None) is not None
+        self._save_session_meta()
         return {"ok": True, "session_id": sid, "deleted": deleted,
                 "existed": bool(deleted or had_meta), "error": error}
 
@@ -2907,6 +3033,7 @@ class WebUI:
         with self._lock:
             meta = self._session_meta.setdefault(sid, {})
             meta["title"] = title
+        self._save_session_meta()
         persisted = False
         try:
             sm = self._session_manager()
@@ -2928,6 +3055,7 @@ class WebUI:
         with self._lock:
             meta = self._session_meta.setdefault(sid, {})
             meta["pinned"] = pinned
+        self._save_session_meta()
         persisted = False
         try:
             sm = self._session_manager()
@@ -2943,6 +3071,90 @@ class WebUI:
         with self._lock:
             meta = self._session_meta.setdefault(sid, {})
             meta["workspace"] = workspace
+        self._save_session_meta()
+
+    # ── per-session meta persistence (2026-09-14) ─────────
+    # 每会话元数据（工作区 / 标题 / 置顶）此前只存在内存字典 self._session_meta 里，
+    # 引擎重启即清零，会话工作区随之静默回退全局 project_root。以下把 meta 落盘并
+    # 在启动时读回，修复「重启后每会话工作区丢失」的缺陷。
+
+    def _session_meta_file(self) -> str:
+        """会话元数据文件：与 webui 配置同目录。
+
+        未配置磁盘路径（``config_path=""``，嵌入式 / 无持久化场景）时返回空串，
+        调用方据此跳过读写——与 ``_save_config_to_disk`` 口径一致：**没有配置路径
+        就不落盘**。绝不能悄悄写进用户家目录，也不该给会话操作平白增加磁盘延迟
+        （曾因此让自动标题的竞态必输）。
+        """
+        cfg_path = str(getattr(self, "_config_path", "") or "").strip()
+        if not cfg_path:
+            return ""
+        return os.path.join(os.path.dirname(os.path.abspath(cfg_path)),
+                            "sessions_meta.json")
+
+    def _save_session_meta(self) -> None:
+        """原子落盘会话元数据（尽力而为：失败只记录，绝不拖垮请求）。"""
+        path = self._session_meta_file()
+        if not path:
+            return          # 未配置磁盘路径：不落盘（内存态照常工作）
+        try:
+            with self._lock:
+                sessions = {k: dict(v) for k, v in self._session_meta.items()
+                            if isinstance(v, dict)}
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            payload = {"format": "norpagent-sessions-meta/1",
+                       "updated_at": time.time(), "sessions": sessions}
+            tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001 — 元数据落盘失败不影响会话功能
+            _logger.debug("session meta save skipped", exc_info=True)
+
+    def _load_session_meta(self) -> None:
+        """启动时读回会话元数据；随后修补「meta 丢失但会话目录仍在」的历史会话。"""
+        path = self._session_meta_file()
+        if not path:
+            self._heal_session_workspaces()
+            return
+        data = None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            data = None
+        except Exception:  # noqa: BLE001 — 文件损坏不阻塞启动
+            _logger.debug("session meta load skipped", exc_info=True)
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("sessions"), dict):
+            for sid, meta in data["sessions"].items():
+                if isinstance(meta, dict):
+                    self._session_meta[str(sid)] = dict(meta)
+        self._heal_session_workspaces()
+
+    def _heal_session_workspaces(self) -> None:
+        """修补历史会话：会话存在、但 meta 完全缺失时，若其默认会话目录仍在，
+        回填为该目录——否则会静默回退全局工作区（即本次修复的缺陷现象）。"""
+        try:
+            root = str(self._config.get("project_root") or "").strip()
+            if not root:
+                return
+            sm = self._session_manager()
+            sessions = sm.list_sessions()
+        except Exception:  # noqa: BLE001 — 运行态未绑定时跳过
+            return
+        changed = False
+        with self._lock:
+            for sess in sessions:
+                sid = str(getattr(sess, "id", "") or "")
+                if not sid or sid in self._session_meta:
+                    continue
+                candidate = os.path.join(root, "sessions", sid)
+                if os.path.isdir(candidate):
+                    self._session_meta[sid] = {"workspace": candidate}
+                    changed = True
+        if changed:
+            self._save_session_meta()
 
     def truncate_session(self, sid: str, keep: int) -> Dict[str, Any]:
         """Rewind a session to its first ``keep`` messages (regenerate / edit a turn).
@@ -3732,8 +3944,8 @@ class WebUI:
             "norp_safe_enabled": cfg.get("norp_safe_enabled", True),
             "security_enabled": cfg.get("security_enabled", True),
             "plugins_enabled": cfg.get("plugins_enabled", True),
-            "audit": cfg.get("plugin_security_audit", "block"),
-            "import_restrict": cfg.get("plugin_security_import_restrict", "strict"),
+            "audit": cfg.get("plugin_security_audit", "warn"),
+            "import_restrict": cfg.get("plugin_security_import_restrict", "soft"),
             "require_permissions": cfg.get("plugin_security_require_permissions", True),
             "resource_limit": cfg.get("plugin_security_resource_limit", False),
             "signature_verify": cfg.get("plugin_signature_verify", True),
@@ -3851,7 +4063,7 @@ class WebUI:
             "tasks_total": len(self._tasks),
         }
 
-    # ── 进化面板数据面（R-005 勾选制 / R-010 导出 / R-012 导入） ──
+    # ── 进化面板数据面（勾选制 导出 导入） ──
     # 进化底座（norpagent.evolution）为可选能力：不可用时面板如实降级为空。
 
     def evolution_points(self) -> Dict[str, Any]:
@@ -3871,7 +4083,7 @@ class WebUI:
                     "points": []}
 
     def evolution_log(self, n: int = 50) -> Dict[str, Any]:
-        """进化日志尾部（热重载 / 进化包导入记录，R-004 / R-012）。"""
+        """进化日志尾部（热重载 / 进化包导入记录）。"""
         try:
             from norpagent.evolution import read_log
 
@@ -4027,8 +4239,8 @@ class WebUI:
     def evolution_export(self, kind: str = "settings", author: str = ""):
         """导出（返回 (bytes, filename, mime)）。
 
-        - kind="fspack"：进化状态打包为 .fspack（含作者署名；R-010）；
-        - kind="settings"（默认）：设置事实源 JSON 快照（R-017）。
+        - kind="fspack"：进化状态打包为 .fspack（含作者署名）；
+        - kind="settings"（默认 设置事实源 JSON 快照。
         """
         import json as _json
 
@@ -4054,7 +4266,7 @@ class WebUI:
         return body, "farstars-settings.json", "application/json"
 
     def evolution_import(self, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """导入进化包（.fspack/.json/.py）或整合包（.zip）（R-010 / R-012）。
+        """导入进化包（.fspack/.json/.py）或整合包（.zip）。
 
         失败项不阻塞其余（整合包逐条语义）；失败逻辑完全不使用并如实报错。
         """
@@ -4078,7 +4290,7 @@ class WebUI:
             if isinstance(item, dict) and isinstance(item.get("settings"), dict):
                 # 快照导入是「用户导入」行为（非进化器自写）：actor 不以
                 # "evolution" 开头，因此不受「进化器写锁定/非可进化项拒绝」
-                # 守卫限制（R-005/§7.6 守卫只拦进化器自身的写入；用户经面板
+                # 守卫限制（/§7.6 守卫只拦进化器自身的写入；用户经面板
                 # / CLI / 导入恢复快照属用户级操作，入审计）。
                 store.set_many(item["settings"], actor="settings-import",
                                reason=f"import {name}")
@@ -4900,9 +5112,9 @@ class WebUI:
             self._flow_ws = ModuleWorkspace(
                 module_dir or default_modules_dir(),
                 config={
-                    "plugin_security_audit": cfg.get("plugin_security_audit", "block"),
+                    "plugin_security_audit": cfg.get("plugin_security_audit", "warn"),
                     "plugin_security_import_restrict":
-                        cfg.get("plugin_security_import_restrict", "strict"),
+                        cfg.get("plugin_security_import_restrict", "soft"),
                     "plugin_security_require_permissions":
                         cfg.get("plugin_security_require_permissions", True),
                     "plugin_signature_verify":

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 xingluosama121, MIT Licensed
-"""norpagent.evolution.points — 可进化点注册表 + 逐项勾选审批制（R-005）。
+"""norpagent.evolution.points — 可进化点注册表 + 逐项勾选审批制。
 
 架构书 §7.5（2026-09-09 裁决）：
 - 设置面板对**每一个可能存在自进化的项目**提供手动勾选：
@@ -253,22 +253,22 @@ def register_evolution_schema(store: Optional[SettingsStore] = None) -> int:
         {
             "key": "evolution.enabled", "title": "Self-evolution master switch",
             "category": "evolution", "evolvable": False, "default": True,
-            "description": "R-005/R-011: master switch; when off, all evolvers stop",
+            "description": ": master switch; when off, all evolvers stop",
         },
         {
             "key": "evolution.idle_policy", "title": "Idle-time evolution policy",
             "category": "evolution", "evolvable": False, "default": "reduced",
-            "description": "R-011: reduced = reduce or skip on idle; off = no evolution; auto = keep",
+            "description": "reduced = reduce or skip on idle; off = no evolution; auto = keep",
         },
         {
             "key": "evolution.idle_min_seconds", "title": "Idle threshold (seconds)",
             "category": "evolution", "evolvable": False, "default": 600,
-            "description": "R-011: no demand for this duration counts as idle",
+            "description": "no demand for this duration counts as idle",
         },
         {
             "key": "evolution.candidate_threshold", "title": "Evolution candidate trigger count",
             "category": "evolution", "evolvable": False, "default": 3,
-            "description": "R-011: frequently used features (>=3 times) become evolution candidates",
+            "description": "frequently used features (>=3 times) become evolution candidates",
         },
     ]
     for point in EVOLUTION_POINTS:
@@ -278,7 +278,7 @@ def register_evolution_schema(store: Optional[SettingsStore] = None) -> int:
             "category": "evolution.approval",
             "evolvable": False,
             "default": point.default_manual,
-            "description": "checked = manual approval; unchecked = auto approval (R-005)",
+            "description": "checked = manual approval; unchecked = auto approval ",
         })
         specs.append({
             "key": _category_key(point.id),
@@ -286,7 +286,7 @@ def register_evolution_schema(store: Optional[SettingsStore] = None) -> int:
             "category": "evolution.approval",
             "evolvable": False,
             "default": point.category,
-            "description": "The major/normal classification policy is itself configurable (R-005)",
+            "description": "The major/normal classification policy is itself configurable ",
         })
     return s.register_schema(specs)
 

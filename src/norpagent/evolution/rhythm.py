@@ -1,5 +1,5 @@
 # Copyright (c) 2026 xingluosama121, MIT Licensed
-"""norpagent.evolution.rhythm — 进化节奏与方向（R-011，2026-09-09 裁决）。
+"""norpagent.evolution.rhythm — 进化节奏与方向。
 
 - 无需求闲时**减少或不进化**：``IdlePlanner`` 按闲时时长 + 策略档决定是否
   进入进化环（``reduced`` 减少 / ``off`` 停 / ``auto`` 维持）；
@@ -20,7 +20,7 @@ DEFAULT_CANDIDATE_THRESHOLD = 3
 
 
 class UsageTracker:
-    """功能使用计数（R-011：≥3 次进入进化候选；阈值本身可设置）。"""
+    """功能使用计数（≥3 次进入进化候选；阈值本身可设置）。"""
 
     def __init__(self, store: Optional[Any] = None) -> None:
         self.store = store or get_store()
@@ -67,7 +67,7 @@ class UsageTracker:
 
 
 class IdlePlanner:
-    """闲时进化策略（R-011：无需求闲时减少或不进化）。"""
+    """闲时进化策略（无需求闲时减少或不进化）。"""
 
     def __init__(self, store: Optional[Any] = None) -> None:
         self.store = store or get_store()
@@ -119,10 +119,10 @@ class IdlePlanner:
 
 def command_evolution(command: str,
                       actor: str = "user") -> Dict[str, Any]:
-    """命令式进化通道（R-011：用户可直接下达命令进化）。
+    """命令式进化通道（用户可直接下达命令进化）。
 
     记录命令并返回受理记录；命令式提案不依赖使用计数与闲时策略
-    （优先级最高，执行仍走 R-004 热重载 + R-005 勾选审批）。
+    （优先级最高，执行仍走 热重载 + 勾选审批）。
     """
     command = str(command or "").strip()
     if not command:

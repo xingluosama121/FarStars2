@@ -42,7 +42,7 @@
 
 - 每层 ``level``（0~63）与 ``count``（个数；level 0 必须为 1）；
 - 端口：``port``（count=1）/ ``ports``（长度=count）/ ``base_port`` 三选一；
-  不写死默认端口（R-025：端口必须显式配置）；
+  不写死默认端口（端口必须显式配置）；
 - 低层 ``parent``：父节点端口号（整型或数字串）、父节点 id、或 ``"level:N"``
   （挂到第 N 层节点，按定义顺序轮转）。
 
@@ -57,7 +57,7 @@
 - 多进程（spawn）：每个节点经 ``norpagent cortex/node`` 子进程启动；
   ``engine:true`` 节点携带完整内核引擎（等价 CLI 默认），否则 ``--bare``。
 
-运行中的错误语义（反馈轮定稿）：定义错误显式报错；``np()`` 启动路径上
+运行中的错误语义：定义错误显式报错；``np()`` 启动路径上
 CNB 参数错误不阻塞主线程启动——宿主照常运行、神经树不加载、错误可查。
 """
 
@@ -300,7 +300,7 @@ def _validate_block(index: int, block: Any, problems: List[str]) -> List[Dict[st
     if not port_keys:
         problems.append(
             f"{where}: 缺少端口配置（port / ports / base_port 三选一，"
-            f"必须显式配置；R-025：端口不写死）")
+            f"必须显式配置；端口不写死）")
     elif len(port_keys) > 1:
         problems.append(
             f"{where}: 端口配置方式只能三选一，当前同时给出 {port_keys}")

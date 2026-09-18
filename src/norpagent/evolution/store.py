@@ -1,7 +1,7 @@
 # Copyright (c) 2026 xingluosama121, MIT Licensed
 """norpagent.evolution.store — settings store（设置事实源）+ 进化日志底座。
 
-架构书 §5.3（O4 已批准）：SQLite 存储（审计友好）+ JSON 导出/导入。
+SQLite 存储（审计友好）+ JSON 导出/导入。
 本模块是远星「全内核唯一设置读入口」的第一块落地：
 
 - ``SettingsStore``：schema 注册（可进化 / 锁定标记是 schema 一等字段）+
@@ -9,10 +9,10 @@
 - 分层继承（2026-09-12，§5.3）：全局 > 档案（成品/预设）> 会话/任务 > 临时
   四层作用域（``set_scoped`` / ``resolve`` / ``layers``）——「不填 = 用上级」，
   每项设置三态（默认值 / 继承值含来源 / 显式值含时间与行为者）可查；
-- 进化器写锁定项 = 内核拒绝 + 审计告警（R-005 / 架构书 §7.6：「可进化标记」
+- 进化器写锁定项 = 内核拒绝 + 审计告警（ / 架构书 §7.6：「可进化标记」
   与「锁定标记」为 schema 一等字段）；
 - ``append_log`` / ``read_log``：进化包与热重载共享的 JSONL 进化日志
-  （R-012：导入失败的逻辑完全不使用并如实记入日志）。
+  （导入失败的逻辑完全不使用并如实记入日志）。
 
 零第三方依赖（标准库 sqlite3 / json）。路径可用环境变量覆盖（测试隔离）：
     NORPAGENT_SETTINGS_DB   设置库路径（默认 ~/.norpagent/settings.db）

@@ -1,9 +1,9 @@
 # Copyright (c) 2026 xingluosama121, MIT Licensed
-"""norpagent.evolution.packages — 进化包（.fspack）与整合包（.zip）（R-010 / R-012）。
+"""norpagent.evolution.packages — 进化包（.fspack）与整合包（.zip）。
 
-R-010：进化成果以 ``.fspack`` 为后缀；**同时兼容读取 json 和 py 后缀**；
+进化成果以 ``.fspack`` 为后缀；**同时兼容读取 json 和 py 后缀**；
 可前端导出、分享、作者署名。
-R-012：多个进化包可打为一个整合包（``.zip``）；单整合包最大 **1024 个**
+多个进化包可打为一个整合包（``.zip``）；单整合包最大 **1024 个**
 进化包；整批/多包同时导入：任一失败**不阻塞**其余，计入进化包日志，
 仅生效导入成功的进化包；导入失败的逻辑**完全不使用**并如实报错、记入日志。
 
@@ -78,7 +78,7 @@ def write_fspack(payload: Dict[str, Any], path: str) -> str:
 
 def export_fspack(item: Dict[str, Any], path: str, author: str = "",
                   meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """导出进化包（R-010：三后缀皆可写；含作者署名元数据）。"""
+    """导出进化包（三后缀皆可写；含作者署名元数据）。"""
     payload = build_fspack(item, author=author, meta=meta)
     write_fspack(payload, path)
     append_log({"event": "fspack.export", "path": path, "author": payload["author"],
@@ -161,7 +161,7 @@ def export_bundle(entries: List[Tuple[str, str]],
                   zip_path: str) -> Dict[str, Any]:
     """打整合包：entries = [(entry_name, fspack_path), ...]。
 
-    超过 1024 个直接拒绝并提示（R-012）；返回整合包摘要。
+    超过 1024 个直接拒绝并提示；返回整合包摘要。
     """
     if len(entries) > MAX_BUNDLE_ENTRIES:
         raise PackageError(
@@ -183,7 +183,7 @@ def export_bundle(entries: List[Tuple[str, str]],
 def import_bundle(zip_path: str,
                   apply_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
                   actor: str = "user") -> Dict[str, Any]:
-    """整批导入整合包（R-012）：
+    """整批导入整合包：
 
     - 超 1024 个条目：整体拒绝并提示（不部分导入）；
     - 任一失败不阻塞其余：逐条校验 + 应用 + 日志；

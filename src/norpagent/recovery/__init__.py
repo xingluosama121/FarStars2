@@ -65,7 +65,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from norpagent.recovery import capture, store
 
-__version__ = "2.2.2"
+__version__ = "2.2.4"
 
 # 品牌（v2.0.0 起正式宣传名）：远星 / FarStars——norpagent 调用方式与内核
 # 名称不变，FarStars 仅作品牌冠名（import / PyPI 包名保持 norpagent）。

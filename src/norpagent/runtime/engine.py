@@ -554,8 +554,8 @@ class NorpEngine:
         on a background thread: startup is never delayed, and network/port
         failures degrade to a plain single instance (warning printed).
 
-        R-023：默认不携带 CNB；显式配置（``np(cnb=...)``）或 env 才启用。
-        R-025 / 2026-09-12 反馈轮（错误语义定稿）：配置错误（含缺端口、
+        默认不携带 CNB；显式配置（``np(cnb=...)``）或 env 才启用。
+         / 2026-09-12 反馈轮（错误语义定稿 配置错误（含缺端口、
         缺节点标识、神经树定义缺必要参数）显式报错但**不阻塞主线程启动**——
         宿主照常启动、神经树不加载；错误经 ``engine.cnb_error`` 可查、
         ``engine.cnb_status`` 显示为 ``config-error``。request_stop() unmounts.

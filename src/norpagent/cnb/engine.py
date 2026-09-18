@@ -74,8 +74,8 @@ DEFAULT_HEARTBEAT = 5.0
 class CnbConfigError(RuntimeError):
     """CNB 显式启用但配置不完整（缺端口 / 缺节点标识 / 非法字段）。
 
-    R-025（2026-09-09 裁决）：启用 CNB 时端口号必须手动配置，不写死默认；
-    没有配置端口号直接抛错并给出明确信息。R-023（2026-09-09 裁决）：
+    启用 CNB 时端口号必须手动配置，不写死默认；
+    没有配置端口号直接抛错并给出明确信息。
     默认启动不携带 CNB，显式传入 {"cnb": True} 等配置才启用。
     """
 
@@ -138,8 +138,8 @@ def _env_float(name: str, default: float, floor: float, ceiling: float) -> float
 def read_env_config(strict: bool = False) -> Dict[str, Any]:
     """Read the NORP_CNB_* env config (the single source of truth for auto-mount).
 
-    R-023：默认不携带 CNB——只有显式配置（NORP_CNB_NODE + 必要的端口）才启用。
-    R-025：端口号不写死（``port_configured`` 标记是否手动配置）；``strict=True``
+    默认不携带 CNB——只有显式配置（NORP_CNB_NODE + 必要的端口）才启用。
+    端口号不写死（``port_configured`` 标记是否手动配置）；``strict=True``
     时启用但缺端口立即抛 :class:`CnbConfigError`。
     2026-09-12 反馈轮：``NORP_CNB_TREE`` 显式给出神经树定义时，端口/节点标识
     由定义携带（必要参数由树定义校验把关），同样视为显式启用通道。
@@ -152,7 +152,7 @@ def read_env_config(strict: bool = False) -> Dict[str, Any]:
     if strict and enabled and not port_configured and not tree_raw:
         raise CnbConfigError(
             "CNB is enabled (NORP_CNB_NODE is set) but no node port is "
-            "configured: set NORP_CNB_PORT explicitly. R-025: the node port "
+            "configured: set NORP_CNB_PORT explicitly. the node port "
             "is never hardcoded; a missing port raises immediately.")
     return {
         "enabled": enabled,
@@ -181,7 +181,7 @@ def apply_explicit_config(cfg: Dict[str, Any],
       键：cnb / enabled / node_id / id / kind / level / parent / port /
       heartbeat / desc / managed。未知键如实报错（CnbConfigError）。
     ``port`` 一旦以显式配置给出即视为「手动配置端口」；端口缺省（env 与
-    显式配置都没有）在启用时由 setup_cnb 抛 CnbConfigError（R-025）。
+    显式配置都没有）在启用时由 setup_cnb 抛 CnbConfigError。
     """
     if explicit is None:
         return dict(cfg)
@@ -258,7 +258,7 @@ def apply_explicit_config(cfg: Dict[str, Any],
 
 
 def validate_cnb_config(explicit: Any = None) -> Dict[str, Any]:
-    """启动前预校验（R-023 / R-025）：返回生效配置；非法配置直接抛错。
+    """启动前预校验：返回生效配置；非法配置直接抛错。
 
     - 默认（无 env、无显式配置）：返回 enabled=False —— 零进程零端口；
     - managed 模式：直接通过（上层自行装配节点，见 NORP_CNB_MANAGED）；
@@ -281,7 +281,7 @@ def validate_cnb_config(explicit: Any = None) -> Dict[str, Any]:
             "CNB is enabled but no node port is configured: the port is never "
             "hardcoded and must be set manually. Set NORP_CNB_PORT, or pass "
             "cnb={\"cnb\": True, \"port\": <1-65535>, ...} at startup. "
-            "(R-025: a missing port raises immediately)")
+            "(a missing port raises immediately)")
     if not str(cfg.get("node_id") or "").strip():
         raise CnbConfigError(
             "CNB is enabled but no node id is configured: set NORP_CNB_NODE, "
@@ -339,7 +339,7 @@ class CnbAdapter:
         self.status = "mounting"  # mounting / mounted / failed / stopped
         self.error: Optional[str] = None
         self.perm_summary: Dict[str, Any] = {}
-        self.slot_mounted = False  # 完整实例模块是否已挂入节点槽位（R-024）
+        self.slot_mounted = False # 完整实例模块是否已挂入节点槽位
         self._lock = threading.Lock()
         self._stopped = threading.Event()
         self._mount_thread: Optional[threading.Thread] = None
@@ -375,7 +375,7 @@ class CnbAdapter:
                 node.register_action(action, handler)
         # 心跳携带内核深度状态
         node.set_heartbeat_provider(self._heartbeat_info)
-        # ── 通用槽位（R-024 修订，2026-09-11）：完整 norpagent 实例 = 标准模块 ──
+        # ── 通用槽位：完整 norpagent 实例 = 标准模块 ──
         # 把本适配器绑定的引擎实例包装为 NorpAgentModule，挂入节点默认槽位
         # "norpagent"。实例模块同时导出内核动作面（槽位二级路由面）：即便
         # 本适配器不做直接注册（手工装配场景），挂载后节点仍具备完整实例
@@ -401,7 +401,7 @@ class CnbAdapter:
         """心跳 provider：返回 (status, extra)。故障不静默——返回
         degraded + provider_error（中枢可见「状态源故障」，非无状态）。
 
-        携带项含通用槽位用量（R-024）：slots.count / slots.free，中枢
+        携带项含通用槽位用量：slots.count / slots.free，中枢
         可见各原子的槽位占用与空位。
         """
         try:
@@ -1103,9 +1103,9 @@ def _slots_summary(node: Optional[Any]) -> List[Dict[str, Any]]:
 def setup_cnb(engine: Any, explicit: Any = None) -> None:
     """Auto-mount hook called by NorpEngine.start() (runtime.engine._setup_cnb).
 
-    R-023：默认不携带 CNB——env（NORP_CNB_NODE）或显式配置（``np(cnb=...)``）
+    默认不携带 CNB——env（NORP_CNB_NODE）或显式配置（``np(cnb=...)``）
     未启用时本函数立即返回，零进程零端口。
-    R-025：启用但未手动配置端口 => 抛 :class:`CnbConfigError`（信息明确），
+    启用但未手动配置端口 => 抛:class:`CnbConfigError`（信息明确），
     不再静默退化到默认端口。
 
     2026-09-12 反馈轮（神经树显式定义）：显式配置携带 ``tree`` 时，按定义
@@ -1274,7 +1274,7 @@ def remount_cnb(engine: Any, spec: Any = None, *,
       改形（运行中手动改形态；``rebuild=true`` 强制整树重建），否则装配新树
       （inproc 整树 / spawn 多进程树，端口由定义携带）；
     - spec 为 True / "on" / 其它 dict：按显式配置装配并挂载单节点——
-        * 端口必须手动配置（R-025：缺端口 CnbConfigError 抛错，不静默退化）；
+        * 端口必须手动配置（缺端口 CnbConfigError 抛错，不静默退化）；
         * 已有挂载先卸载再挂新（替换语义）；挂载在后台线程完成，不阻塞调用；
     - wait>0：最多等待 wait 秒直到 mounted / failed（脚本与测试友好）。
 

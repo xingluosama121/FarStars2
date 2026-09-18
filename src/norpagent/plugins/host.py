@@ -139,10 +139,11 @@ class PluginHostProcess:
         if self._blocker is not None:
             self._blocker.unregister()
             self._blocker = None
-        if self._import_restrict in ("safe", "strict"):
+        if self._import_restrict in ("soft", "safe", "strict"):
             self._blocker = _ImportBlocker(
                 set(DANGEROUS_IMPORTS_FOR_BLOCK) | set(ALWAYS_BLOCKED),
                 strict=(self._import_restrict == "strict"),
+                warn_only=(self._import_restrict == "soft"),
             )
             self._blocker.register()
 

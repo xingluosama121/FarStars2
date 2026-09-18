@@ -208,12 +208,12 @@ from norpagent import farstars_app  # noqa: E402,F401
 #   - 前端 V2（暖阳版）：左列选项卡设置布局、每项悬停说明、总开关联动置灰、
 #     Reasoning Effort 增补 xhigh、工作区目录选择器、会话批量清除/清空、
 #     输入框内联模式/模型/工作区控制、三端共通 i18n（/assets/i18n.js · np_lang）。
-# v2.2.1（2026-09-12）缺陷收口（需求清单 R-032 / R-033）：
-#   - R-033 ask_user 工具：内置工具面补齐 ask_user——模型可通过工具调用主动向
+# v2.2.1缺陷收口：
+# - ask_user 工具：内置工具面补齐 ask_user——模型可通过工具调用主动向
 #     用户提问 / 澄清需求 / 确认危险操作（此前仅有 UI 适配器与内核审批链的内部
 #     机制，活跃工具集缺失该工具）；standard / ptc / longrun 预设与两个装配入口
 #     （install_defaults / install_core）均注册；
-#   - R-032 token 计数计入原始文本：端点未回传 usage 时，后端按「原始文本」
+# - token 计数计入原始文本：端点未回传 usage 时，后端按「原始文本」
 #     （raw markdown / LaTeX 源码 + 提示词）估算 input + output（此前只算渲染后
 #     的可见输出且缺 input，导致总 token 偏低）；估算值带 estimated 标记，前端
 #     以「≈」如实标注，端点回传 usage 时依旧以服务端数值为准。
@@ -233,7 +233,7 @@ from norpagent import farstars_app  # noqa: E402,F401
 #   - 前端修复：ask_user 模态 Enter 发送 + Markdown 渲染；思考过程块可自由滚动；
 #   - 索引存储合并：workspace_index.db / context_index.db 合并为 unified_index.py
 #     单库单连接 + 统一维护，workspace_index.py / context_index.py 降为兼容转发层。
-__version__ = "2.2.2"
+__version__ = "2.2.4"
 __brand_cn__ = "远星"
 __brand_en__ = "FarStars"
 __display_name__ = "FarStars（远星）· norpagent"

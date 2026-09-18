@@ -60,7 +60,7 @@ from .engine import (  # noqa: E402,F401
     read_env_config,
     KERNEL_ACTIONS,
 )
-# 神经树显式定义（2026-09-12 反馈轮）：不预设形状；启动时显式传入定义，
+# 神经树显式定义：不预设形状；启动时显式传入定义，
 # 三种来源（dict / JSON 文件 / PY 文件），严格校验缺必要参数，两种装配。
 from .tree import (  # noqa: E402,F401
     InProcTree,
@@ -76,7 +76,7 @@ from .tree import (  # noqa: E402,F401
 
 # v1.0.7 起 CNB 并入内核：版本跟随 norpagent（publish_pypi.ps1 校验一致）。
 # 与 norpagent/__init__.py 的 __version__ 保持同步。
-__version__ = "2.2.2"
+__version__ = "2.2.4"
 
 __all__ = [
     "__version__",

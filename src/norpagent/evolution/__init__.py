@@ -1,7 +1,7 @@
 # Copyright (c) 2026 xingluosama121, MIT Licensed
-"""norpagent.evolution — 自进化子系统（R-004 / R-005 / R-010 ~ R-012 / R-017）。
+"""norpagent.evolution — 自进化子系统。
 
-架构书 §7（自进化闭环）的工程落地，四类进化（2A 记忆 / 2B 技能 / 2C 配置 /
+的工程落地，四类进化（2A 记忆 / 2B 技能 / 2C 配置 /
 2D 代码）共享的底座：
 
     store.py     设置事实源（SQLite + JSON 导入导出；可进化/锁定一等字段）；

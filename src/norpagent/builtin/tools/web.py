@@ -16,12 +16,14 @@ gives better fetch and parse quality.
 from __future__ import annotations
 
 import ipaddress
+import json
+import os
 import re
 import socket
 import time
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 from norpagent.protocols.tool import Tool, ToolResult
 
@@ -105,6 +107,15 @@ _TEXT_TYPES = (
 #    repeated searches stay responsive instead of re-probing a dead engine.
 _ENGINE_COOLDOWN: Dict[str, float] = {}
 _ENGINE_COOLDOWN_SECONDS = 180.0
+
+# ── 可选搜索引擎 + 翻页上限（2026-09-14）─────────────────────
+# 内置引擎：auto（默认：DDG → Bing 链）/ duckduckgo / bing / baidu / custom（自定义端点）。
+# 默认引擎可被环境变量 NORPAGENT_WEB_SEARCH_ENGINE 覆盖。
+_BUILTIN_ENGINES = ("auto", "duckduckgo", "bing", "baidu", "custom")
+_ENGINE_LABELS = {"duckduckgo": "DuckDuckGo", "bing": "Bing", "baidu": "Baidu"}
+_MAX_RESULTS_CAP = 50      # max_results 上限
+_PAGE_TARGET = 10          # 单页目标条数（各引擎每页实际 10~30 条）
+_MAX_PAGES = 8             # 翻页上限（防止无限抓取）
 
 
 def _engine_on_cooldown(name: str) -> bool:
@@ -613,16 +624,34 @@ class WebSearchTool:
                 "name": self.name,
                 "description": (
                     "Searches the web for keywords and returns result titles, links and snippets. "
-                    "Uses DuckDuckGo by default (free, no API key); automatically falls back to Bing "
-                    "when DuckDuckGo is unreachable. Suitable for looking up the latest material, "
-                    "API docs, error messages, etc."
+                    "Engine is selectable: auto (default; DuckDuckGo then Bing fallback), duckduckgo, "
+                    "bing, baidu, or custom (your own search endpoint, JSON API or HTML page). "
+                    "Up to 50 results (automatic pagination). Suitable for looking up the latest "
+                    "material, API docs, error messages, etc."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "Search keywords or a question"},
-                        "max_results": {"type": "integer", "description": "Max results to return (default 5, max 10)"},
+                        "max_results": {"type": "integer", "description": "Max results to return (default 5, range 1-50; paginated automatically)"},
                         "timeout": {"type": "integer", "description": "Request timeout in seconds (default 15, range 5-60)"},
+                        "engine": {
+                            "type": "string",
+                            "enum": list(_BUILTIN_ENGINES),
+                            "description": "Search engine: auto (default) / duckduckgo / bing / baidu / custom",
+                        },
+                        "engine_url": {"type": "string", "description": "custom only: URL template, e.g. https://api.example.com/search?q={query}&offset={offset} (placeholders: {query} URL-encoded, {offset}, {page}, {count})"},
+                        "engine_name": {"type": "string", "description": "custom only: display name for the engine"},
+                        "engine_type": {"type": "string", "enum": ["json", "html"], "description": "custom only: response kind (default json)"},
+                        "engine_results_path": {"type": "string", "description": "custom+json: dot path to the results array, e.g. web.results or data.items"},
+                        "engine_title_field": {"type": "string", "description": "custom+json: field name/path for the title (default title)"},
+                        "engine_url_field": {"type": "string", "description": "custom+json: field name/path for the link (default url)"},
+                        "engine_snippet_field": {"type": "string", "description": "custom+json: field name/path for the snippet (default snippet)"},
+                        "engine_headers": {"type": "object", "description": "custom only: extra HTTP headers (e.g. API key)"},
+                        "engine_result_selector": {"type": "string", "description": "custom+html: CSS selector for each result block"},
+                        "engine_title_selector": {"type": "string", "description": "custom+html: CSS selector for the title (inside a result block)"},
+                        "engine_link_selector": {"type": "string", "description": "custom+html: CSS selector for the link"},
+                        "engine_snippet_selector": {"type": "string", "description": "custom+html: CSS selector for the snippet"},
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -634,20 +663,51 @@ class WebSearchTool:
         query = str(args.get("query") or "").strip()
         if not query:
             return ToolResult(output="Please provide search keywords.", success=False, error="missing_query")
-        max_results = max(1, min(int(args.get("max_results") or 5), 10))
+        engine = str(args.get("engine")
+                     or os.environ.get("NORPAGENT_WEB_SEARCH_ENGINE")
+                     or "auto").strip().lower()
+        if engine not in _BUILTIN_ENGINES:
+            return ToolResult(
+                output=("unknown engine: %r; choose one of %s"
+                        % (engine, ", ".join(_BUILTIN_ENGINES))),
+                success=False, error="bad_engine")
+        max_results = max(1, min(int(args.get("max_results") or 5), _MAX_RESULTS_CAP))
         timeout = max(5, min(int(args.get("timeout") or 15), 60))
 
-        results, engine = self._search_chain(query, timeout)
+        if engine == "custom":
+            cfg = self._custom_config(args)
+            if not cfg["url"]:
+                return ToolResult(
+                    output=("custom engine requires 'engine_url' (a URL template containing "
+                            "{query}); see the tool schema for optional JSON/HTML mapping."),
+                    success=False, error="missing_engine_url")
+            results = self._collect_pages(
+                lambda off, t: self._custom_page(cfg, query, off, t),
+                max_results, timeout)
+            engine_label = "custom (%s)" % cfg["name"]
+        elif engine == "auto":
+            # 保持既有 auto 链语义（DDG 优先、Bing 兜底、引擎冷却），仅在需要更多结果时翻页
+            results, engine_label = self._search_chain(query, timeout)
+            if results and len(results) < max_results:
+                results, engine_label = self._paginate_auto(
+                    query, results, engine_label, max_results, timeout)
+        else:
+            results = self._collect_pages(
+                lambda off, t: self._builtin_page(engine, query, off, t),
+                max_results, timeout)
+            engine_label = _ENGINE_LABELS.get(engine, engine)
+
         if not results:
             return ToolResult(
-                output=("search failed: no results returned (DuckDuckGo and Bing were both "
-                        "unreachable or empty). Retry later or try different keywords."),
+                output=("search failed: no results returned (%s). "
+                        "Retry later, pick another engine, or try different keywords."
+                        % engine_label),
                 success=False,
                 error="no_results",
             )
 
         lines = ["[search results]", "", f"keywords: {query}",
-                 f"engine: {engine}", f"results: {len(results)}", ""]
+                 f"engine: {engine_label}", f"results: {len(results)}", ""]
         for i, (title, href, snippet) in enumerate(results[:max_results], 1):
             lines.append(f"{i}. {title}")
             lines.append(f"   {href}")
@@ -818,6 +878,343 @@ class WebSearchTool:
                 snippet = " ".join(unescape(re.sub(r"<[^>]+>", " ", sm.group(1))).split())
             results.append((title or href, href, snippet[:300]))
         return results
+
+    # ── 引擎选择 / 翻页 / 自定义引擎（2026-09-14）──────────────
+
+    @staticmethod
+    def _norm_url(url: str) -> str:
+        """去重键：忽略 scheme / www / 末尾斜杠 / fragment。"""
+        try:
+            p = urlparse(str(url))
+            host = (p.netloc or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            path = (p.path or "").rstrip("/")
+            return (host + path + "?" + p.query) if p.query else (host + path)
+        except Exception:  # noqa: BLE001
+            return str(url)
+
+    def _collect_pages(self, fetch_page, target: int, timeout: int,
+                       max_pages: int = _MAX_PAGES) -> List[Tuple[str, str, str]]:
+        """按页抓取并按 URL 去重，直到凑够 target 条或该引擎不再有新结果。"""
+        out: List[Tuple[str, str, str]] = []
+        seen = set()
+        offset = 0
+        for _ in range(max(1, int(max_pages))):
+            if len(out) >= target:
+                break
+            try:
+                page = fetch_page(offset, timeout)
+            except Exception:  # noqa: BLE001 — 单页失败不放弃整体
+                break
+            if not page:
+                break
+            fresh = 0
+            for title, href, snippet in page:
+                key = self._norm_url(href)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append((title, href, snippet))
+                fresh += 1
+            if fresh == 0:
+                break
+            offset += len(page)
+        return out
+
+    def _paginate_auto(self, query: str,
+                       first: List[Tuple[str, str, str]], label: str,
+                       target: int, timeout: int) -> Tuple[List[Tuple[str, str, str]], str]:
+        """auto 模式翻页：沿用首个成功引擎继续取后续页。"""
+        if "DuckDuckGo" in label:
+            fetch_page = self._ddg_page
+        elif "Bing" in label:
+            fetch_page = self._bing_page
+        else:
+            return first, label
+        out = list(first)
+        seen = {self._norm_url(u) for _, u, _ in out}
+        offset = len(out)
+        for _ in range(_MAX_PAGES):
+            if len(out) >= target:
+                break
+            try:
+                page = fetch_page(query, offset, timeout)
+            except Exception:  # noqa: BLE001
+                break
+            if not page:
+                break
+            fresh = 0
+            for title, href, snippet in page:
+                key = self._norm_url(href)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append((title, href, snippet))
+                fresh += 1
+            if fresh == 0:
+                break
+            offset += len(page)
+        return out, label
+
+    def _builtin_page(self, engine: str, query: str, offset: int,
+                      timeout: int) -> List[Tuple[str, str, str]]:
+        """内置引擎的分页取数（offset 为已取条数）。"""
+        if engine == "duckduckgo":
+            return self._ddg_page(query, offset, timeout)
+        if engine == "bing":
+            return self._bing_page(query, offset, timeout)
+        if engine == "baidu":
+            return self._baidu_page(query, offset, timeout)
+        return []
+
+    # -- DuckDuckGo（分页：表单参数 s / dc）--
+
+    def _ddg_page(self, query: str, offset: int,
+                  timeout: int) -> List[Tuple[str, str, str]]:
+        endpoint = self._ENDPOINT
+        blocked, _ = is_private_url(endpoint)
+        if blocked:
+            return []
+        form = {"q": query, "s": str(offset), "dc": str(offset + 1)}
+        try:
+            if _requests_available():
+                import requests
+                resp = requests.post(
+                    endpoint, data=form,
+                    headers={"User-Agent": _USER_AGENT,
+                             "Accept-Language": "en-US,en;q=0.9,zh;q=0.8"},
+                    timeout=timeout, allow_redirects=True)
+                if resp.status_code != 200:
+                    return []
+                return self._parse_results(resp.text)
+            from urllib.parse import urlencode
+            from urllib.request import Request, urlopen
+            req = Request(endpoint, data=urlencode(form).encode("utf-8"),
+                          headers={"User-Agent": _USER_AGENT,
+                                   "Content-Type": "application/x-www-form-urlencoded",
+                                   "Accept-Language": "en-US,en;q=0.9,zh;q=0.8"})
+            resp = urlopen(req, timeout=timeout)
+            return self._parse_results(
+                resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            return []
+
+    # -- Bing（分页：first=offset+1）--
+
+    def _bing_page(self, query: str, offset: int,
+                   timeout: int) -> List[Tuple[str, str, str]]:
+        endpoints = self._BING_ENDPOINTS
+        last: List[Tuple[str, str, str]] = []
+        for endpoint in endpoints:
+            blocked, _ = is_private_url(endpoint)
+            if blocked:
+                continue
+            params = {"q": query, "first": str(offset + 1)}
+            try:
+                if _requests_available():
+                    import requests
+                    resp = requests.get(
+                        endpoint, params=params,
+                        headers={"User-Agent": _USER_AGENT,
+                                 "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8"},
+                        timeout=timeout, allow_redirects=True)
+                    if resp.status_code == 200:
+                        last = self._parse_bing(resp.text)
+                else:
+                    from urllib.parse import urlencode
+                    from urllib.request import Request, urlopen
+                    req = Request(endpoint + "?" + urlencode(params),
+                                  headers={"User-Agent": _USER_AGENT,
+                                           "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8"})
+                    resp = urlopen(req, timeout=timeout)
+                    last = self._parse_bing(
+                        resp.read(3 * 1024 * 1024).decode("utf-8", errors="replace"))
+            except Exception:  # noqa: BLE001
+                last = []
+            if last:
+                return last
+        return last
+
+    # -- Baidu（分页：pn=offset）--
+
+    def _baidu_page(self, query: str, offset: int,
+                    timeout: int) -> List[Tuple[str, str, str]]:
+        endpoint = "https://www.baidu.com/s"
+        blocked, _ = is_private_url(endpoint)
+        if blocked:
+            return []
+        params = {"wd": query, "pn": str(offset)}
+        try:
+            if _requests_available():
+                import requests
+                resp = requests.get(
+                    endpoint, params=params,
+                    headers={"User-Agent": _USER_AGENT,
+                             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+                    timeout=timeout, allow_redirects=True)
+                if resp.status_code != 200:
+                    return []
+                return self._parse_baidu(resp.text)
+            from urllib.parse import urlencode
+            from urllib.request import Request, urlopen
+            req = Request(endpoint + "?" + urlencode(params),
+                          headers={"User-Agent": _USER_AGENT,
+                                   "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
+            resp = urlopen(req, timeout=timeout)
+            return self._parse_baidu(
+                resp.read(3 * 1024 * 1024).decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _parse_baidu(self, html: str) -> List[Tuple[str, str, str]]:
+        results: List[Tuple[str, str, str]] = []
+        for block in re.findall(r'<div[^>]+class="result[^"]*".*?(?=<div[^>]+class="result|<div id="page)',
+                                html, re.S | re.I):
+            m = re.search(r'<h3[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                          block, re.S | re.I)
+            if not m:
+                continue
+            href = unescape(m.group(1)).strip()
+            title = " ".join(unescape(re.sub(r"<[^>]+>", " ", m.group(2))).split())
+            if not href.startswith(("http://", "https://")):
+                continue
+            snippet = ""
+            sm = re.search(r'class="content-right[^"]*"[^>]*>(.*?)</span>', block, re.S | re.I)
+            if sm:
+                snippet = " ".join(unescape(re.sub(r"<[^>]+>", " ", sm.group(1))).split())
+            results.append((title or href, href, snippet[:300]))
+        return results
+
+    # -- 自定义引擎 --
+
+    def _custom_config(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        headers = args.get("engine_headers")
+        return {
+            "name": str(args.get("engine_name") or "custom"),
+            "url": str(args.get("engine_url") or "").strip(),
+            "type": str(args.get("engine_type") or "json").strip().lower(),
+            "results_path": str(args.get("engine_results_path") or "").strip(),
+            "title_field": str(args.get("engine_title_field") or "title").strip(),
+            "url_field": str(args.get("engine_url_field") or "url").strip(),
+            "snippet_field": str(args.get("engine_snippet_field") or "snippet").strip(),
+            "headers": headers if isinstance(headers, dict) else {},
+            "result_selector": str(args.get("engine_result_selector") or "").strip(),
+            "title_selector": str(args.get("engine_title_selector") or "").strip(),
+            "link_selector": str(args.get("engine_link_selector") or "").strip(),
+            "snippet_selector": str(args.get("engine_snippet_selector") or "").strip(),
+        }
+
+    @staticmethod
+    def _dig(obj: Any, path: str) -> Any:
+        """按点路径取值（支持 a.b.0.c 与列表下标）。"""
+        if not path:
+            return obj
+        cur = obj
+        for part in str(path).split("."):
+            if part == "":
+                continue
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            elif isinstance(cur, list):
+                try:
+                    cur = cur[int(part)]
+                except Exception:  # noqa: BLE001
+                    return None
+            else:
+                return None
+            if cur is None:
+                return None
+        return cur
+
+    def _render_url(self, template: str, query: str, offset: int) -> str:
+        page = (offset // max(1, _PAGE_TARGET)) + 1
+        try:
+            return template.format(query=quote(query), offset=offset,
+                                   page=page, count=_PAGE_TARGET)
+        except Exception:  # noqa: BLE001 — 模板里出现未知占位符时退化为直接拼接
+            sep = "&" if "?" in template else "?"
+            return template + sep + "q=" + quote(query)
+
+    def _custom_page(self, cfg: Dict[str, Any], query: str, offset: int,
+                     timeout: int) -> List[Tuple[str, str, str]]:
+        url = self._render_url(cfg["url"], query, offset)
+        for key, value in list(cfg["headers"].items()):
+            if isinstance(value, str) and "{query}" in value:
+                cfg["headers"][key] = value.replace("{query}", quote(query))
+        blocked, _reason = is_private_url(url)
+        if blocked:
+            return []
+        headers = {"User-Agent": _USER_AGENT,
+                   "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8"}
+        headers.update({str(k): str(v) for k, v in cfg["headers"].items()})
+        try:
+            if _requests_available():
+                import requests
+                resp = requests.get(url, headers=headers, timeout=timeout,
+                                    allow_redirects=True)
+                if resp.status_code != 200:
+                    return []
+                body = resp.text
+            else:
+                from urllib.request import Request, urlopen
+                resp = urlopen(Request(url, headers=headers), timeout=timeout)
+                body = resp.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return []
+        if cfg["type"] == "html":
+            return self._parse_custom_html(cfg, body)
+        return self._parse_custom_json(cfg, body)
+
+    def _parse_custom_json(self, cfg: Dict[str, Any], body: str) -> List[Tuple[str, str, str]]:
+        try:
+            data = json.loads(body)
+        except Exception:  # noqa: BLE001
+            return []
+        items = self._dig(data, cfg["results_path"])
+        if items is None and isinstance(data, list):
+            items = data
+        if not isinstance(items, list):
+            return []
+        out: List[Tuple[str, str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            href = str(self._dig(item, cfg["url_field"]) or "").strip()
+            title = str(self._dig(item, cfg["title_field"]) or "").strip()
+            snippet = str(self._dig(item, cfg["snippet_field"]) or "").strip()
+            if not href.startswith(("http://", "https://")):
+                continue
+            out.append((title or href, href, " ".join(snippet.split())[:300]))
+        return out
+
+    def _parse_custom_html(self, cfg: Dict[str, Any], body: str) -> List[Tuple[str, str, str]]:
+        if not cfg["result_selector"]:
+            return []
+        try:
+            from bs4 import BeautifulSoup
+        except Exception:  # noqa: BLE001 — 没装 bs4 时无法按选择器解析
+            return []
+        soup = BeautifulSoup(body, "html.parser")
+        out: List[Tuple[str, str, str]] = []
+        for block in soup.select(cfg["result_selector"]):
+            link_el = block.select_one(cfg["link_selector"]) if cfg["link_selector"] else None
+            if link_el is None:
+                link_el = block.find("a")
+            href = str((link_el.get("href") if link_el else "") or "").strip()
+            if href and not href.startswith(("http://", "https://")):
+                href = urljoin(cfg["url"], href)
+            if not href.startswith(("http://", "https://")):
+                continue
+            title_el = block.select_one(cfg["title_selector"]) if cfg["title_selector"] else link_el
+            title = " ".join((title_el.get_text(" ", strip=True) if title_el else "").split())
+            snippet = ""
+            if cfg["snippet_selector"]:
+                sn_el = block.select_one(cfg["snippet_selector"])
+                snippet = " ".join((sn_el.get_text(" ", strip=True) if sn_el else "").split())
+            out.append((title or href, href, snippet[:300]))
+        return out
+
 
 def _unwrap_ddg_redirect(href: str) -> str:
     """DuckDuckGo result links are redirect URLs; unwrap the real target."""

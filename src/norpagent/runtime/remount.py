@@ -57,7 +57,7 @@ Replacement semantics grouped by slot:
 7. **engine service keys** (cnb, 2026-09-12): ``np.remount(cnb=...)`` hot-mounts /
    replaces / detaches the Central Nervous Bus while the engine stays RUNNING —
    ``cnb=False/"off"`` detaches, ``cnb=True/"on"/dict`` assembles and mounts a new
-   node (R-025: the port must be configured manually or a clear error is raised;
+   node (the port must be configured manually or a clear error is raised;
    an existing mount is replaced after shutting the old adapter down). Mounting
    happens on a background thread and never blocks the caller; pass
    ``wait=<seconds>`` via the dedicated norpagent.cnb.engine.remount_cnb() call
@@ -190,7 +190,7 @@ def remount_engine(engine: Any, **slot_values: Any) -> Any:
 
     # 5.5 CNB engine service key (2026-09-12): hot mount / replace / detach the
     #     Central Nervous Bus while the engine stays RUNNING; mounting continues
-    #     on a background thread (R-025 validation already raised on bad specs).
+    # on a background thread (validation already raised on bad specs).
     if cnb_spec is not _CNB_MISSING:
         from norpagent.cnb.engine import remount_cnb
 

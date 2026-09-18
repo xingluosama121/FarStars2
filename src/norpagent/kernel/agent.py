@@ -33,8 +33,10 @@ from norpagent.arch.address import is_address_like, resolve_address
 from norpagent.arch.layer import call_factory
 from norpagent.hooks.core import HookVeto
 from norpagent.kernel.context import (
+    MessageCopyError,
     RunContext,
     clamp_history,
+    fold_history,
     estimate_text_tokens,
     estimate_tokens,
     repair_tool_pairs,
@@ -783,6 +785,20 @@ class AgentRuntime:
         else:
             components = self.components
 
+        # ── 上下文库回读（2026-09-15）：把跨会话沉淀的结论接回请求 ──
+        # 此前上下文库只写不读，这一段修复该缺陷。失败静默、只查一次、
+        # 注入系统提示词（不随步数重复增长）。
+        try:
+            _store = (components or {}).get("context_store") if isinstance(components, dict) else None
+            if _store is not None:
+                from norpagent.kernel.context import recall_context
+
+                _recall = recall_context(_store, user_input)
+                if _recall:
+                    system_prompt = (system_prompt + "\n\n" + _recall) if system_prompt else _recall
+        except Exception:  # noqa: BLE001 — 回读失败不得阻断任务（静默降级）
+            pass
+
         ctx = RunContext(
             registry=self.registry,
             session_manager=session_manager,
@@ -1237,10 +1253,34 @@ class AgentRuntime:
             system_prompt = modified["system_prompt"]
 
         history = list((session_manager or self.session_manager).history(session_id))
+        # 折叠旧历史为 <history> 文本块，只保留最近 N 轮完整。
+        # 目的：终止「每步全量重放思维链 + 完整工具载荷」导致的百万级输入。
+        try:
+            _fold_n = int((getattr(self, "params", {}) or {}).get("history_fold_turns", 3) or 0)
+        except (TypeError, ValueError):
+            _fold_n = 3
+        if _fold_n > 0:
+            try:
+                history = fold_history(history, keep_recent_turns=_fold_n)
+            except MessageCopyError:
+                # 折叠是纯优化：拿不到安全副本就放弃折叠，绝不动会话原文。
+                pass
         # 2026-09-13: optional context-budget clamp. Drops the oldest whole turns
         # (never splitting tool_call / tool_call_id pairs); 0 disables it.
-        if token_budget and token_budget > 0:
-            history = clamp_history(history, int(token_budget))
+        # 2026-09-15：压缩无条件执行（预算 0 = 不设上限，但仍做安全级压缩）。
+        if True:
+            # 2026-09-15: 先压缩，压缩后仍超预算才截断（截断是最后退路）。
+            from norpagent.kernel.context import (
+                compress_history,
+                estimate_tokens as _est_tokens,
+            )
+            try:
+                history, _cstats = compress_history(history, int(token_budget))
+            except MessageCopyError:
+                # 压缩是纯优化：拿不到安全副本就放弃压缩，绝不动会话原文。
+                _cstats = {"skipped": "message_copy_failed"}
+            if _est_tokens(history) > int(token_budget):
+                history = clamp_history(history, int(token_budget))
         # 2026-09-13 round 19: an interrupted run can leave an assistant
         # tool-call message without its tool results (process killed mid-tool,
         # a hook dropped the result, ...). Compatible endpoints reject such a
@@ -1494,7 +1534,7 @@ class AgentRuntime:
     def _synth_usage(history: Any, output: Any) -> Optional[ModelUsage]:
         """Estimate token usage from the **raw** text when the endpoint returns none.
 
-        R-032: the counter must reflect the raw source text (markdown / LaTeX
+        the counter must reflect the raw source text (markdown / LaTeX
         delimiters included) for both the prompt (input) and the model's generated
         text (output = content + chain of thought + tool-call arguments). Counting
         only a rendered / stripped view — or omitting the prompt entirely — made
@@ -1565,7 +1605,7 @@ class AgentRuntime:
                 "output_tokens": out,
                 "input_tokens": inp,
                 "total_tokens": total,
-                # R-032: True when the numbers came from a local raw-text estimate
+                # True when the numbers came from a local raw-text estimate
                 # (the endpoint returned no usage) — lets the UI show them as
                 # approximate rather than exact.
                 "estimated": bool(getattr(result.usage, "estimated", False)),

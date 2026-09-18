@@ -1,5 +1,5 @@
 # Copyright (c) 2026 xingluosama121, MIT Licensed
-"""norpagent.farstars_app.entry — 成品发行版入口实现（R-006 / R-014 / R-023 / R-025 / R-007）。
+"""norpagent.farstars_app.entry — 成品发行版入口实现。
 
 架构书 §3.1（拍板 3A / O5）：成品态入口的本体位于独立入口模块
 ``norpagent.farstars_app``，与 frame 基座分离，避免未来拆分伤筋动骨。
@@ -8,18 +8,18 @@
 ``norpagent unbox`` 一键拉起「开箱即用的自进化用户软件」（架构书 §8.1）：
 
     中枢（可选）       CNB level 0 中枢进程（含引擎，非裸壳）；默认不携带，
-                       显式 --cnb 启用（R-023）；启用时端口必须手动配置
-                       （R-025：缺端口即抛错）。
-    核心智能体         单个功能强大的智能体（R-014：不设默认原子集），
+                       显式 --cnb 启用；启用时端口必须手动配置
+                       （缺端口即抛错）。
+    核心智能体 单个功能强大的智能体（不设默认原子集），
                        由引擎 + 成品档案装配（默认 standard 预设 + 全量工具面）。
     控制台             Web 前端（对话 / 设置 / 回退 / 插件 / 控制台页），
                        浏览器打开即用。
-    进化器             自进化回路设置底座（R-004/R-005：热重载 + 勾选审批制），
+    进化器 自进化回路设置底座（热重载 + 勾选审批制），
                        档案中可开关，默认开启（重大人工、普通自动）。
     成品档案           ``~/.norpagent/unbox.json``：装配清单 + 默认设置 +
                        视角（声明式数据，可读可改）。
 
-用户三不原则（R-007）：不需要看开发手册、不需要知道怎么开发、不需要知道
+用户三不原则：不需要看开发手册、不需要知道怎么开发、不需要知道
 运行过程；但控制台常驻「运行过程可查、可干预」通道（白盒默认不打扰）。
 
 用户态全量工具：成品态启动默认**全量装配全部内置工具**（档案 ``tools``
@@ -30,7 +30,7 @@
     norpagent unbox                        # 浏览器打开即用（默认端口 8890）
     norpagent unbox --port 8890 --no-browser
     norpagent unbox --smoke                # 自检：装配 → 健康检查 → 退出（CI/测试）
-    norpagent unbox --cnb --cnb-port 17811 # 显式启用 CNB（端口必配，R-025）
+    norpagent unbox --cnb --cnb-port 17811 # 显式启用 CNB（端口必配）
     norpagent unbox --cnb-parent http://127.0.0.1:17800 --cnb-port 17811
                                            # 以节点身份加入既有神经树
 """
@@ -58,17 +58,17 @@ DEFAULT_PROFILE: Dict[str, Any] = {
     "ui": "web",
     "port": DEFAULT_PORT,
     "console": True,               # 星轨控制台 / 内置控制台页
-    "evolution": {                 # 自进化（R-004 / R-005 底座设置）
+    "evolution": {                 # 自进化（底座设置）
         "enabled": True,
         "approval": "major-manual",  # 默认：重大人工批准、普通自动批准
-        "idle_policy": "reduced",    # 闲时减少或不进化（R-011）
+        "idle_policy": "reduced",    # 闲时减少或不进化
     },
-    "cnb": {                       # CNB（R-023：默认关闭；启用时端口必配 R-025）
+    "cnb": {                       # CNB（默认关闭；启用时端口必配）
         "enabled": False,
         "node_id": None,
         "parent": None,
         "port": None,
-        # 神经树显式定义（2026-09-12 反馈轮）：JSON / PY 文件路径或 JSON 文本；
+        # 神经树显式定义：JSON / PY 文件路径或 JSON 文本；
         # 给出后整树按定义装配（端口由定义携带，不必再配 cnb.port）。
         "tree": None,
     },
@@ -168,7 +168,7 @@ def run_unbox(args: argparse.Namespace) -> int:
     model = profile.get("model") or None
 
     # CNB：默认关闭；--cnb / --cnb-parent / --cnb-tree 显式启用；
-    # 启用时端口必配（R-025）；2026-09-12 反馈轮（错误语义）：配置错误显式
+    # 启用时端口必配；2026-09-12 反馈轮（错误语义 配置错误显式
     # 报错但不阻塞成品启动——成品照常运行、神经树不加载（错误信息明确）。
     cnb_cfg = dict(profile.get("cnb") or {})
     if getattr(args, "cnb", False):
@@ -214,12 +214,12 @@ def run_unbox(args: argparse.Namespace) -> int:
     tools = _resolve_tools(profile)
     if tools:
         kwargs["tools"] = tools
-    # CNB 装配（R-023：默认关闭）：
+    # CNB 装配（默认关闭
     #  - 神经树模式（tree 给出）：整树按显式定义装配（np 路径内建），宿主引擎
-    #    绑定为根节点（中枢）模块；端口由定义携带（2026-09-12 反馈轮）。
+    #    绑定为根节点（中枢）模块；端口由定义携带。
     #  - 独立模式（无 parent）：本进程内含一个 level 0 中枢（树根），引擎经
     #    CnbAdapter 绑定为中枢的引擎槽——完整 norpagent 实例同时成为中枢节点
-    #    的一个标准模块（R-024 修订：实例可插入 CNB 节点）。
+    # 的一个标准模块（修订：实例可插入 CNB 节点）。
     #  - 入树模式（给了 parent）：引擎以节点身份自动挂载到既有神经树。
     cnb_standalone = cnb_enabled and not cnb_cfg.get("parent") and not cnb_tree
     if cnb_enabled and cnb_tree:
@@ -280,7 +280,7 @@ def run_unbox(args: argparse.Namespace) -> int:
     elif cnb_note:
         print("  CNB         not loaded (config error reported; does not block running)")
     else:
-        print("  CNB         not carried (off by default, R-023)")
+        print("  CNB         not carried (off by default)")
     print("  exit        Ctrl+C (or quit from the console)")
 
     if getattr(args, "smoke", False):
@@ -335,7 +335,7 @@ def _smoke(engine: Any, port: int, cnb_enabled: bool,
            cnb_tree: Any = None) -> int:
     """自检：引擎 RUNNING + Web 健康 + （可选）CNB 树就绪 → 退出。
 
-    错误语义（2026-09-12 反馈轮）：CNB 配置错误不阻塞成品启动（显式报错、
+    错误语义：CNB 配置错误不阻塞成品启动（显式报错、
     神经树不加载），自检按「产品健康」口径通过并如实打印 config-error。
     """
     deadline = time.time() + 15.0
@@ -429,7 +429,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--smoke", action="store_true",
                         help="self-check mode: assemble -> health check -> exit (for tests/CI)")
     parser.add_argument("--cnb", action="store_true",
-                        help="explicitly enable CNB (off by default, R-023; the port must be set manually, R-025)")
+                        help="explicitly enable CNB (off by default; the port must be set manually)")
     parser.add_argument("--cnb-node-id", default=None, help="CNB node id")
     parser.add_argument("--cnb-parent", default=None,
                         help="join an existing neural tree as a node (parent bus address)")

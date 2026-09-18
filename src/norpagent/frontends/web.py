@@ -532,7 +532,7 @@ class WebFrontend:
                 from norpagent import safe
 
                 _sec_level = str(cfg.get("security_level") or "standard").strip().lower()
-                if _sec_level not in ("basic", "standard", "high"):
+                if _sec_level not in ("relaxed", "basic", "standard", "high"):
                     _sec_level = "standard"
                 # native tool confirmation + plugin-call approval: hand the runtime
                 # config to the security kit so ApprovalPolicy actually reads it
@@ -548,7 +548,11 @@ class WebFrontend:
                     "approval_enabled": bool(cfg.get("approval_enabled", True)),
                 }
                 _kit = safe(reg, level=_sec_level, hooks=True,
-                            config={"approval": _approval})
+                            config={"approval": _approval,
+                                    "guard_enabled": bool(
+                                        cfg.get("jailbreak_guard_enabled", True)),
+                                    "jailbreak_action": str(
+                                        cfg.get("jailbreak_guard_action") or "warn")})
                 try:
                     setattr(reg, "_safety_kit", _kit)
                 except Exception:  # noqa: BLE001

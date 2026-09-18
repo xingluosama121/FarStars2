@@ -1328,6 +1328,19 @@ var I18N = {
     "sec.alert.clear_all": "Clear all",
     "sec.alert.close": "Dismiss",
     "sec.alert.title": "NORP Safety System Interception",
+    "sec.alert.title.danger": "NORP Safety System Blocked",
+    "sec.alert.title.warn": "NORP Safety System Warning",
+    "sec.alert.title.notice": "NORP Safety System Notice",
+    "sec.body.danger": "Blocked by the safety system.",
+    "sec.body.warn": "Warning from the safety system.",
+    "sec.code.hook_veto": "A plugin hook vetoed this tool call",
+    "sec.code.approval_denied": "You denied the approval request",
+    "sec.code.ssrf": "Access to an internal / loopback address was blocked",
+    "sec.code.jailbreak": "The jailbreak / injection guard intervened",
+    "sec.code.sandbox": "The sandbox blocked this operation",
+    "sec.code.unsafe_command": "The safety kit flagged a risky command",
+    "sec.code.plugin_untrusted": "An unsigned plugin was loaded (warning only)",
+    "sec.code.unknown": "The safety system intervened",
     "scat.model": "Model", "scat.loop": "Generation", "scat.tools": "Tools", "scat.memory": "Memory",
     "scat.cnb": "CNB", "scat.security": "Safety", "scat.plugins": "Plugins", "scat.multimodal": "Multimodal",
     "scat.evolution": "Evolution", "scat.frontend": "Interface", "scat.runtime": "Runtime & Recovery",
@@ -1507,6 +1520,19 @@ var I18N = {
     "sec.alert.clear_all": "清除全部",
     "sec.alert.close": "关闭此条",
     "sec.alert.title": "NORP 安全系统介入拦截",
+    "sec.alert.title.danger": "NORP 安全系统拦截",
+    "sec.alert.title.warn": "NORP 安全系统警告",
+    "sec.alert.title.notice": "NORP 安全系统提示",
+    "sec.body.danger": "已被安全系统拦截。",
+    "sec.body.warn": "安全系统警告。",
+    "sec.code.hook_veto": "插件钩子否决了本次工具调用",
+    "sec.code.approval_denied": "你拒绝了该审批请求",
+    "sec.code.ssrf": "已阻止访问内网 / 回环地址",
+    "sec.code.jailbreak": "越狱 / 注入防护已介入",
+    "sec.code.sandbox": "沙箱已阻止该操作",
+    "sec.code.unsafe_command": "安全套件标记了高风险命令",
+    "sec.code.plugin_untrusted": "未签名插件已加载（仅警告）",
+    "sec.code.unknown": "安全系统已介入",
     "scat.model": "模型", "scat.loop": "生成参数", "scat.tools": "工具", "scat.memory": "记忆",
     "scat.cnb": "CNB", "scat.security": "安全", "scat.plugins": "插件", "scat.multimodal": "多模态",
     "scat.evolution": "进化", "scat.frontend": "界面", "scat.runtime": "调度与恢复",
@@ -2282,12 +2308,29 @@ function _secAlertTrim(box) {
     box.removeChild(last);
   }
 }
-function securityAlert(message, level) {
+function securityAlert(message, level, code) {
   var box = $("#alerts");
-  if (!box || !message) return;
+  if (!box) return;
+  /* 2026-09-15 分级：notice 属"轻微提示"，一闪而过，不占用常驻告警区。 */
+  if (level === "notice") {
+    toast(message || t("sec.alert.title.notice"), "warn");
+    return;
+  }
   var danger = (level === "danger" || level === "err" || level === "error");
-  var text = String(message);
-  var key = (danger ? "d:" : "w:") + text;
+  var raw = String(message || "").replace(/\s+/g, " ").trim();
+  code = String(code || "");
+  /* 本地化摘要：按后端分类码取词；后端原文只作细节/悬浮提示，避免英文界面里冒出中文。 */
+  var loc = code ? t("sec.code." + code) : "";
+  if (!loc || loc === "sec.code." + code) loc = "";
+  var hasCJK = /[\u3400-\u9fff]/.test(raw);
+  var text;
+  if (loc) {
+    text = loc;
+    if (raw && raw !== loc && (!hasCJK || LANG === "zh_CN")) text = loc + " — " + raw;
+  } else {
+    text = raw || (danger ? t("sec.body.danger") : t("sec.body.warn"));
+  }
+  var key = (danger ? "d:" : "w:") + code + "|" + raw;
   var rec = _secAlerts[key];
   if (rec && rec.el.parentNode) {
     rec.n += 1;
@@ -2304,6 +2347,7 @@ function securityAlert(message, level) {
   var el = document.createElement("div");
   el.className = "alert " + (danger ? "danger" : "warn");
   el.setAttribute("data-sec-key", key);
+  if (raw) el.title = raw;   /* 原文保留在悬浮提示里 */
   var ic = document.createElement("span");
   ic.className = "a-ic";
   ic.textContent = danger ? "!!" : "!";
@@ -2311,7 +2355,10 @@ function securityAlert(message, level) {
   msg.className = "a-msg";
   var ttl = document.createElement("span");
   ttl.className = "a-title";
-  ttl.textContent = t("sec.alert.title");
+  var _titleKey = "sec.alert.title." + (danger ? "danger" : "warn");
+  var _titleText = t(_titleKey);
+  ttl.textContent = (_titleText && _titleText !== _titleKey)
+    ? _titleText : t("sec.alert.title");
   var body = document.createElement("span");
   body.className = "a-body";
   body.textContent = text;   /* CSS white-space:pre-wrap keeps \n line breaks */
@@ -4145,15 +4192,15 @@ function handleEvent(item) {
   switch (type) {
     case "security_alert": {
       /* Explicit security/sandbox interception event from the backend. */
-      securityAlert(item.message || item.detail || t("alert.security"), item.level || "warn");
+      securityAlert(item.message || item.detail, item.level || "warn", item.code || "");
       return;
     }
     case "notify": {
       var lv = item.level || "info";
       if (lv === "danger") {
-        if (fresh(item.ts, 300)) { securityAlert(item.message || t("alert.security"), "danger"); }
+        if (fresh(item.ts, 300)) { securityAlert(item.message, "danger", item.code || ""); }
       } else if (lv === "warn" || lv === "warning") {
-        if (fresh(item.ts, 300)) { securityAlert(item.message || t("alert.security"), "warn"); }
+        if (fresh(item.ts, 300)) { toast(item.message, "warn"); }
       } else if (lv === "error" || lv === "err") {
         if (fresh(item.ts, 180)) { toast(item.message || "task error", "err"); }
       }

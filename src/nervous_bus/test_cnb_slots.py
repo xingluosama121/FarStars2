@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-nervous_bus.test_cnb_slots — R-023 / R-024（2026-09-11 修订）/ R-025 验收
+nervous_bus.test_cnb_slots — 验收
 
 覆盖需求点：
 
-  R-024 通用槽位（修订版：norpagent 完整实例 = 可插入 CNB 节点的模块）
+   通用槽位（修订版：norpagent 完整实例 = 可插入 CNB 节点的模块）
         - 每节点 ≤64 槽位；容量满第 65 个拒绝；
         - 槽位号唯一、模块协议校验、动作名冲突拒绝、on_mount 失败事务不提交；
         - model / tools / plugins / 自定义模块均可槽位化挂载（总线 slot_mount）；
@@ -14,11 +14,11 @@ nervous_bus.test_cnb_slots — R-023 / R-024（2026-09-11 修订）/ R-025 验�
         - slot_list / slot_describe / slot_mount / slot_unmount 总线动作；
         - 槽位挂载/卸载入节点审计。
 
-  R-023 默认不携带 CNB
+   默认不携带 CNB
         - 默认 env/配置下 enabled=False、setup_cnb 静默返回（零挂载）；
         - 显式 {"cnb": True, ...} / env 才是启用通道。
 
-  R-025 端口手动配置、缺省报错（2026-09-12 反馈轮修订错误语义）
+   端口手动配置、缺省报错（2026-09-12 反馈轮修订错误语义）
         - read_env_config(strict=True) 缺端口抛 CnbConfigError；
         - validate_cnb_config 缺端口/缺节点标识抛错（直接调用的严格校验面）；
         - np(cnb={"cnb": True}) 缺端口：显式报错但不阻塞启动——宿主正常
@@ -311,9 +311,9 @@ def main() -> int:
           (resp.get("detail") or {}).get("count") == 1, str(resp))
 
     # ══════════════════════════════════════════════════════
-    # C. R-023 默认不携带 + R-025 端口缺失抛错
+    # C. 默认不携带 + 端口缺失抛错
     # ══════════════════════════════════════════════════════
-    print("── C. R-023 / R-025 ──")
+    print("── C. ──")
     _saved = {k: os.environ.pop(k, None) for k in (
         "NORP_CNB_NODE", "NORP_CNB_PORT", "NORP_CNB_PARENT",
         "NORP_CNB_MANAGED", "NORP_CNB_KIND", "NORP_CNB_LEVEL")}

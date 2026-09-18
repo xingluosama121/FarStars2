@@ -46,6 +46,7 @@ dict, at the same granularity as the norpagent.security modules.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -54,17 +55,20 @@ from norpagent.security.guard import (
     harden_system_prompt as _harden_system_prompt,
 )
 from norpagent.security.guard import scan_message as _scan_message
+
+_log = logging.getLogger('norpagent.safe')
 from norpagent.security.network_policy import (
     NetworkPolicy,
     POLICY_DENY,
     POLICY_ALLOW_ALL,
 )
 
-# three security presets
+# four security presets (2026-09-15: relaxed added as the loosest tier)
+LEVEL_RELAXED = "relaxed"
 LEVEL_BASIC = "basic"
 LEVEL_STANDARD = "standard"
 LEVEL_HIGH = "high"
-VALID_LEVELS = (LEVEL_BASIC, LEVEL_STANDARD, LEVEL_HIGH)
+VALID_LEVELS = (LEVEL_RELAXED, LEVEL_BASIC, LEVEL_STANDARD, LEVEL_HIGH)
 
 
 @dataclass
@@ -84,8 +88,11 @@ class SecurityContext:
     level: str = LEVEL_STANDARD
     guard_enabled: bool = True
     harden_enabled: bool = True
-    audit_level: str = "warn"            # off / warn / block
-    import_restrict: str = "safe"        # off / safe / strict
+    # input-guard action (2026-09-15, loosened): notice = silent pass;
+    # warn = pass + log; block = veto. Default moved off hard-block.
+    jailbreak_action: str = "warn"
+    audit_level: str = "warn"            # off / notice / warn / block
+    import_restrict: str = "safe"        # off / soft / safe / strict
     require_permissions: bool = False
     signature_verify: bool = True
     signature_required: bool = False     # True: only trusted signatures may load
@@ -189,8 +196,16 @@ class SafetyKit:
                     return None
                 user_input = event.get("user_input") or ""
                 blocked, reason, _ = self.scan_input(user_input)
-                if blocked:
+                if not blocked:
+                    return None
+                action = str(params.get("jailbreak_action")
+                             or self.context.jailbreak_action
+                             or "warn").strip().lower()
+                if action == "block":
                     raise HookVeto(reason or "input blocked by security protection")
+                if action == "warn":
+                    _log.warning("input guard: %s (allowed: warn only)",
+                                 reason or "suspicious input pattern")
                 return None
 
             hooks.before_input.subscribe(guard_input)
@@ -333,14 +348,22 @@ def _build_context(level: str, config: Optional[dict],
         raise ValueError(f"unknown security level '{level}'. Options: {VALID_LEVELS}")
 
     ctx = SecurityContext(level=level)
-    if level == LEVEL_BASIC:
+    if level == LEVEL_RELAXED:
         ctx.import_restrict = "off"
+        ctx.audit_level = "off"
+        ctx.jailbreak_action = "notice"
+        ctx.network_policy = POLICY_ALLOW_ALL
+        ctx.approval_config = {"approval_enabled": False}
+    elif level == LEVEL_BASIC:
+        ctx.import_restrict = "off"
+        ctx.jailbreak_action = "warn"
         ctx.network_policy = POLICY_ALLOW_ALL
         ctx.approval_config = {"approval_enabled": False}
     elif level == LEVEL_STANDARD:
         pass  # standard by default
     elif level == LEVEL_HIGH:
         ctx.audit_level = "block"
+        ctx.jailbreak_action = "block"
         ctx.require_permissions = True
         ctx.signature_required = True
 
@@ -360,6 +383,9 @@ def _apply_config(ctx: SecurityContext, config: dict) -> None:
         "plugin_security_import_restrict": ("import_restrict", str),
         "plugin_security_require_permissions": ("require_permissions", bool),
         "plugin_signature_verify": ("signature_verify", bool),
+        "jailbreak_action": ("jailbreak_action", str),
+        "jailbreak_guard_action": ("jailbreak_action", str),
+        "jailbreak_guard_enabled": ("guard_enabled", bool),
         "plugin_signature_required": ("signature_required", bool),
         "plugin_network_policy": ("network_policy", str),
         "plugin_isolation": ("plugin_isolation", str),

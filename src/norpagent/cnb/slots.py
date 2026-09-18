@@ -1,7 +1,7 @@
 # Copyright (c) 2026 xingluosama121, MIT Licensed
 """norpagent.cnb.slots — 通用槽位（Universal Slots）：CNB 节点的 ≤64 槽位挂载面。
 
-R-024（2026-09-11 修订版）：
+
 - 神经总线上每一节点不再「硬挂」固定的 agent 实例形态，而是提供最多 64 个
   通用槽位；槽位走神经总线，什么都可以挂载：model、tools、plugins、自定义
   模块……CNB 由此成为「槽位连接器」的多实例延伸扩展（单实例时槽位连接本地
@@ -36,7 +36,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-# 单节点通用槽位上限（R-024 裁决：≤64）
+# 单节点通用槽位上限（裁决：≤64）
 MAX_SLOTS = 64
 
 # 模块种类：norpagent 完整实例（口谕：可插入 CNB 节点的标准模块）
@@ -321,7 +321,7 @@ class SlotBay:
         if len(self._slots) >= self.max_slots:
             raise SlotError(
                 f"slot capacity exceeded: {len(self._slots)}/{self.max_slots} "
-                f"(R-024: at most {self.max_slots} universal slots per node)")
+                f"(at most {self.max_slots} universal slots per node)")
         if module is None:
             raise SlotError("module must not be None")
         for attr in ("describe", "actions"):

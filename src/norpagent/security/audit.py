@@ -145,9 +145,18 @@ _SUSPICIOUS_BASES = ("os", "subprocess", "builtins", "sys", "ctypes", "cffi", "s
 class SourceAuditor:
     """AST source auditor (purely functional, thread-safe, no global state)."""
 
+    #: 四挡（2026-09-15）：off < notice < warn < block
+    #:   off    = 不记录（info.audit_issues 留空），不提示、不拦截
+    #:   notice = 审计并记录，不提示、不拦截
+    #:   warn   = 审计并记录 + 用户可见警告，不拦截
+    #:   block  = 审计并记录 + 命中 CRITICAL 时拦截
+    AUDIT_LEVELS = ("off", "notice", "warn", "block")
+
     def __init__(self, audit_level: str = "warn") -> None:
-        """audit_level: off / warn / block (invalid values fall back to warn)."""
-        self.audit_level = audit_level if audit_level in ("off", "warn", "block") else "warn"
+        """audit_level: off / notice / warn / block (invalid values fall back to warn)."""
+        self.audit_level = (
+            audit_level if audit_level in self.AUDIT_LEVELS else "warn"
+        )
 
     # ── entry ────────────────────────────────────────────
 

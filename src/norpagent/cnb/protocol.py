@@ -103,8 +103,8 @@ FROZEN_ALLOWED_ACTIONS: frozenset = frozenset({
     "inspect",        # 节点全景检查（只读）
     "list_snapshots", # 快照列表（只读）
     "task_records",   # 已受理任务载荷与结果记录（只读，取证/验收回执）
-    "slot_list",      # 通用槽位摘要（只读，R-024）
-    "slot_describe",  # 通用槽位完整描述（只读，R-024）
+    "slot_list",      # 通用槽位摘要（只读）
+    "slot_describe",  # 通用槽位完整描述（只读）
 })
 
 # ----------------------------------------------------------------------

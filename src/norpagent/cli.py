@@ -10,7 +10,7 @@ Usage::
     norpagent --mode standard --ui web --port 8787 # web UI (HTTP + SSE)
     norpagent --mode standard --plugin-dir ./my_plugins   # load external plugins
     norpagent --safe-mode                                 # safe mode: load only the minimal kernel
-    norpagent unbox                                # one-click product distribution (R-006):
+    norpagent unbox # one-click product distribution:
                                                    # ready-to-use self-evolving user software
     norpagent plugin-sign --gen                    # generate a plugin signing key pair
     norpagent plugin-sign my_plugin.py --key <private key hex>
@@ -692,7 +692,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         from norpagent.cnb.cli import main as _cnb_cli_main
 
         return _cnb_cli_main(argv)
-    # 成品发行版入口（R-006）：norpagent unbox —— 一键拉起开箱即用用户软件。
+    # 成品发行版入口：norpagent unbox —— 一键拉起开箱即用用户软件。
     # 入口本体位于独立入口模块 norpagent.farstars_app（架构书 §3.1 / O5）。
     if argv and argv[0] == "unbox":
         from norpagent.farstars_app.entry import main as _unbox_main
@@ -712,7 +712,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="norpagent Agent framework CLI",
         epilog=(
             "entries:\n"
-            "  norpagent unbox                     one-click product distribution (R-006)\n"
+            "  norpagent unbox                     one-click product distribution \n"
             "settings store CLI (three channels, one source):\n"
             "  norpagent settings list|get|set|reset|export|import|audit|schema\n"
             "Central Nervous Bus (CNB) subcommands (kernel-integrated into "
@@ -756,7 +756,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--plugin-isolation", default="auto",
                         choices=["auto", "inproc", "process"],
                         help="plugin isolation mode (auto=per plugin ISOLATION declaration; process=force process-level isolation)")
-    parser.add_argument("--safe", default=None, choices=["basic", "standard", "high"],
+    parser.add_argument("--safe", default=None, choices=["relaxed", "basic", "standard", "high"],
                         help="norpagent.safe() security level (runtime policies: approval/audit/signature; no hooks by default)")
     parser.add_argument("--safe-hooks", action="store_true",
                         help="with --safe: explicitly enable hook intervention (before_input jailbreak blocking + prompt hardening)")
