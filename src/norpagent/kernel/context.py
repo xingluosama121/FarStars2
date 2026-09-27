@@ -73,26 +73,31 @@ class RunContext:
         """Task store component (used by task_* tools; may be None when the persistent scheduler carries its own)."""
         return self.components.get("task_store")
 
-    def ask_user(self, question: str, default: str = "", kind: str = "") -> str:
-        """Ask the user a question (returns default when the UI provides no interaction).
+    def ask_user(self, question: str, kind: str = "") -> Optional[str]:
+        """Ask the user a question; ``None`` means no answer was obtained.
+
+        This wrapper used to swallow every failure and return a caller-supplied
+        ``default``, which meant a timeout or a missing UI silently turned into a
+        fabricated user decision. It now propagates ``None`` instead: the caller
+        must fail, re-ask, or own its fallback explicitly.
 
         ``kind`` is forwarded to the UI adapter so an approval prompt can render a
         binary approve/reject control while a clarification keeps the text box.
         A third-party adapter that still implements the old two-argument
-        ``ask_user`` is called without ``kind`` rather than failing the request
-        (which would otherwise be read as a denial).
+        ``ask_user`` is called without ``kind`` rather than failing the request.
         """
-        if self.ui is not None:
+        if self.ui is None:
+            return None
+        try:
+            return self.ui.ask_user(question, kind=kind)
+        except TypeError:
+            # legacy adapter without ``kind``; and possibly without ``default``
             try:
-                return self.ui.ask_user(question, default, kind)
-            except TypeError:
-                try:
-                    return self.ui.ask_user(question, default)
-                except Exception:
-                    return default
+                return self.ui.ask_user(question)
             except Exception:
-                return default
-        return default
+                return None
+        except Exception:
+            return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -222,6 +227,28 @@ def repair_tool_pairs(messages: "list[Any]") -> "list[Any]":
 
 
 # ══════════════════════════════════════════════════════════
+# ────────────────────────────
+#  [2026-09-18] 本节实现已整体停用（原文保留在下方注释中，便于回滚）。
+#
+#  停用原因（实测）：
+#   1. 折叠与截断都以「轮」为粒度，而主循环每个任务只追加一条 user 消息，
+#      长任务恒为 1 轮 —— fold_history(len(units)<=keep) 与
+#      clamp_history(len(units)<=1) 在主力场景下完全空转；
+#   2. 分级压缩会把自己的记账标记写进回传体（assistant 追加
+#      "[tools called: ...]"、tool 结果被替换为 "[compressed: N chars
+#      omitted]" / "[duplicate tool result omitted during compression]"）；
+#   3. 每步对消息做三次深拷贝，且 compress/fold/clamp 职责重叠。
+#
+#  现行方案：norpagent/kernel/render.py —— 渲染式历史 + 滚动总结。
+#  回传体 = system + 单条 user（含 <history>/<current_content>，超预算时加
+#  <summary>），其后跟随「循环内」消息：最后一条 user 之后的 assistant/tool
+#  原样回传（含 tool_calls 与工具结果），循环外的历史才剥离思考与工具流量。
+#  思维链不进回传体，但 reasoning 必须保留（DeepSeek 工具轮要求原样回显
+#  reasoning_content，否则 400）。
+#
+#  回滚方式：取消下方注释，并恢复 agent.py build_messages 中的旧调用链。
+# ────────────────────────────
+
 #  History compression (2026-09-15)
 # ══════════════════════════════════════════════════════════
 #
@@ -364,272 +391,272 @@ def _copy_message(m: Any) -> Any:
     return c
 
 
-def _pass_drop_reasoning(msgs: "list[Any]", protected: set) -> int:
-    """L1：丢弃思维链、剥离内联 base64、折叠连续重复的工具结果。"""
-    changed = 0
-    prev_tool_payload = None
-    for i, m in enumerate(msgs):
-        if i in protected:
-            continue
-        role = (getattr(m, "role", "") or "")
-        # 连续重复的工具结果：保留消息本身（配对合法性），只替换载荷
-        if role == "tool":
-            body = str(getattr(m, "content", "") or "")
-            if prev_tool_payload is not None and body and body == prev_tool_payload:
-                m.content = _DUP_MARK
-                changed += 1
-            else:
-                prev_tool_payload = body
-        if getattr(m, "reasoning", ""):
-            m.reasoning = ""
-            try:
-                # 回传三要素契约（2026-09-15）：发生过工具调用的助手消息，
-                # reasoning_content 字段必须保留（可为空串），否则下一次请求
-                # 返回 400；无工具调用的消息该字段本就不回传，置 False 让
-                # to_openai() 直接省略。这样「历史只带空思维链、上一轮带全量」
-                # 既省 token 又不破坏端点契约。
-                m.has_reasoning = bool(getattr(m, "tool_calls", None))
-            except Exception:  # noqa: BLE001
-                pass
-            changed += 1
-        body = str(getattr(m, "content", "") or "")
-        if "base64," in body:
-            stripped = _DATA_URL_RE.sub("<inline-data removed>", body)
-            if stripped != body:
-                m.content = stripped
-                changed += 1
-    return changed
-
-
-def _pass_clip_long(msgs: "list[Any]", protected: set) -> int:
-    """L2：超长工具结果 / 超长助手正文 → 头 + 尾 + 省略标记。"""
-    changed = 0
-    for i, m in enumerate(msgs):
-        if i in protected:
-            continue
-        role = (getattr(m, "role", "") or "")
-        body = str(getattr(m, "content", "") or "")
-        if role == "tool" and len(body) > _TOOL_RESULT_DEGRADE_OVER:
-            m.content = _clip_text(body, _TOOL_RESULT_HEAD, _TOOL_RESULT_TAIL)
-            changed += 1
-        elif role == "assistant" and len(body) > _ASSISTANT_DEGRADE_OVER:
-            m.content = _clip_text(body, _ASSISTANT_HEAD, _ASSISTANT_TAIL)
-            changed += 1
-    return changed
-
-
-def _degrade_unit(unit: "list[Any]", aggressive: bool) -> int:
-    """把一整轮降级为卡片：助手只留结论 + 工具名，工具结果只留首段。"""
-    changed = 0
-    for m in unit:
-        role = (getattr(m, "role", "") or "")
-        if role == "assistant":
-            names = [str(getattr(tc, "name", "") or "")
-                     for tc in (getattr(m, "tool_calls", None) or [])]
-            body = str(getattr(m, "content", "") or "")
-            keep_head = 120 if aggressive else _ASSISTANT_CARD_HEAD
-            keep_tail = 0 if aggressive else _ASSISTANT_CARD_TAIL
-            card = _clip_text(body, keep_head, keep_tail) if body else ""
-            if names:
-                card = ("%s\n[tools called: %s]" % (card, ", ".join(names))).strip()
-            if card != body:
-                m.content = card
-                changed += 1
-            for tc in (getattr(m, "tool_calls", None) or []):
-                args = str(getattr(tc, "arguments", "") or "")
-                if args and len(args) > 120:
-                    try:
-                        tc.arguments = "[arguments omitted during compression]"
-                        changed += 1
-                    except Exception:  # noqa: BLE001
-                        pass
-        elif role == "tool":
-            body = str(getattr(m, "content", "") or "")
-            head = 80 if aggressive else _TOOL_RESULT_CARD_HEAD
-            card = _clip_text(body, head, 0)
-            if card != body:
-                m.content = card
-                changed += 1
-        elif role == "user":
-            body = str(getattr(m, "content", "") or "")
-            if len(body) > _USER_CLIP_HEAD + _USER_CLIP_TAIL:
-                m.content = _clip_text(body, _USER_CLIP_HEAD, _USER_CLIP_TAIL)
-                changed += 1
-    return changed
-
-
-def _pass_old_turns(msgs: "list[Any]", protected: set,
-                    head: "list[Any]", units: "list[list[Any]]") -> int:
-    """L3：早前轮次（非最后一轮）整体降级为卡片。"""
-    if len(units) <= 1:
-        return 0
-    changed = 0
-    for unit in units[:-1]:
-        changed += _degrade_unit(unit, aggressive=False)
-    return changed
-
-
-def _pass_current_turn(msgs: "list[Any]", protected: set,
-                       head: "list[Any]", units: "list[list[Any]]") -> int:
-    """L4：当前任务内较早步骤也降级（长任务的增长恰恰都在这一轮里）。"""
-    if not units:
-        return 0
-    last = units[-1][:-max(1, 2)] if len(units[-1]) > 2 else []
-    return _degrade_unit(last, aggressive=True) if last else 0
-
-
-def _fold_one_line(text: str, limit: int = 600) -> str:
-    """把一段多行文本压成一行并截断（折叠历史用）。"""
-    t = " ".join((text or "").split())
-    if len(t) > limit:
-        t = t[:limit].rstrip() + "\u2026"
-    return t
-
-
-def fold_history(messages: "list[Any]", keep_recent_turns: int = 3,
-                 max_chars: int = 12000) -> "list[Any]":
-    """把「最近 keep_recent_turns 轮」之外的历史折叠成 <history> 文本块。
-
-    动机：每一步都全量重放历史（含思维链与完整工具载荷）会把账单推到百万级。
-    折叠后旧轮次只留「用户说了什么 / 助手结论 / 调用了哪些工具」，工具结果正文
-    整体丢弃；折叠块并入**当前用户消息**的前缀，因此消息数不随历史增长。
-
-    约束：
-      1. 最近 keep_recent_turns 轮**原样保留**（当前任务不受影响）；
-      2. 无 system 头或轮数不足时不动作；失败静默（返回原列表）；
-      3. ``keep_recent_turns <= 0`` 关闭折叠。
-    """
-    msgs = [_copy_message(m) for m in (messages or [])]
-    if keep_recent_turns <= 0 or not msgs:
-        return msgs
-    try:
-        head, units = _split_turns(msgs)
-    except Exception:  # noqa: BLE001
-        return msgs
-    if len(units) <= keep_recent_turns:
-        return msgs
-    old_units = units[:-keep_recent_turns]
-    recent_units = units[-keep_recent_turns:]
-
-    lines: "list[str]" = []
-    for unit in old_units:
-        for m in unit:
-            role = (getattr(m, "role", "") or "")
-            text = (getattr(m, "content", "") or "").strip()
-            if role == "user" and text:
-                lines.append("用户：" + _fold_one_line(text))
-            elif role == "assistant":
-                calls = getattr(m, "tool_calls", None) or []
-                names = [getattr(tc, "name", "") for tc in calls]
-                names = [n for n in names if n]
-                if text:
-                    lines.append("助手：" + _fold_one_line(text))
-                if names:
-                    lines.append("（调用工具："
-                                 + ", ".join(names) + "）")
-    if not lines:
-        return msgs
-    body = "\n".join(lines)
-    if len(body) > max_chars:
-        body = body[:max_chars].rstrip() + "\u2026"
-    block = "<history>\n" + body + "\n</history>\n\n"
-
-    flat = [m for unit in recent_units for m in unit]
-    target = None
-    for i in range(len(flat) - 1, -1, -1):
-        if (getattr(flat[i], "role", "") or "") == "user":
-            target = i
-            break
-    if target is None:
-        return msgs
-    out = [_copy_message(m) for m in flat]
-    out[target].content = block + (getattr(out[target], "content", "") or "")
-    return list(head) + out
-
-
-def compress_history(messages: "list[Any]", target_tokens: int,
-                     protect_tail: int = 2,
-                     max_level: int = 4) -> "tuple[list[Any], dict]":
-    """压缩历史以贴合 ``target_tokens``；不够时由调用方再截断。
-
-    返回 ``(new_messages, stats)``。``target_tokens <= 0`` 或本来就够→原样返回。
-    ``protect_tail`` 为末尾不被改动的消息条数（当前输入不变形）。
-    """
-    msgs = [_copy_message(m) for m in (messages or [])]
-    stats: Dict[str, Any] = {"target": int(target_tokens), "levels_run": [],
-                             "changed": 0, "before_tokens": 0, "after_tokens": 0}
-    if not msgs:
-        return msgs, stats
-    # 2026-09-15：压缩改为**无条件**。预算 <= 0（默认不设上限）时不再直接放行，
-    # 而是至少执行 L1 安全级压缩：丢历史思维链 / 剥离内联 base64 / 折叠连续重复
-    # 工具结果。这些改写不增删消息、不破坏 tool_call 配对，属纯收益，因此
-    # 「历史思维链无上限回传」这一主要浪费在默认配置下即被消除。
-    # 预算 > 0 时按原分级流程 L1→L4，仍不够再由调用方截断（截断是最后退路）。
-    if target_tokens <= 0:
-        protected0 = set(range(max(0, len(msgs) - max(0, int(protect_tail))), len(msgs)))
-        before0 = estimate_tokens(msgs)
-        changed0 = _pass_drop_reasoning(msgs, protected0) if max_level >= 1 else 0
-        if changed0:
-            stats["levels_run"].append("L1")
-            stats["changed"] = changed0
-        stats["before_tokens"] = before0
-        stats["after_tokens"] = estimate_tokens(msgs)
-        return msgs, stats
-    before = estimate_tokens(msgs)
-    stats["before_tokens"] = before
-    if before <= target_tokens:
-        stats["after_tokens"] = before
-        return msgs, stats
-    protect_n = max(0, int(protect_tail))
-    protected = set(range(max(0, len(msgs) - protect_n), len(msgs)))
-    head, units = _split_turns(msgs)
-    for i in range(len(head)):          # 前导 system 永不改动
-        protected.add(i)
-
-    passes = [
-        ("L1-drop-reasoning", lambda: _pass_drop_reasoning(msgs, protected)),
-        ("L2-clip-long", lambda: _pass_clip_long(msgs, protected)),
-        ("L3-old-turns", lambda: _pass_old_turns(msgs, protected, head, units)),
-        ("L4-current-turn", lambda: _pass_current_turn(msgs, protected, head, units)),
-    ]
-    for idx, (name, fn) in enumerate(passes):
-        if idx >= max(1, int(max_level)):
-            break
-        if estimate_tokens(msgs) <= target_tokens:
-            break
-        n = fn()
-        stats["levels_run"].append(name)
-        stats["changed"] += int(n or 0)
-        if not n:
-            continue
-    stats["after_tokens"] = estimate_tokens(msgs)
-    return msgs, stats
-
-def clamp_history(messages: "list[Any]", max_tokens: int) -> "list[Any]":
-    """Drop the oldest whole turns so the estimate fits ``max_tokens``.
-
-    ``max_tokens <= 0`` disables the clamp (returns a copy unchanged). Leading
-    system messages are always kept. The last turn is always kept, even if it
-    alone exceeds the budget; older turns are removed newest-first only when the
-    whole turn fits (keep-all-or-drop-all). Tool_call / tool_call_id pairs are
-    never split because a turn is handled as one unit.
-    """
-    msgs = list(messages)
-    if max_tokens <= 0 or not msgs:
-        return msgs
-    head, units = _split_turns(msgs)
-    if len(units) <= 1:
-        return msgs
-    head_tokens = estimate_tokens(head)
-    kept: "list[list[Any]]" = [units[-1]]
-    kept_tokens = head_tokens + estimate_tokens(units[-1])
-    for unit in reversed(units[:-1]):
-        unit_tokens = estimate_tokens(unit)
-        if kept_tokens + unit_tokens > max_tokens:
-            break  # keep-all-or-drop-all: never slice an older turn
-        kept.insert(0, unit)
-        kept_tokens += unit_tokens
-    return head + [m for unit in kept for m in unit]
+# def _pass_drop_reasoning(msgs: "list[Any]", protected: set) -> int:
+#     """L1：丢弃思维链、剥离内联 base64、折叠连续重复的工具结果。"""
+#     changed = 0
+#     prev_tool_payload = None
+#     for i, m in enumerate(msgs):
+#         if i in protected:
+#             continue
+#         role = (getattr(m, "role", "") or "")
+#         # 连续重复的工具结果：保留消息本身（配对合法性），只替换载荷
+#         if role == "tool":
+#             body = str(getattr(m, "content", "") or "")
+#             if prev_tool_payload is not None and body and body == prev_tool_payload:
+#                 m.content = _DUP_MARK
+#                 changed += 1
+#             else:
+#                 prev_tool_payload = body
+#         if getattr(m, "reasoning", ""):
+#             m.reasoning = ""
+#             try:
+#                 # 回传三要素契约（2026-09-15）：发生过工具调用的助手消息，
+#                 # reasoning_content 字段必须保留（可为空串），否则下一次请求
+#                 # 返回 400；无工具调用的消息该字段本就不回传，置 False 让
+#                 # to_openai() 直接省略。这样「历史只带空思维链、上一轮带全量」
+#                 # 既省 token 又不破坏端点契约。
+#                 m.has_reasoning = bool(getattr(m, "tool_calls", None))
+#             except Exception:  # noqa: BLE001
+#                 pass
+#             changed += 1
+#         body = str(getattr(m, "content", "") or "")
+#         if "base64," in body:
+#             stripped = _DATA_URL_RE.sub("<inline-data removed>", body)
+#             if stripped != body:
+#                 m.content = stripped
+#                 changed += 1
+#     return changed
+#
+#
+# def _pass_clip_long(msgs: "list[Any]", protected: set) -> int:
+#     """L2：超长工具结果 / 超长助手正文 → 头 + 尾 + 省略标记。"""
+#     changed = 0
+#     for i, m in enumerate(msgs):
+#         if i in protected:
+#             continue
+#         role = (getattr(m, "role", "") or "")
+#         body = str(getattr(m, "content", "") or "")
+#         if role == "tool" and len(body) > _TOOL_RESULT_DEGRADE_OVER:
+#             m.content = _clip_text(body, _TOOL_RESULT_HEAD, _TOOL_RESULT_TAIL)
+#             changed += 1
+#         elif role == "assistant" and len(body) > _ASSISTANT_DEGRADE_OVER:
+#             m.content = _clip_text(body, _ASSISTANT_HEAD, _ASSISTANT_TAIL)
+#             changed += 1
+#     return changed
+#
+#
+# def _degrade_unit(unit: "list[Any]", aggressive: bool) -> int:
+#     """把一整轮降级为卡片：助手只留结论 + 工具名，工具结果只留首段。"""
+#     changed = 0
+#     for m in unit:
+#         role = (getattr(m, "role", "") or "")
+#         if role == "assistant":
+#             names = [str(getattr(tc, "name", "") or "")
+#                      for tc in (getattr(m, "tool_calls", None) or [])]
+#             body = str(getattr(m, "content", "") or "")
+#             keep_head = 120 if aggressive else _ASSISTANT_CARD_HEAD
+#             keep_tail = 0 if aggressive else _ASSISTANT_CARD_TAIL
+#             card = _clip_text(body, keep_head, keep_tail) if body else ""
+#             if names:
+#                 card = ("%s\n[tools called: %s]" % (card, ", ".join(names))).strip()
+#             if card != body:
+#                 m.content = card
+#                 changed += 1
+#             for tc in (getattr(m, "tool_calls", None) or []):
+#                 args = str(getattr(tc, "arguments", "") or "")
+#                 if args and len(args) > 120:
+#                     try:
+#                         tc.arguments = "[arguments omitted during compression]"
+#                         changed += 1
+#                     except Exception:  # noqa: BLE001
+#                         pass
+#         elif role == "tool":
+#             body = str(getattr(m, "content", "") or "")
+#             head = 80 if aggressive else _TOOL_RESULT_CARD_HEAD
+#             card = _clip_text(body, head, 0)
+#             if card != body:
+#                 m.content = card
+#                 changed += 1
+#         elif role == "user":
+#             body = str(getattr(m, "content", "") or "")
+#             if len(body) > _USER_CLIP_HEAD + _USER_CLIP_TAIL:
+#                 m.content = _clip_text(body, _USER_CLIP_HEAD, _USER_CLIP_TAIL)
+#                 changed += 1
+#     return changed
+#
+#
+# def _pass_old_turns(msgs: "list[Any]", protected: set,
+#                     head: "list[Any]", units: "list[list[Any]]") -> int:
+#     """L3：早前轮次（非最后一轮）整体降级为卡片。"""
+#     if len(units) <= 1:
+#         return 0
+#     changed = 0
+#     for unit in units[:-1]:
+#         changed += _degrade_unit(unit, aggressive=False)
+#     return changed
+#
+#
+# def _pass_current_turn(msgs: "list[Any]", protected: set,
+#                        head: "list[Any]", units: "list[list[Any]]") -> int:
+#     """L4：当前任务内较早步骤也降级（长任务的增长恰恰都在这一轮里）。"""
+#     if not units:
+#         return 0
+#     last = units[-1][:-max(1, 2)] if len(units[-1]) > 2 else []
+#     return _degrade_unit(last, aggressive=True) if last else 0
+#
+#
+# def _fold_one_line(text: str, limit: int = 600) -> str:
+#     """把一段多行文本压成一行并截断（折叠历史用）。"""
+#     t = " ".join((text or "").split())
+#     if len(t) > limit:
+#         t = t[:limit].rstrip() + "\u2026"
+#     return t
+#
+#
+# def fold_history(messages: "list[Any]", keep_recent_turns: int = 3,
+#                  max_chars: int = 12000) -> "list[Any]":
+#     """把「最近 keep_recent_turns 轮」之外的历史折叠成 <history> 文本块。
+#
+#     动机：每一步都全量重放历史（含思维链与完整工具载荷）会把账单推到百万级。
+#     折叠后旧轮次只留「用户说了什么 / 助手结论 / 调用了哪些工具」，工具结果正文
+#     整体丢弃；折叠块并入**当前用户消息**的前缀，因此消息数不随历史增长。
+#
+#     约束：
+#       1. 最近 keep_recent_turns 轮**原样保留**（当前任务不受影响）；
+#       2. 无 system 头或轮数不足时不动作；失败静默（返回原列表）；
+#       3. ``keep_recent_turns <= 0`` 关闭折叠。
+#     """
+#     msgs = [_copy_message(m) for m in (messages or [])]
+#     if keep_recent_turns <= 0 or not msgs:
+#         return msgs
+#     try:
+#         head, units = _split_turns(msgs)
+#     except Exception:  # noqa: BLE001
+#         return msgs
+#     if len(units) <= keep_recent_turns:
+#         return msgs
+#     old_units = units[:-keep_recent_turns]
+#     recent_units = units[-keep_recent_turns:]
+#
+#     lines: "list[str]" = []
+#     for unit in old_units:
+#         for m in unit:
+#             role = (getattr(m, "role", "") or "")
+#             text = (getattr(m, "content", "") or "").strip()
+#             if role == "user" and text:
+#                 lines.append("用户：" + _fold_one_line(text))
+#             elif role == "assistant":
+#                 calls = getattr(m, "tool_calls", None) or []
+#                 names = [getattr(tc, "name", "") for tc in calls]
+#                 names = [n for n in names if n]
+#                 if text:
+#                     lines.append("助手：" + _fold_one_line(text))
+#                 if names:
+#                     lines.append("（调用工具："
+#                                  + ", ".join(names) + "）")
+#     if not lines:
+#         return msgs
+#     body = "\n".join(lines)
+#     if len(body) > max_chars:
+#         body = body[:max_chars].rstrip() + "\u2026"
+#     block = "<history>\n" + body + "\n</history>\n\n"
+#
+#     flat = [m for unit in recent_units for m in unit]
+#     target = None
+#     for i in range(len(flat) - 1, -1, -1):
+#         if (getattr(flat[i], "role", "") or "") == "user":
+#             target = i
+#             break
+#     if target is None:
+#         return msgs
+#     out = [_copy_message(m) for m in flat]
+#     out[target].content = block + (getattr(out[target], "content", "") or "")
+#     return list(head) + out
+#
+#
+# def compress_history(messages: "list[Any]", target_tokens: int,
+#                      protect_tail: int = 2,
+#                      max_level: int = 4) -> "tuple[list[Any], dict]":
+#     """压缩历史以贴合 ``target_tokens``；不够时由调用方再截断。
+#
+#     返回 ``(new_messages, stats)``。``target_tokens <= 0`` 或本来就够→原样返回。
+#     ``protect_tail`` 为末尾不被改动的消息条数（当前输入不变形）。
+#     """
+#     msgs = [_copy_message(m) for m in (messages or [])]
+#     stats: Dict[str, Any] = {"target": int(target_tokens), "levels_run": [],
+#                              "changed": 0, "before_tokens": 0, "after_tokens": 0}
+#     if not msgs:
+#         return msgs, stats
+#     # 2026-09-15：压缩改为**无条件**。预算 <= 0（默认不设上限）时不再直接放行，
+#     # 而是至少执行 L1 安全级压缩：丢历史思维链 / 剥离内联 base64 / 折叠连续重复
+#     # 工具结果。这些改写不增删消息、不破坏 tool_call 配对，属纯收益，因此
+#     # 「历史思维链无上限回传」这一主要浪费在默认配置下即被消除。
+#     # 预算 > 0 时按原分级流程 L1→L4，仍不够再由调用方截断（截断是最后退路）。
+#     if target_tokens <= 0:
+#         protected0 = set(range(max(0, len(msgs) - max(0, int(protect_tail))), len(msgs)))
+#         before0 = estimate_tokens(msgs)
+#         changed0 = _pass_drop_reasoning(msgs, protected0) if max_level >= 1 else 0
+#         if changed0:
+#             stats["levels_run"].append("L1")
+#             stats["changed"] = changed0
+#         stats["before_tokens"] = before0
+#         stats["after_tokens"] = estimate_tokens(msgs)
+#         return msgs, stats
+#     before = estimate_tokens(msgs)
+#     stats["before_tokens"] = before
+#     if before <= target_tokens:
+#         stats["after_tokens"] = before
+#         return msgs, stats
+#     protect_n = max(0, int(protect_tail))
+#     protected = set(range(max(0, len(msgs) - protect_n), len(msgs)))
+#     head, units = _split_turns(msgs)
+#     for i in range(len(head)):          # 前导 system 永不改动
+#         protected.add(i)
+#
+#     passes = [
+#         ("L1-drop-reasoning", lambda: _pass_drop_reasoning(msgs, protected)),
+#         ("L2-clip-long", lambda: _pass_clip_long(msgs, protected)),
+#         ("L3-old-turns", lambda: _pass_old_turns(msgs, protected, head, units)),
+#         ("L4-current-turn", lambda: _pass_current_turn(msgs, protected, head, units)),
+#     ]
+#     for idx, (name, fn) in enumerate(passes):
+#         if idx >= max(1, int(max_level)):
+#             break
+#         if estimate_tokens(msgs) <= target_tokens:
+#             break
+#         n = fn()
+#         stats["levels_run"].append(name)
+#         stats["changed"] += int(n or 0)
+#         if not n:
+#             continue
+#     stats["after_tokens"] = estimate_tokens(msgs)
+#     return msgs, stats
+#
+# def clamp_history(messages: "list[Any]", max_tokens: int) -> "list[Any]":
+#     """Drop the oldest whole turns so the estimate fits ``max_tokens``.
+#
+#     ``max_tokens <= 0`` disables the clamp (returns a copy unchanged). Leading
+#     system messages are always kept. The last turn is always kept, even if it
+#     alone exceeds the budget; older turns are removed newest-first only when the
+#     whole turn fits (keep-all-or-drop-all). Tool_call / tool_call_id pairs are
+#     never split because a turn is handled as one unit.
+#     """
+#     msgs = list(messages)
+#     if max_tokens <= 0 or not msgs:
+#         return msgs
+#     head, units = _split_turns(msgs)
+#     if len(units) <= 1:
+#         return msgs
+#     head_tokens = estimate_tokens(head)
+#     kept: "list[list[Any]]" = [units[-1]]
+#     kept_tokens = head_tokens + estimate_tokens(units[-1])
+#     for unit in reversed(units[:-1]):
+#         unit_tokens = estimate_tokens(unit)
+#         if kept_tokens + unit_tokens > max_tokens:
+#             break  # keep-all-or-drop-all: never slice an older turn
+#         kept.insert(0, unit)
+#         kept_tokens += unit_tokens
+#     return head + [m for unit in kept for m in unit]
 
 
 # ──────────────────────────────────────────────────────────────

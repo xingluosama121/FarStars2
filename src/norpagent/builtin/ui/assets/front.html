@@ -202,6 +202,12 @@ a { color: var(--primary-strong); text-decoration: none; }
 }
 .sess-item .s-sub { font-size: 11px; color: var(--text-3); margin-top: 1px; }
 .sess-item .s-run { width: 7px; height: 7px; border-radius: 50%; background: var(--secondary); flex: none; animation: pulse 1.2s ease infinite; }
+.sess-item .s-ask {
+  width: 14px; height: 14px; border-radius: 50%; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700; line-height: 1; border: 1px solid var(--warn);
+  background: var(--warn-soft); color: var(--warn);
+}
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 .sess-item .s-del {
   width: 22px; height: 22px; border-radius: 6px; flex: none;
@@ -246,6 +252,10 @@ a { color: var(--primary-strong); text-decoration: none; }
 .msgs-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
 .msgs { flex: 1; overflow-y: auto; padding: 20px 0 8px; scroll-behavior: smooth; min-height: 0; }
 .msgs-inner { max-width: 860px; margin: 0 auto; padding: 0 20px; }
+/* 虚拟列表：上下高度占位条撑出真实滚动长度，本身不参与命中测试 */
+.vpad { height: 0; overflow: hidden; pointer-events: none; }
+/* 窗口化重绘不应重放消息入场动画（滚动时节点会被反复换入换出） */
+.msgs-inner.vwin .msg { animation: none; }
 .msg { margin-bottom: 18px; animation: slideup 0.2s ease; }
 .msg-user { display: flex; justify-content: flex-end; }
 .msg-user .u-col { max-width: 78%; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
@@ -1948,6 +1958,10 @@ function rerenderAllBots() {
       });
     });
   } catch (e) { /* 渲染升级尽力而为 */ }
+  /* 渲染器升级后（CDN marked/katex 就绪）输出段由纯文本变富文本，高度全变：
+     高度表作废重估，并按新高度重绘窗口与占位条（否则滚动条长度会失真）。 */
+  vInvalidateAll();
+  vSyncWindow(true);
 }
 function md(text) {
   var s = String(text == null ? "" : text);
@@ -2425,7 +2439,9 @@ var S = {
   batchMode: false,          // session batch-clear mode
   batchSel: {},              // session batch selection {sid: true}
   recBatch: false,           // snapshot batch-delete mode
-  recSel: {}                 // snapshot batch selection {id: true}
+  recSel: {},                // snapshot batch selection {id: true}
+  askSeen: {},               // question_id -> ts（已展示/已答复，不再重复弹窗）
+  askPending: {}             // sid -> {item, ts}（属于该会话、等待用户切过去的提问）
 };
 
 /* SVG snippets reused in dynamic markup */
@@ -3199,6 +3215,7 @@ function sessionItemHtml(sid) {
   return '<div class="sess-item' + active + pinned + (S.batchMode ? " batch" : "") + '" data-sid="' + esc(sid) + '">'
     + check
     + (s.running ? '<span class="s-run" title="running"></span>' : '')
+    + (pendingAsk(sid) ? '<span class="s-ask" title="' + esc(t("ask.title")) + '">?</span>' : '')
     + '<div class="s-main"><div class="s-title">' + esc(s.title || sid.slice(0, 8)) + '</div></div>'
     + '<button class="s-pin" data-pin="' + esc(sid) + '" title="' + esc(s.pinned ? t("chat.unpin") : t("chat.pin")) + '">' + SVG.pin + '</button>'
     + '<button class="s-edit" data-rename="' + esc(sid) + '" title="' + esc(t("chat.rename")) + '">' + SVG.edit + '</button>'
@@ -3267,6 +3284,15 @@ function openSession(sid) {
   /* 输入框草稿：每个会话独立保留（切走存、切回取） */
   var _inp = $("#input");
   if (_inp && S.sid && S.sid !== sid) { _drafts[S.sid] = _inp.value; }
+  /* 弹窗只属于"当前正在看的会话"：切走时把未答复的提问暂存回原会话，切回时
+     由 pendingAsk() 重新弹出，用户不会对着别的会话回答本会话的提问 */
+  if (askState && askState.sid && askState.sid !== sid) {
+    if (askState.item) {
+      S.askPending[askState.sid] = { item: askState.item, ts: askState.item.ts || nowSec() };
+    }
+    $("#ask-modal").classList.add("hidden");
+    askState = null;
+  }
   S.sid = sid;
   _userScrolled = false;  /* 打开会话：恢复自动跟随并直接贴底 */
   var sess = ensureSession(sid);
@@ -3281,6 +3307,9 @@ function openSession(sid) {
   else { renderAllMessages(sid, false); refreshVariants(sid); }
   refreshSessionPrompt(sid);
   updateStopBtn();
+  /* 该会话可能有"用户人在别处时"收到的提问：切进来即弹出 */
+  var owed = pendingAsk(sid);
+  if (owed) { showAsk(owed); }
 }
 /* 历史回载：同一"工作"（任务）的多条 assistant 消息合并为一条，
    其 segments 依序拼接 —— 多段思考 / 多段输出 / 工具卡片在刷新后原样重现 */
@@ -3589,18 +3618,383 @@ function slideToBottom(box, duration) {
   }
   requestAnimationFrame(frame);
 }
+/* ============================================================
+   虚拟消息列表（virtual message list）——只把可见窗口放进 DOM
+   ------------------------------------------------------------
+   动机：大会话实测 1370 条显示消息 / 3356 个分段 / API JSON 7.34MB，改造前
+   打开或切换会话会把全部消息一次性建成 DOM（约 3.9 万节点），必然卡顿。
+   这里的做法是业界标准窗口化：
+     [顶占位条 .vpad]  高度 = 窗口首条之前所有消息的高度和
+     [窗口内消息节点]  视口上下各多渲染 V_OVERSCAN 像素
+     [底占位条 .vpad]  高度 = 窗口末条之后所有消息的高度和
+   每条消息的高度先按内容估算（折叠的思考块 / 工具卡片只占标题行），节点渲染
+   后实测并写回；高度变化时用「锚点索引」补偿 scrollTop，避免视图跳动。
+
+   与既有实现的兼容点：
+   - 所有按 id 定位节点的逻辑（renderStatsFor / botByDomId / 折叠状态回写 /
+     复制按钮 / 内联编辑）都只看窗口内节点，窗口内节点仍带 msgDomId；
+   - 流式追加照旧走 updateBotDom：尾部在窗口内时原地增量更新，不在窗口内时
+     自动跳过（模型已更新，滚回去时按模型重建）；
+   - 小会话（不足 3 屏）窗口覆盖全部消息，行为与改造前一致。
+   对照开关：window.NP_VLIST = false 可退回全量渲染（仅用于排查）。
+   ============================================================ */
+var VLIST_ON = (typeof window === "undefined") || (window.NP_VLIST !== false);
+var V_OVERSCAN = 800;            /* 视口两侧各多渲染的像素 */
+var V_MARGIN_FALLBACK = 18;      /* .msg 的 margin-bottom（offsetHeight 不含它） */
+var V_SUPPRESS_SCROLL = false;   /* 补建窗口节点期间抑制 updateBotDom 的贴底 */
+var V = {
+  on: false, sid: null, list: null,
+  nodes: {},                     /* index -> 已渲染节点 */
+  h: [], hest: [],               /* 每条高度 / 该高度是否为估算值 */
+  start: -1, end: -1,
+  padTop: null, padBot: null,
+  raf: 0, resizeT: 0, bound: false,
+  anchorIdx: 0, anchorOff: 0, pendAnchor: null,
+  keepBottom: 0, keepAnchor: 0          /* 诊断计数：贴底补偿 / 锚点补偿各触发多少次 */
+};
+function vBox() { return document.getElementById("msgs"); }
+function vInner() { return document.getElementById("msgs-inner"); }
+
+/* 高度估算：只用于尚未渲染过的消息。折叠的 think / toolcard 正文是
+   display:none，只占标题行，因此按标题行高度估，避免整体估算严重偏大。 */
+function vEstimateMsg(m) {
+  if (!m) { return 60; }
+  if (m.kind === "user") { return 64; }
+  var est = 46;                  /* .who 头像行 */
+  var segs = m.segments || [];
+  for (var i = 0; i < segs.length; i++) {
+    var s = segs[i];
+    if (!s) { continue; }
+    if (s.type === "think") { est += s.open ? 240 : 32; }
+    else if (s.type === "tool") { est += (s.card && s.card.open) ? 260 : 36; }
+    else if (s.type === "output") {
+      var txt = String(s.text || "");
+      /* 约 58 字符折一行、行高 20px，上限 8000px（超长输出交给实测修正） */
+      est += 30 + Math.min(8000, Math.ceil(txt.length / 58) * 20);
+    }
+  }
+  if (m.stats) { est += 22; }
+  if (m.status === "running") { est += 24; }
+  return est;
+}
+function vMarginOf(node) {
+  try {
+    var v = parseFloat(window.getComputedStyle(node).marginBottom);
+    if (isFinite(v)) { return v; }
+  } catch (e) { /* 取不到就用常量兜底 */ }
+  return V_MARGIN_FALLBACK;
+}
+function vMeasureNode(node) {
+  if (!node) { return 0; }
+  var h = node.offsetHeight || 0;
+  return h > 0 ? (h + vMarginOf(node)) : 0;
+}
+function vTeardown() {
+  if (V.raf) { try { cancelAnimationFrame(V.raf); } catch (e) {} V.raf = 0; }
+  V.on = false; V.sid = null; V.list = null;
+  V.nodes = {}; V.h = []; V.hest = [];
+  V.start = -1; V.end = -1;
+  V.padTop = null; V.padBot = null;
+  V.anchorIdx = 0; V.anchorOff = 0; V.pendAnchor = null;
+}
+/* 建立容器与上下占位条；会话 / 消息数组换了就重建 */
+function vPrepare(sess) {
+  var inner = vInner();
+  if (!inner) { return false; }
+  if (V.on && V.sid === sess.id && V.list === sess.msgs
+      && V.padTop && V.padTop.parentNode) {
+    return true;
+  }
+  vTeardown();
+  inner.innerHTML = "";
+  inner.classList.add("vwin");
+  V.padTop = document.createElement("div");
+  V.padTop.className = "vpad";
+  V.padBot = document.createElement("div");
+  V.padBot.className = "vpad";
+  inner.appendChild(V.padTop);
+  inner.appendChild(V.padBot);
+  V.on = true;
+  V.sid = sess.id;
+  V.list = sess.msgs;
+  V.nodes = {};
+  V.start = -1; V.end = -1;
+  vBind();
+  vInvalidateAll();
+  return true;
+}
+/* 列表长度变化（流式新增消息）后补齐高度数组 */
+function vSyncArrays() {
+  var list = V.list || [];
+  var n = list.length;
+  if (!V.h) { V.h = []; V.hest = []; }
+  if (V.h.length > n) { V.h.length = n; V.hest.length = n; }
+  for (var i = 0; i < n; i++) {
+    var h = V.h[i];
+    if (typeof h !== "number" || !isFinite(h) || h <= 0) {
+      V.h[i] = vEstimateMsg(list[i]);
+      V.hest[i] = true;
+    }
+  }
+}
+/* 全部高度作废重估：语言 / 宽度 / 渲染器（CDN 就绪）变化后调用。
+   已在 DOM 中的节点当场实测，剩下的走估算。 */
+function vInvalidateAll() {
+  /* 先按真实几何记下视口顶端那条消息，重估高度后再把它钉回原位 */
+  var snap = vCaptureAnchor();
+  var list = V.list || [];
+  var n = list.length;
+  V.h = new Array(n);
+  V.hest = new Array(n);
+  for (var i = 0; i < n; i++) {
+    V.h[i] = vEstimateMsg(list[i]);
+    V.hest[i] = true;
+  }
+  Object.keys(V.nodes).forEach(function (k) {
+    var i = +k;
+    var nd = V.nodes[k];
+    if (!nd || !nd.parentNode || !(i < n)) { return; }
+    var h = vMeasureNode(nd);
+    if (h > 0) { V.h[i] = h; V.hest[i] = false; }
+  });
+  vApplyPads(false);
+  vKeepView(snap);
+}
+function vOffsets() {
+  var n = V.list ? V.list.length : 0;
+  var off = new Array(n + 1);
+  var acc = 0;
+  for (var i = 0; i < n; i++) {
+    off[i] = acc;
+    acc += (V.h[i] > 0 ? V.h[i] : 1);
+  }
+  off[n] = acc;
+  return off;
+}
+/* 第一个满足 off[i+1] > x 的下标（off 单调递增，二分） */
+function vLowerBound(off, n, x) {
+  var lo = 0, hi = n;
+  while (lo < hi) {
+    var mid = (lo + hi) >> 1;
+    if (off[mid + 1] <= x) { lo = mid + 1; } else { hi = mid; }
+  }
+  return lo < n ? lo : (n > 0 ? n - 1 : 0);
+}
+function vComputeRange(box, off) {
+  var n = V.list ? V.list.length : 0;
+  if (!n) { return [0, -1]; }
+  var vh = box.clientHeight || 600;
+  var lo = box.scrollTop - V_OVERSCAN;
+  var hi = box.scrollTop + vh + V_OVERSCAN;
+  var s = vLowerBound(off, n, lo);
+  var e = s;
+  while (e < n - 1 && off[e + 1] < hi) { e++; }
+  return [s, e];
+}
+/* 几何锚点：直接量「视口顶端那条消息」的真实位置，而不是用估算高度反推下标——
+   off[] 里绝大多数条目是估算值，估算与实际布局的偏差会让算术锚点选错消息，
+   重测高度后视图就会跳。快照 = { idx: 消息下标, off: 该消息顶部已滚过视口顶端的距离 } */
+function vIndexOfNode(node) {
+  var ks = Object.keys(V.nodes);
+  for (var i = 0; i < ks.length; i++) {
+    if (V.nodes[ks[i]] === node) { return +ks[i]; }
+  }
+  return -1;
+}
+function vCaptureAnchor() {
+  var box = vBox();
+  var inner = vInner();
+  if (!box || !inner) { return null; }
+  /* 贴底状态必须在「改写高度 / 占位条之前」判定：重排会让盒子瞬间离开底部，
+     那时再判定就会把「用户本就贴底」误判成「用户停在某条消息上」。 */
+  var pinned = _atBottom(box, 24);
+  var nodes = inner.querySelectorAll(".msg");
+  var boxTop = box.getBoundingClientRect().top;
+  for (var i = 0; i < nodes.length; i++) {
+    var r = nodes[i].getBoundingClientRect();
+    if (r.bottom > boxTop + 0.5) {
+      var idx = vIndexOfNode(nodes[i]);
+      if (idx >= 0) { return { idx: idx, off: boxTop - r.top, pinned: pinned }; }
+    }
+  }
+  return { idx: -1, off: 0, pinned: pinned };
+}
+/* 按几何快照还原 scrollTop：让快照里那条消息回到它原来的视口位置。
+   写 scrollTop 前登记 _progScrollTop，避免被 scroll 守卫误判成「用户上翻」。 */
+function vRestoreAnchor(snap) {
+  if (!snap) { return false; }
+  var box = vBox();
+  if (!box) { return false; }
+  var node = (snap.idx >= 0) ? V.nodes[snap.idx] : null;
+  /* 该消息已不在窗口内：说明滚动位置是主动跳变的（切换会话 / 拖到底部），不干预 */
+  if (!node) { return false; }
+  var d = node.getBoundingClientRect().top - box.getBoundingClientRect().top;
+  var delta = d + snap.off;   /* >0：锚点比预期更靠下，把视图往下推同样的量 */
+  if (!isFinite(delta) || Math.abs(delta) <= 0.5) { return true; }
+  var want = box.scrollTop + delta;
+  var max = Math.max(0, box.scrollHeight - box.clientHeight);
+  if (want < 0) { want = 0; }
+  if (want > max) { want = max; }
+  _progScrollTop = want;
+  _instantScrollTo(box, want);
+  _lastScrollTop = box.scrollTop;
+  return true;
+}
+/* 高度 / 占位条变化后的统一收尾：贴底就继续贴底，否则按快照还原视图 */
+function vKeepView(snap) {
+  var box = vBox();
+  if (!box) { return; }
+  var pinned = snap ? snap.pinned : _atBottom(box, 24);
+  if (pinned) {
+    V.keepBottom++;
+    _progScrollTop = Math.max(0, box.scrollHeight - box.clientHeight);
+    _instantScrollTo(box, box.scrollHeight);
+    _lastScrollTop = box.scrollTop;
+    return;
+  }
+  V.keepAnchor++;
+  vRestoreAnchor(snap);
+}
+/* 写占位条高度；keepAnchor 时补偿 scrollTop（贴底就继续贴底，否则锚点不动） */
+function vApplyPads(keepAnchor) {
+  if (!V.on || !V.padTop || !V.padBot) { return; }
+  var n = V.list ? V.list.length : 0;
+  if (!n) {
+    V.padTop.style.height = "0px";
+    V.padBot.style.height = "0px";
+    return;
+  }
+  var off = vOffsets();
+  var s = V.start < 0 ? 0 : V.start;
+  var e = V.end;
+  var topH = off[s];
+  var botH = Math.max(0, off[n] - (e >= 0 ? off[e + 1] : off[s]));
+  var curT = parseFloat(V.padTop.style.height);
+  if (!(Math.abs(curT - topH) <= 0.5)) { V.padTop.style.height = topH + "px"; }
+  var curB = parseFloat(V.padBot.style.height);
+  if (!(Math.abs(curB - botH) <= 0.5)) { V.padBot.style.height = botH + "px"; }
+  if (!keepAnchor) { return; }
+  /* 补偿只认几何快照（见 vCaptureAnchor）：pendAnchor 由 vSyncWindow 在重建窗口
+     之前放好；没有就用当前几何现取一份 */
+  var snap = V.pendAnchor;
+  V.pendAnchor = null;
+  vKeepView(snap || vCaptureAnchor());
+}
+/* 核心：按当前滚动位置同步窗口 */
+function vSyncWindow(force) {
+  if (!VLIST_ON || !V.on) { return; }
+  var box = vBox();
+  var inner = vInner();
+  if (!box || !inner || !V.list || !V.padBot) { return; }
+  var sess = S.sessions[V.sid];
+  if (!sess || S.sid !== V.sid) { return; }
+  vSyncArrays();
+  var n = V.list.length;
+  if (!n) { return; }
+  var off = vOffsets();
+  var r = vComputeRange(box, off);
+  var s = r[0], e = r[1];
+  if (!force && s === V.start && e === V.end) { vApplyPads(false); return; }
+  /* 锚点：视口顶端所在消息 + 它顶部到视口的偏移（高度变化后据此还原视图） */
+  var aIdx = vLowerBound(off, n, box.scrollTop);
+  V.anchorIdx = aIdx;
+  V.anchorOff = box.scrollTop - off[aIdx];
+  /* 重建窗口前先取几何快照，供 vApplyPads 里的 vKeepView 还原视图 */
+  V.pendAnchor = vCaptureAnchor();
+  /* 卸掉窗口外节点 */
+  Object.keys(V.nodes).forEach(function (k) {
+    var i = +k;
+    var nd = V.nodes[k];
+    if (i < s || i > e || !(i < n)) {
+      if (nd && nd.parentNode) { nd.parentNode.removeChild(nd); }
+      delete V.nodes[k];
+    }
+  });
+  /* 补建窗口内缺失节点：插入到「下一个已存在节点」或底占位条之前，保持顺序 */
+  for (var i = s; i <= e; i++) {
+    if (V.nodes[i] || !V.list[i]) { continue; }
+    var node = vShell(sess, V.list[i]);
+    var ref = null;
+    for (var j = i + 1; j <= e; j++) {
+      if (V.nodes[j]) { ref = V.nodes[j]; break; }
+    }
+    inner.insertBefore(node, ref || V.padBot);
+    V.nodes[i] = node;
+    vHydrate(sess, V.list[i], node);
+  }
+  V.start = s;
+  V.end = e;
+  /* 实测窗口内高度（先全部建好再测，只触发一次同步布局） */
+  var changed = false;
+  for (var k2 = s; k2 <= e; k2++) {
+    var nd2 = V.nodes[k2];
+    if (!nd2) { continue; }
+    var h = vMeasureNode(nd2);
+    if (h > 0) {
+      if (Math.abs(h - V.h[k2]) > 0.5) { V.h[k2] = h; changed = true; }
+      V.hest[k2] = false;
+    }
+  }
+  vApplyPads(changed || force);
+}
+function vSchedule() {
+  if (!V.on || V.raf) { return; }
+  V.raf = requestAnimationFrame(function () { V.raf = 0; vSyncWindow(false); });
+}
+/* 是否需要走「无动画开屏」：超过 3 屏的会话跳过入场滑动动画 */
+function vIsBig() {
+  var box = vBox();
+  if (!box) { return false; }
+  var list = V.list || [];
+  var acc = 0;
+  for (var i = 0; i < list.length; i++) { acc += (V.h[i] > 0 ? V.h[i] : 1); }
+  return acc > 3 * Math.max(400, box.clientHeight || 0);
+}
+function vBind() {
+  if (V.bound) { return; }
+  V.bound = true;
+  var box = vBox();
+  if (box) { box.addEventListener("scroll", function () { vSchedule(); }, { passive: true }); }
+  /* 宽度变化会改变折行 → 全部高度重估；防抖避免拖拽窗口时反复重排 */
+  window.addEventListener("resize", function () {
+    if (!V.on) { return; }
+    if (V.resizeT) { clearTimeout(V.resizeT); }
+    V.resizeT = setTimeout(function () {
+      V.resizeT = 0;
+      if (!V.on) { return; }
+      vInvalidateAll();
+      vSyncWindow(true);
+    }, 160);
+  });
+}
+
 function renderAllMessages(sid, animate) {
   var inner = $("#msgs-inner");
-  if (!sid) { inner.innerHTML = '<div class="empty-note">' + esc(t("chat.empty")) + '</div>'; return; }
-  var sess = S.sessions[sid];
-  if (!sess) { inner.innerHTML = ""; return; }
-  inner.innerHTML = "";
-  if (!sess.msgs.length) {
+  if (!sid) {
+    vTeardown(); inner.classList.remove("vwin");
     inner.innerHTML = '<div class="empty-note">' + esc(t("chat.empty")) + '</div>';
     return;
   }
-  sess.msgs.forEach(function (m) { appendMsgDom(sess, m); });
-  scrollBottom(true, !!animate);
+  var sess = S.sessions[sid];
+  if (!sess) { vTeardown(); inner.classList.remove("vwin"); inner.innerHTML = ""; return; }
+  if (!sess.msgs.length) {
+    vTeardown(); inner.classList.remove("vwin");
+    inner.innerHTML = '<div class="empty-note">' + esc(t("chat.empty")) + '</div>';
+    return;
+  }
+  if (!VLIST_ON) {
+    /* 对照排查开关（window.NP_VLIST = false）：退回改造前的全量渲染 */
+    vTeardown(); inner.classList.remove("vwin");
+    inner.innerHTML = "";
+    sess.msgs.forEach(function (m) { appendMsgDom(sess, m); });
+    scrollBottom(true, !!animate);
+    return;
+  }
+  vPrepare(sess);
+  vSyncWindow(true);
+  /* 大会话不做「从顶部滑到底部」的入场动画：动画会逐帧穿过整条历史，等于把
+     省掉的全量渲染又做一遍。小会话（不足 3 屏）保持原动画不变。 */
+  scrollBottom(true, !!animate && !vIsBig());
 }
 function msgDomId(sess, m) { return "m-" + sess.id.slice(0, 6) + "-" + m.seq; }
 /* DOM 定位消息对象（用于把折叠状态写回模型对象，重绘不丢失） */
@@ -3630,26 +4024,48 @@ function syncSegOpen(blockEl, type) {
   if (type === "think") { seg.open = blockEl.classList.contains("open"); }
   else if (type === "tool" && seg.card) { seg.card.open = blockEl.classList.contains("open"); }
 }
-function appendMsgDom(sess, m) {
-  var inner = $("#msgs-inner");
-  if (S.sid !== sess.id) return;
-  if (!sess.msgs.length) inner.innerHTML = "";
-  var emptyNote = inner.querySelector(".empty-note");
-  if (emptyNote) emptyNote.remove();
+/* 消息节点骨架：只建静态结构；助手消息的分段 / 统计 / 任务行随后由
+   vHydrate 填充。虚拟列表与旧的全量渲染共用这一个构造函数，两边 DOM 结构一致。 */
+function vShell(sess, m) {
   var el = document.createElement("div");
   el.id = msgDomId(sess, m);
   if (m.kind === "user") {
     el.className = "msg msg-user";
     el.innerHTML = '<div class="u-col">' + renderUserBubble(sess, m) + "</div>";
-  } else {
-    el.className = "msg msg-assistant";
-    el.innerHTML = '<div class="who"><span class="avatar">' + SVG.bot + '</span><span>FarStars</span><span class="t"></span></div>'
-      + '<div class="body"><div class="segments"></div><div class="statsline hidden"></div><div class="taskline hidden"></div></div>';
-    inner.appendChild(el);
-    updateBotDom(sess, m, true);
+    return el;
+  }
+  el.className = "msg msg-assistant";
+  el.innerHTML = '<div class="who"><span class="avatar">' + SVG.bot + '</span><span>FarStars</span><span class="t"></span></div>'
+    + '<div class="body"><div class="segments"></div><div class="statsline hidden"></div><div class="taskline hidden"></div></div>';
+  return el;
+}
+/* 填充骨架：助手消息复用 updateBotDom（分段增量 / 统计 / 任务行同一实现），
+   期间抑制贴底，避免补建历史节点时把视图拽到底部。 */
+function vHydrate(sess, m, el) {
+  if (!el || !m || m.kind !== "bot") return;
+  var prev = V_SUPPRESS_SCROLL;
+  V_SUPPRESS_SCROLL = true;
+  try { updateBotDom(sess, m, true); } finally { V_SUPPRESS_SCROLL = prev; }
+}
+function appendMsgDom(sess, m) {
+  /* 虚拟列表生效：节点只在窗口内存在，追加交给窗口管理 */
+  if (VLIST_ON && V.on && V.sid === sess.id && V.list === sess.msgs) {
+    var i = V.list.indexOf(m);
+    if (i < 0) { return; }
+    V.h[i] = vEstimateMsg(m);
+    V.hest[i] = true;
+    vSyncWindow(true);
     return;
   }
+  /* 未启用虚拟列表（或会话未就绪）：与改造前完全一致的全量追加 */
+  var inner = $("#msgs-inner");
+  if (S.sid !== sess.id) return;
+  if (!sess.msgs.length) inner.innerHTML = "";
+  var emptyNote = inner.querySelector(".empty-note");
+  if (emptyNote) emptyNote.remove();
+  var el = vShell(sess, m);
   inner.appendChild(el);
+  vHydrate(sess, m, el);
 }
 /* 工具卡片（分段渲染共用；open 状态记录在卡片对象上，重绘不丢失）。
    拆成 class / inner 两个片段，便于结构不变时原地更新节点（不重建）。 */
@@ -3801,7 +4217,7 @@ function updateBotDom(sess, bot, full) {
     line.classList.add("hidden");
   }
   /* 流式更新后自动跟随到底部（仅在用户本就位于底部附近时；用户上翻时不打扰） */
-  scrollBottom();
+  if (!V_SUPPRESS_SCROLL) { scrollBottom(); }
 }
 function taskLineText(bot) {
   if (bot.status === "running") return '<span class="spin"></span>' + (LANG === "zh_CN" ? "生成中…" : "working…");
@@ -4207,6 +4623,13 @@ function handleEvent(item) {
       return;
     }
     case "question": {
+      /* 提问走全局事件流（全部会话 + 手机代理同一条 SSE）：先认领归属，不属于
+         当前会话的提问只登记到它自己的会话（列表打标 + 提示），切过去再弹 */
+      if (!fresh(item.ts, ASK_TTL)) return;                  /* 服务端已丢弃 */
+      if (item.question_id && S.askSeen[item.question_id]
+          && fresh(S.askSeen[item.question_id], ASK_TTL)) return;   /* 已展示过 */
+      var _qsid = askOwner(item);
+      if (_qsid && _qsid !== S.sid) { rememberAsk(_qsid, item); return; }
       showAsk(item);
       return;
     }
@@ -4521,7 +4944,12 @@ var askState = null;
 function showAsk(item) {
   var kind = item.kind || "clarify";
   var isApproval = (kind === "approval");
-  askState = { qid: item.question_id, sid: item.sid || S.sid || "", kind: kind };
+  var qid = item.question_id || "";
+  var qsid = item.sid || S.sid || "";
+  markAskSeen(qid);
+  clearAsk(qsid);
+  renderSessions();
+  askState = { qid: qid, sid: qsid, kind: kind, item: item };
   /* Markdown render: the agent is instructed to write questions in Markdown
      (### headings / lists); render with the shared md() so the
      dialog matches the chat bubbles instead of showing raw source. */
@@ -4558,6 +4986,41 @@ function answerAsk(answer) {
   askState = null;
   api("POST", "/answer", payload).catch(function (e) { toast(String(e.message || e), "err"); });
 }
+/* 提问事件走的是全局事件流（所有会话、手机代理共用同一条 SSE），因此必须认领
+   归属：不属于当前会话的提问只登记到它的会话（列表打标 + 提示），等用户切过去
+   再弹窗，避免"看着 B 会话却回答了 A 会话的提问"。 */
+var ASK_TTL = 300;            /* WebUI.ask_timeout 秒：超时后服务端已丢弃该提问 */
+function askOwner(item) {
+  var sid = (item && item.sid) || "";
+  if (sid) return sid;
+  /* 服务端丢失 sid（ask_user 不在任务线程里调用）时的唯一候选：仅一条会话在跑 */
+  var running = Object.keys(S.sessions).filter(function (k) {
+    return S.sessions[k] && S.sessions[k].running;
+  });
+  return running.length === 1 ? running[0] : "";
+}
+function markAskSeen(qid) {
+  if (!qid) return;
+  var cut = nowSec() - ASK_TTL;
+  Object.keys(S.askSeen).forEach(function (k) {
+    if (S.askSeen[k] < cut) { delete S.askSeen[k]; }
+  });
+  S.askSeen[qid] = nowSec();
+}
+function rememberAsk(sid, item) {
+  if (!sid) return;
+  S.askPending[sid] = { item: item, ts: item.ts || nowSec() };
+  renderSessions();
+  var title = (S.sessions[sid] && S.sessions[sid].title) || sid.slice(0, 8);
+  toast(t("ask.title") + " · " + title, "warn");
+}
+function pendingAsk(sid) {
+  var rec = sid ? S.askPending[sid] : null;
+  if (!rec) return null;
+  if (!fresh(rec.ts, ASK_TTL)) { delete S.askPending[sid]; return null; }
+  return rec.item;
+}
+function clearAsk(sid) { if (sid) delete S.askPending[sid]; }
 
 /* ============================================================
    SSE connection
@@ -7050,6 +7513,38 @@ function init() {
     fromMarkdown: function (s) { return themeFromMarkdown(s); },
     parseImport: function (s) { return themeParseImport(s); },
     validateCss: function (s) { return themeValidateCss(s); }
+  };
+  /* 测试 / 调试钩子：虚拟列表窗口状态与聊天渲染入口（不参与业务逻辑） */
+  window.__norpVList = {
+    on: function () { return VLIST_ON; },
+    state: function () {
+      var est = 0;
+      if (V.hest) { for (var i = 0; i < V.hest.length; i++) { if (V.hest[i]) { est++; } } }
+      return { on: V.on, sid: V.sid, start: V.start, end: V.end,
+               rendered: Object.keys(V.nodes).length,
+               total: V.list ? V.list.length : 0,
+               estimated: est,
+               padTop: V.padTop ? V.padTop.style.height : null,
+               padBot: V.padBot ? V.padBot.style.height : null,
+               anchorIdx: V.anchorIdx, anchorOff: V.anchorOff,
+               keepBottom: V.keepBottom, keepAnchor: V.keepAnchor };
+    },
+    sync: function (force) { vSyncWindow(!!force); },
+    invalidate: function () { vInvalidateAll(); vSyncWindow(true); }
+  };
+  window.__norpChat = {
+    sessions: function () { return S.sessions; },
+    state: function () { return { sid: S.sid, order: S.order }; },
+    put: function (sid, sess) { S.sessions[sid] = sess; },
+    focus: function (sid) { S.sid = sid; },
+    order: function (a) { if (a) { S.order = a; } return S.order; },
+    run: function (fn) { return fn(S); },
+    render: renderAllMessages,
+    updateBot: updateBotDom,
+    append: appendMsgDom,
+    msgDomId: msgDomId,
+    scrollBottom: scrollBottom,
+    instantScroll: _instantScrollTo
   };
   bootRenderer();
   ensureStatsTicker();

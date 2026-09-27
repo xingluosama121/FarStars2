@@ -27,6 +27,7 @@ from norpagent.builtin.sandboxes.pooled import (
     _kill_process_tree,
     _robust_decode,
     _stream_reader,
+    _suppress_windows_error_dialogs,
 )
 from norpagent.loops.cancel import cancel_requested
 from norpagent.protocols.sandbox import SandboxResult
@@ -48,6 +49,7 @@ class SubprocessSandbox:
         env: Optional[Dict[str, str]] = None,
     ) -> SandboxResult:
         try:
+            _suppress_windows_error_dialogs()
             proc = subprocess.Popen(
                 command,
                 shell=True,  # cross-platform: cmd on Windows, /bin/sh on POSIX

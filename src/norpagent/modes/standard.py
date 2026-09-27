@@ -18,6 +18,9 @@ _SYSTEM_PROMPT = (
     "You can use file read/write, command execution, web retrieval and other tools to complete complex engineering tasks. "
     "For long-period tasks: write intermediate conclusions into the context store (context_add) for later retrieval, "
     "and submit independent subtasks to the queue (task_submit) to advance in parallel. "
+    "Call task_done when a milestone is finished and verified, with a summary of what "
+    "was done and what is needed to continue: it moves the history boundary so the "
+    "finished work stops being replayed while the steps after it stay verbatim. "
     "Follow engineering best practices: understand before acting; state the plan before important operations. "
     "All file operations are strictly confined to the workspace root; use relative paths."
 )
@@ -56,6 +59,8 @@ def build_standard_preset(model: str = "openai_compat") -> Preset:
             "task_list",
             "task_status",
             "task_cancel",
+            # milestone boundary: lets the model mark completed work
+            "task_done",
         ],
         session="sqlite",  # persistent sessions; switch to "memory" for in-memory environments
         sandbox="pooled",  # pooled sandbox; switch to "subprocess" for simple environments

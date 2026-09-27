@@ -87,7 +87,7 @@ _TOOL_CATEGORIES = (
     ("web", ("web_search", "web_fetch", "web_extract_links")),
     ("context", ("context_add", "context_search", "context_list", "context_delete")),
     ("project", ("project_status",)),
-    ("task", ("task_submit", "task_list", "task_status", "task_cancel")),
+    ("task", ("task_submit", "task_list", "task_status", "task_cancel", "task_done")),
 )
 
 
@@ -294,7 +294,7 @@ class RescueToolEnvironment:
             "web_search", "web_fetch", "web_extract_links",
             "context_add", "context_search", "context_list", "context_delete",
             "project_status",
-            "task_submit", "task_list", "task_status", "task_cancel",
+            "task_submit", "task_list", "task_status", "task_cancel", "task_done",
         }
         for name in self.registry.list_tools():
             try:

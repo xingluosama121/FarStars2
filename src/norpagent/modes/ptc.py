@@ -17,7 +17,11 @@ _SYSTEM_PROMPT = (
     "2. In the code, call the Agent's registered tools via call_tool(tool_name, **args);\n"
     "3. Organize call order, conditionals and result aggregation in code;\n"
     "4. Execute the code with the run_python tool and continue or answer based on the output.\n"
-    "Simple questions can be answered directly without writing code."
+    "Simple questions can be answered directly without writing code.\n"
+    "When a milestone of a long task is finished and verified, call task_done with a "
+    "summary of what was done and what is needed to continue: it moves the history "
+    "boundary so the finished work stops being replayed while the steps after it "
+    "stay verbatim."
 )
 
 
@@ -52,6 +56,8 @@ def build_ptc_preset(model: str = "openai_compat") -> Preset:
             "task_list",
             "task_status",
             "task_cancel",
+            # milestone boundary: lets the model mark completed work
+            "task_done",
         ],
         session="sqlite",
         sandbox="pooled",

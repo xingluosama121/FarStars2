@@ -35,7 +35,7 @@ import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-_UA = "norpagent-multimodal/2.2.4 (FarStars)"
+_UA = "norpagent-multimodal/2.3.1 (FarStars)"
 
 
 class MultimodalError(Exception):

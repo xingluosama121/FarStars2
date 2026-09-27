@@ -20,6 +20,7 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
@@ -108,9 +109,33 @@ _TEXT_TYPES = (
 _ENGINE_COOLDOWN: Dict[str, float] = {}
 _ENGINE_COOLDOWN_SECONDS = 180.0
 
+# ── 引擎节流 + 反爬识别（2026-09-19）─────────────────────────
+# 实测（2026-09-19）：连续快速请求会被引擎判定为爬虫。
+#   百度最明显——一轮并发查询之后，同一 IP 在数分钟内所有查询都只返回
+#   安全验证页（HTTP 200、无结果块），且不会自行恢复。
+# 因此：① 对同一引擎的相邻请求强制最小间隔；② 把"安全验证页"识别为
+#   引擎不可用并进冷却，而不是当成"这次没搜到"——后者会让每一次搜索
+#   都重新去撞同一堵墙。
+_ENGINE_LAST_CALL: Dict[str, float] = {}
+_ENGINE_MIN_INTERVAL = 1.2      # 同一引擎相邻请求的最小间隔（秒）
+
+# 命中任一特征即视为被反爬拦截。
+_BLOCK_MARKERS = (
+    # 百度
+    "百度安全验证", "wappass.baidu.com", "verify.baidu.com", "security-verify",
+    # Bing
+    "unusual traffic", "captcha", "verify you are human", "are you a robot",
+    # DuckDuckGo
+    "unfortunately, bots use duckduckgo too",
+    # 通用
+    "enable javascript and cookies to continue",
+)
+
 # ── 可选搜索引擎 + 翻页上限（2026-09-14）─────────────────────
-# 内置引擎：auto（默认：DDG → Bing 链）/ duckduckgo / bing / baidu / custom（自定义端点）。
-# 默认引擎可被环境变量 NORPAGENT_WEB_SEARCH_ENGINE 覆盖。
+# 内置引擎：auto（默认回退链 Bing → Baidu → DuckDuckGo）/ duckduckgo /
+# bing / baidu / custom（自定义端点）。默认引擎可被环境变量
+# NORPAGENT_WEB_SEARCH_ENGINE 覆盖。
+# 2026-09-19：回退链顺序改为 Bing 优先，不再按查询语言分流。
 _BUILTIN_ENGINES = ("auto", "duckduckgo", "bing", "baidu", "custom")
 _ENGINE_LABELS = {"duckduckgo": "DuckDuckGo", "bing": "Bing", "baidu": "Baidu"}
 _MAX_RESULTS_CAP = 50      # max_results 上限
@@ -130,6 +155,241 @@ def _mark_engine_down(name: str) -> None:
 def _reset_engine_cooldown() -> None:
     """Clear the engine health cache (tests / manual reset)."""
     _ENGINE_COOLDOWN.clear()
+    _ENGINE_LAST_CALL.clear()
+
+
+def _throttle(engine_key: str) -> None:
+    """同一引擎相邻请求之间的最小间隔（防反爬）。"""
+    now = time.time()
+    last = _ENGINE_LAST_CALL.get(engine_key)
+    if last is not None:
+        wait = _ENGINE_MIN_INTERVAL - (now - last)
+        if wait > 0:
+            time.sleep(wait)
+    _ENGINE_LAST_CALL[engine_key] = time.time()
+
+
+def _looks_blocked(body: str) -> bool:
+    """响应体是否像反爬 / 安全验证页。"""
+    if not body:
+        return False
+    head = body[:20000].lower()
+    return any(marker.lower() in head for marker in _BLOCK_MARKERS)
+
+
+def _query_tokens(query: str) -> List[str]:
+    """查询词切分：ASCII 词（>=2 字符）+ 中文双字组（单字中文自成一组）。"""
+    tokens: List[str] = []
+    for word in re.findall(r"[A-Za-z0-9_]{2,}", query or ""):
+        tokens.append(word.lower())
+    for run in re.findall(r"[\u4e00-\u9fff]+", query or ""):
+        if len(run) == 1:
+            tokens.append(run)
+        else:
+            tokens.extend(run[i:i + 2] for i in range(len(run) - 1))
+    return tokens
+
+
+def _results_relevant(results: List[Tuple[str, str, str]], query: str) -> bool:
+    """结果与查询词是否存在任何字面重叠。
+
+    用于识别"引擎返回了一个与查询无关的通用页"（实测遇到过：查询
+    'Chalkbeat Khanmigo' 返回加拿大本地的披萨店聚合页）。只在**完全无
+    重叠**时判为无关，以免误杀。
+    注意这是粗筛：它抓不住"只匹配了查询里第一个词"这种部分退化，那种
+    情况需要更重的语义判断，本函数不做承诺。
+    """
+    tokens = _query_tokens(query)
+    if not tokens or not results:
+        return True
+    haystack = " ".join(
+        ((title or "") + " " + (snippet or "")) for title, _href, snippet in results
+    ).lower()
+    return any(token in haystack for token in tokens)
+
+
+# ── 工具层并行（2026-09-19）──────────────────────────────────
+# 并发全部落在**工具内部**，不改内核调度：内核的 tool_calls 循环仍是串行
+# 的（kernel/agent.py），避免把并发语义污染进内核。这里直接复用库自研的
+# nasyncio 事件循环设施（norpagent.loops.nasyncio.NasyncioLoopRuntime，
+# 零 asyncio 依赖），而不是另起 stdlib 线程池。
+#
+# 并发维度是**关键词 / URL**，不是引擎：一次调用里的多个关键词各自独立跑
+# 完自己的引擎回退链，彼此并发。
+#
+# 两档限流：
+#   - _MAX_LANES：整体并发上限（关键词 / URL 级），默认 64；
+#   - _DOMAIN_LIMIT：同一 DNS 归属（域名相同，或解析到同一 IP）上限
+#     5 路/次，防止对同一目标站短时猛打被封。
+_MAX_LANES = 64
+_DOMAIN_LIMIT = 5
+_PARALLEL_FALLBACK = 8      # 自研循环不可用时的降级并发度
+_COLLECT_TIMEOUT = 60.0     # 整批收集的总预算（秒）
+
+_RUNTIME_LOCK = threading.Lock()
+_RUNTIME: Any = None
+
+
+def _get_runtime():
+    """惰性启动自研 nasyncio 运行时（进程内单例，64 worker）。
+
+    复用库自身的异步设施而非另造线程池；启动失败返回 None，调用方降级为
+    受控的小并发。
+    """
+    global _RUNTIME
+    if _RUNTIME is not None:
+        return _RUNTIME
+    with _RUNTIME_LOCK:
+        if _RUNTIME is not None:
+            return _RUNTIME
+        try:
+            from norpagent.loops.nasyncio import NasyncioLoopRuntime
+        except Exception:
+            _RUNTIME = False
+            return None
+        try:
+            rt = NasyncioLoopRuntime(config={"max_workers": _MAX_LANES})
+            rt.start()
+        except Exception:
+            _RUNTIME = False
+            return None
+        _RUNTIME = rt
+        return rt
+
+
+def _host_group(url: str) -> str:
+    """同一 DNS 归属分组键：优先用解析后的 IP，取不到则退回主机名。
+
+    同组内最多 _DOMAIN_LIMIT 路并发。用 IP 而非域名作键，是为了让"不同
+    域名指向同一台机器"也能被同一档限流覆盖。
+    """
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        return ""
+    if not host:
+        return ""
+    try:
+        infos = socket.getaddrinfo(host, None)
+        if infos:
+            return infos[0][4][0]
+    except Exception:
+        pass
+    return host
+
+
+def _parallel_map(jobs, timeout: float = _COLLECT_TIMEOUT):
+    """并发跑完 jobs 里的每一项，**等全部结束**再返回（不做提前中止）。
+
+    Args:
+        jobs: [(key, group, fn), ...]；key 用于回传顺序，group 是限流分组键。
+
+    Returns:
+        {key: (ok, value_or_exception)} —— 与 jobs 一一对应；超时未完成的
+        项标记为 (False, TimeoutError)。
+    """
+    n = len(jobs)
+    if n == 0:
+        return {}
+    if n == 1:
+        key, _grp, fn = jobs[0]
+        try:
+            return {key: (True, fn())}
+        except Exception as exc:  # noqa: BLE001
+            return {key: (False, exc)}
+
+    runtime = _get_runtime()
+    out: Dict[Any, Tuple[bool, Any]] = {}
+    deadline = time.monotonic() + timeout
+
+    if runtime is None:
+        # 降级：受控的小并发，保证工具仍可用。
+        from concurrent.futures import ThreadPoolExecutor
+        lanes = max(1, min(_PARALLEL_FALLBACK, n))
+        with ThreadPoolExecutor(max_workers=lanes) as pool:
+            fut = {key: pool.submit(fn) for key, _grp, fn in jobs}
+            for key, f in fut.items():
+                try:
+                    out[key] = (True, f.result(timeout=max(1.0, deadline - time.monotonic())))
+                except Exception as exc:  # noqa: BLE001
+                    out[key] = (False, exc)
+        return out
+
+    handles: Dict[Any, Any] = {}
+    groups: Dict[Any, str] = {}
+    inflight: Dict[Any, str] = {}
+    group_count: Dict[str, int] = {}
+    waiting = [key for key, _grp, _fn in jobs]
+    fn_of = {key: fn for key, _grp, fn in jobs}
+    grp_of = {key: (grp or "") for key, grp, _fn in jobs}
+
+    def _fill():
+        rest = []
+        for key in waiting:
+            group = grp_of[key]
+            if len(inflight) >= _MAX_LANES or group_count.get(group, 0) >= _DOMAIN_LIMIT:
+                rest.append(key)
+                continue
+            handles[key] = runtime.submit_async(fn_of[key])
+            inflight[key] = group
+            groups[key] = group
+            group_count[group] = group_count.get(group, 0) + 1
+        waiting[:] = rest
+
+    _fill()
+    while inflight:
+        for key in list(inflight):
+            handle = handles[key]
+            try:
+                finished = handle.done()
+            except Exception:  # noqa: BLE001
+                finished = True
+            if not finished:
+                continue
+            group = inflight.pop(key)
+            group_count[group] = max(0, group_count.get(group, 0) - 1)
+            try:
+                out[key] = (True, handle.result(timeout=0))
+            except Exception as exc:  # noqa: BLE001
+                out[key] = (False, exc)
+        _fill()
+        if time.monotonic() > deadline:
+            break
+        if inflight:
+            time.sleep(0.005)
+
+    # 超时仍未完成的：主动取消并标记
+    for key in list(inflight):
+        try:
+            handles[key].cancel()
+        except Exception:  # noqa: BLE001
+            pass
+    for key, _grp, _fn in jobs:
+        if key not in out:
+            out[key] = (False, TimeoutError("parallel task not finished within the budget"))
+    return out
+
+
+def _host_of_result(href: str) -> str:
+    """搜索结果按目标域名分组（不做 DNS，避免翻页时为每条结果额外解析）。"""
+    try:
+        return (urlparse(href).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _dedupe_by_url(items):
+    """按 URL 去重，保留首次出现顺序。"""
+    seen = set()
+    out = []
+    for item in items:
+        href = item[1] if len(item) > 1 else ""
+        key = (href or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 def _requests_available() -> bool:
@@ -429,30 +689,84 @@ class WebFetchTool:
             "function": {
                 "name": self.name,
                 "description": (
-                    "Fetches the body text of a given URL (HTML tags/scripts/styles stripped automatically). "
+                    "Fetches the body text of one or more URLs (HTML tags/scripts/styles stripped "
+                    "automatically). Pass several URLs in \"urls\" and they are fetched "
+                    "concurrently; every URL is collected before returning. "
                     "Built-in SSRF protection; only public http/https addresses allowed. "
-                    "Returns truncated plain text, suitable for reading online docs, blogs, API responses, etc."
+                    "Overall concurrency is capped at 64, and at most 5 lanes per target domain "
+                    "or resolved IP. Returns truncated plain text, suitable for reading online "
+                    "docs, blogs, API responses, etc."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "url": {"type": "string", "description": "The full URL to fetch"},
+                        "url": {"type": "string", "description": "The full URL to fetch. For several independent URLs prefer \"urls\" instead of calling the tool repeatedly."},
+                        "urls": {"type": "array", "items": {"type": "string"}, "description": "Optional. Several URLs fetched CONCURRENTLY; all of them are collected before returning. Overall concurrency is capped at 64, and at most 5 lanes per target domain / resolved IP."},
                         "max_chars": {"type": "integer", "description": "Max characters to return (default 8000, range 500-50000)"},
                         "timeout": {"type": "integer", "description": "Request timeout in seconds (default 15, range 5-60)"},
                     },
-                    "required": ["url"],
                     "additionalProperties": False,
                 },
             },
         }
 
     def run(self, args: Dict[str, Any], ctx: Any) -> ToolResult:
-        url = _ensure_https(str(args.get("url") or "").strip())
-        if not url or url == "https://":
+        raw = args.get("urls")
+        targets: List[str] = []
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                candidate = _ensure_https(str(item or "").strip())
+                if candidate and candidate != "https://" and candidate not in targets:
+                    targets.append(candidate)
+        single = _ensure_https(str(args.get("url") or "").strip())
+        if single and single != "https://" and single not in targets:
+            targets.insert(0, single)
+        if not targets:
             return ToolResult(output="Please provide a URL to fetch.", success=False, error="missing_url")
         max_chars = max(500, min(int(args.get("max_chars") or 8000), 50000))
         timeout = max(5, min(int(args.get("timeout") or 15), 60))
 
+        # 单个 URL：直接返回原有的单页版式（不引入并发与分组开销）。
+        if len(targets) == 1:
+            return self._fetch_one(targets[0], max_chars, timeout)
+
+        # 多个 URL：自研 nasyncio 运行时并发抓取，整批全部收集完再返回。
+        # 限流分组键按"解析后的 IP（取不到则退回主机名）"计算，使指向同一
+        # 台机器的不同域名共享 5 路上限。
+        jobs = []
+        for idx, target in enumerate(targets):
+            jobs.append((idx, _host_group(target),
+                         (lambda u: (lambda: self._fetch_one(u, max_chars, timeout)))(target)))
+        outcomes = _parallel_map(jobs, timeout=min(_COLLECT_TIMEOUT, max(timeout, 10) * 2))
+
+        lines = ["[web fetch results]", "",
+                 "URLs: %d (concurrent, all collected)" % len(targets), ""]
+        ok_count = 0
+        for idx, target in enumerate(targets):
+            ok, value = outcomes.get(idx, (False, RuntimeError("missing outcome")))
+            lines.append("=" * 60)
+            if not ok:
+                lines.append("URL: %s" % target)
+                lines.append("failed: %s" % value)
+                lines.append("")
+                continue
+            result = value
+            if result.success:
+                ok_count += 1
+                lines.append(result.output)
+            else:
+                lines.append("URL: %s" % target)
+                lines.append("failed: %s" % (result.error or "unknown"))
+            lines.append("")
+        lines.append("-" * 60)
+        lines.append("summary: %d/%d fetched" % (ok_count, len(targets)))
+        if ok_count == 0:
+            return ToolResult(output="\n".join(lines).rstrip(), success=False,
+                              error="all_failed")
+        return ToolResult(output="\n".join(lines).rstrip())
+
+    def _fetch_one(self, url: str, max_chars: int, timeout: int) -> ToolResult:
+        """抓取并抽取单个 URL 的正文（单 URL 与多 URL 共用）。"""
         blocked, reason = is_private_url(url)
         if blocked:
             return ToolResult(output=f"security restriction: {reason}", success=False, error=reason)
@@ -623,16 +937,19 @@ class WebSearchTool:
             "function": {
                 "name": self.name,
                 "description": (
-                    "Searches the web for keywords and returns result titles, links and snippets. "
-                    "Engine is selectable: auto (default; DuckDuckGo then Bing fallback), duckduckgo, "
-                    "bing, baidu, or custom (your own search endpoint, JSON API or HTML page). "
-                    "Up to 50 results (automatic pagination). Suitable for looking up the latest "
-                    "material, API docs, error messages, etc."
+                    "Searches the web and returns result titles, links and snippets. "
+                    "Pass several independent keyword sets in \"queries\" and they run "
+                    "concurrently (the whole batch is collected before returning). "
+                    "Engine is selectable: auto (default; Bing, then Baidu, then DuckDuckGo), "
+                    "bing, baidu, duckduckgo, or custom (your own search endpoint, JSON API or "
+                    "HTML page). Up to 50 results per keyword (automatic pagination). "
+                    "Suitable for looking up the latest material, API docs, error messages, etc."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Search keywords or a question"},
+                        "query": {"type": "string", "description": "Search keywords or a question. Two unrelated terms joined together often return an irrelevant generic page; short focused keywords work better, and 2-4 word queries are the sweet spot. For several independent topics prefer \"queries\" instead of joining them into one string."},
+                        "queries": {"type": "array", "items": {"type": "string"}, "description": "Optional. Several independent keyword sets searched CONCURRENTLY; all of them are collected before returning. Overall concurrency is capped at 64, and at most 5 lanes per target domain / resolved IP. Use this instead of calling the tool repeatedly when you already have a list of topics to look up."},
                         "max_results": {"type": "integer", "description": "Max results to return (default 5, range 1-50; paginated automatically)"},
                         "timeout": {"type": "integer", "description": "Request timeout in seconds (default 15, range 5-60)"},
                         "engine": {
@@ -660,9 +977,20 @@ class WebSearchTool:
         }
 
     def run(self, args: Dict[str, Any], ctx: Any) -> ToolResult:
-        query = str(args.get("query") or "").strip()
-        if not query:
-            return ToolResult(output="Please provide search keywords.", success=False, error="missing_query")
+        raw = args.get("queries")
+        keywords: List[str] = []
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                text = str(item or "").strip()
+                if text and text not in keywords:
+                    keywords.append(text)
+        single = str(args.get("query") or "").strip()
+        if single and single not in keywords:
+            keywords.insert(0, single)
+        if not keywords:
+            return ToolResult(output="Please provide search keywords.",
+                              success=False, error="missing_query")
+
         engine = str(args.get("engine")
                      or os.environ.get("NORPAGENT_WEB_SEARCH_ENGINE")
                      or "auto").strip().lower()
@@ -674,41 +1002,91 @@ class WebSearchTool:
         max_results = max(1, min(int(args.get("max_results") or 5), _MAX_RESULTS_CAP))
         timeout = max(5, min(int(args.get("timeout") or 15), 60))
 
-        if engine == "custom":
-            cfg = self._custom_config(args)
-            if not cfg["url"]:
-                return ToolResult(
-                    output=("custom engine requires 'engine_url' (a URL template containing "
-                            "{query}); see the tool schema for optional JSON/HTML mapping."),
-                    success=False, error="missing_engine_url")
-            results = self._collect_pages(
-                lambda off, t: self._custom_page(cfg, query, off, t),
+        # 多个关键词 -> 自研 nasyncio 运行时并发；每个关键词各自跑完整条
+        # 引擎回退链。整批**全部收集完**再返回。
+        def _one(keyword: str) -> Tuple[List[Tuple[str, str, str]], str]:
+            if engine == "custom":
+                cfg = self._custom_config(args)
+                if not cfg["url"]:
+                    return [], "custom (no engine_url)"
+                found = self._collect_pages(
+                    lambda off, t: self._custom_page(cfg, keyword, off, t),
+                    max_results, timeout)
+                return found, "custom (%s)" % cfg["name"]
+            if engine == "auto":
+                found, label = self._search_chain(keyword, timeout)
+                if found and len(found) < max_results:
+                    found, label = self._paginate_auto(
+                        keyword, found, label, max_results, timeout)
+                return found, label
+            found = self._collect_pages(
+                lambda off, t: self._builtin_page(engine, keyword, off, t),
                 max_results, timeout)
-            engine_label = "custom (%s)" % cfg["name"]
-        elif engine == "auto":
-            # 保持既有 auto 链语义（DDG 优先、Bing 兜底、引擎冷却），仅在需要更多结果时翻页
-            results, engine_label = self._search_chain(query, timeout)
-            if results and len(results) < max_results:
-                results, engine_label = self._paginate_auto(
-                    query, results, engine_label, max_results, timeout)
-        else:
-            results = self._collect_pages(
-                lambda off, t: self._builtin_page(engine, query, off, t),
-                max_results, timeout)
-            engine_label = _ENGINE_LABELS.get(engine, engine)
+            return found, _ENGINE_LABELS.get(engine, engine)
 
-        if not results:
+        if engine == "custom" and not self._custom_config(args)["url"]:
             return ToolResult(
-                output=("search failed: no results returned (%s). "
-                        "Retry later, pick another engine, or try different keywords."
-                        % engine_label),
-                success=False,
-                error="no_results",
-            )
+                output=("custom engine requires 'engine_url' (a URL template containing "
+                        "{query}); see the tool schema for optional JSON/HTML mapping."),
+                success=False, error="missing_engine_url")
 
-        lines = ["[search results]", "", f"keywords: {query}",
-                 f"engine: {engine_label}", f"results: {len(results)}", ""]
-        for i, (title, href, snippet) in enumerate(results[:max_results], 1):
+        jobs = []
+        for idx, keyword in enumerate(keywords):
+            group = ("direct:" + keyword) if engine == "custom" else ""
+            jobs.append((idx, group, (lambda kw: (lambda: _one(kw)))(keyword)))
+        outcomes = _parallel_map(jobs, timeout=min(_COLLECT_TIMEOUT, max(timeout, 10) * 2))
+
+        per_keyword: List[Tuple[str, List[Tuple[str, str, str]], str]] = []
+        for idx, keyword in enumerate(keywords):
+            ok, value = outcomes.get(idx, (False, RuntimeError("missing outcome")))
+            if ok and value:
+                found, label = value
+                per_keyword.append((keyword, found or [], label))
+            elif ok:
+                per_keyword.append((keyword, [], ""))
+            else:
+                per_keyword.append((keyword, [], "error: %s" % type(value).__name__))
+
+        if len(per_keyword) == 1:
+            keyword, found, label = per_keyword[0]
+            if not found:
+                return ToolResult(
+                    output=("search failed: no results returned (%s). "
+                            "Retry later, pick another engine, or try different keywords."
+                            % label),
+                    success=False,
+                    error="no_results",
+                )
+            lines = ["[search results]", "", f"keywords: {keyword}",
+                     f"engine: {label}", f"results: {len(found)}", ""]
+            for i, (title, href, snippet) in enumerate(found[:max_results], 1):
+                lines.append(f"{i}. {title}")
+                lines.append(f"   {href}")
+                if snippet:
+                    lines.append(f"   {snippet}")
+                lines.append("")
+            return ToolResult(output="\n".join(lines).rstrip())
+
+        merged: List[Tuple[str, str, str]] = []
+        for _keyword, found, _label in per_keyword:
+            merged.extend(found)
+        merged = _dedupe_by_url(merged)
+
+        lines = ["[search results]",
+                 "",
+                 "keywords: %d (%s)" % (len(per_keyword),
+                                        "concurrent, all collected"),
+                 "engine: %s" % ("auto" if len({l for _k, _f, l in per_keyword}) > 1
+                                 else (per_keyword[0][2] or "n/a")),
+                 "results: %d after de-duplication" % len(merged),
+                 ""]
+        lines.append("per keyword:")
+        for keyword, found, label in per_keyword:
+            lines.append("  - %s -> %s (%d)" % (keyword, label or "no results", len(found)))
+        lines.append("")
+        lines.append("merged results:")
+        lines.append("")
+        for i, (title, href, snippet) in enumerate(merged[:max_results * len(per_keyword)], 1):
             lines.append(f"{i}. {title}")
             lines.append(f"   {href}")
             if snippet:
@@ -718,16 +1096,50 @@ class WebSearchTool:
 
     def _search_chain(self, query: str,
                       timeout: int) -> Tuple[List[Tuple[str, str, str]], str]:
-        """Multi-engine chain: DuckDuckGo first (user preference, free/no key),
-        then Bing as the automatic fallback. Returns (results, engine-label).
+        """Single-query engine fallback chain. Returns (results, engine-label).
 
-        Engines that recently failed every endpoint are skipped for a short
-        cooldown window: a blocked network would otherwise burn one full
-        connection timeout per endpoint on every single search."""
-        # 1) DuckDuckGo (primary). Probe attempts are capped so a blocked
-        #    network cannot stall the chain; failures enter the cooldown cache.
+        顺序固定为 **Bing → Baidu → DuckDuckGo**（2026-09-19 起不再按查询
+        语言分流）。处于冷却期的引擎直接跳过：否则被墙的网络会在每次搜索
+        都白白烧掉一个完整的连接超时。
+
+        结果与查询词完全无重叠时判为该引擎返回了无关页，继续尝试下一个。
+        相关性判定只决定优先级、不构成否决：若所有引擎都只给出无字面重叠
+        的结果，宁可返回其中第一份，也好过返回空。
+
+        注意这里处理的是**一个**关键词的引擎回退；多个关键词之间的并发在
+        run() 里由自研 nasyncio 运行时调度。
+        """
         ddg_timeout = max(5, min(timeout, 6))
-        if not _engine_on_cooldown("DuckDuckGo"):
+
+        def _try_bing():
+            if _engine_on_cooldown("Bing"):
+                return None
+            attempted_b = False
+            for endpoint in self._BING_ENDPOINTS:
+                blocked, _reason = is_private_url(endpoint)
+                if blocked:
+                    continue
+                attempted_b = True
+                results = self._search_bing(endpoint, query, timeout)
+                if results:
+                    return results, "Bing"
+            if attempted_b:
+                _mark_engine_down("Bing")
+            return None
+
+        def _try_baidu():
+            if _engine_on_cooldown("Baidu"):
+                return None
+            results = self._baidu_page(query, 0, timeout)
+            if results:
+                return results, "Baidu"
+            return None
+
+        def _try_duckduckgo():
+            # Probe attempts are capped so a blocked network cannot stall the
+            # chain; failures enter the cooldown cache.
+            if _engine_on_cooldown("DuckDuckGo"):
+                return None
             attempted = False
             for endpoint in (self._ENDPOINT, self._FALLBACK):
                 blocked, _reason = is_private_url(endpoint)
@@ -739,19 +1151,25 @@ class WebSearchTool:
                     return results, "DuckDuckGo"
             if attempted:
                 _mark_engine_down("DuckDuckGo")
-        # 2) Bing (fallback; free / no key)
-        if not _engine_on_cooldown("Bing"):
-            attempted_b = False
-            for endpoint in self._BING_ENDPOINTS:
-                blocked, _reason = is_private_url(endpoint)
-                if blocked:
-                    continue
-                attempted_b = True
-                results = self._search_bing(endpoint, query, timeout)
-                if results:
-                    return results, "Bing (fallback)"
-            if attempted_b:
-                _mark_engine_down("Bing")
+            return None
+
+        probes = (("Bing", _try_bing),
+                  ("Baidu", _try_baidu),
+                  ("DuckDuckGo", _try_duckduckgo))
+        fallback: Optional[Tuple[List[Tuple[str, str, str]], str]] = None
+        for name, probe in probes:
+            got = probe()
+            if not got:
+                continue
+            results, label = got
+            if _results_relevant(results, query):
+                return results, label
+            if fallback is None:
+                fallback = (results, label)
+            # 不调用 _mark_engine_down：引擎确实应答了，只是结果不理想；
+            # 冷却只留给"被封 / 连不上"这类真正的不可用。
+        if fallback is not None:
+            return fallback
         return [], ""
 
     def _search(self, endpoint: str, query: str, timeout: int) -> List[Tuple[str, str, str]]:
@@ -775,6 +1193,9 @@ class WebSearchTool:
         )
         if resp.status_code != 200:
             return []
+        if _looks_blocked(resp.text):
+            _mark_engine_down("DuckDuckGo")
+            return []
         return self._parse_results(resp.text)
 
     def _search_urllib(self, endpoint: str, query: str, timeout: int) -> List[Tuple[str, str, str]]:
@@ -792,8 +1213,11 @@ class WebSearchTool:
             },
         )
         resp = urlopen(req, timeout=timeout)
-        body = resp.read(2 * 1024 * 1024)
-        return self._parse_results(body.decode("utf-8", errors="replace"))
+        body = resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
+        if _looks_blocked(body):
+            _mark_engine_down("DuckDuckGo")
+            return []
+        return self._parse_results(body)
 
     def _parse_results(self, html: str) -> List[Tuple[str, str, str]]:
         results: List[Tuple[str, str, str]] = []
@@ -843,6 +1267,9 @@ class WebSearchTool:
         )
         if resp.status_code != 200:
             return []
+        if _looks_blocked(resp.text):
+            _mark_engine_down("Bing")
+            return []
         return self._parse_bing(resp.text)
 
     def _search_bing_urllib(self, endpoint: str, query: str,
@@ -856,8 +1283,11 @@ class WebSearchTool:
                      "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8"},
         )
         resp = urlopen(req, timeout=timeout)
-        body = resp.read(3 * 1024 * 1024)
-        return self._parse_bing(body.decode("utf-8", errors="replace"))
+        body = resp.read(3 * 1024 * 1024).decode("utf-8", errors="replace")
+        if _looks_blocked(body):
+            _mark_engine_down("Bing")
+            return []
+        return self._parse_bing(body)
 
     def _parse_bing(self, html: str) -> List[Tuple[str, str, str]]:
         results: List[Tuple[str, str, str]] = []
@@ -976,6 +1406,7 @@ class WebSearchTool:
         blocked, _ = is_private_url(endpoint)
         if blocked:
             return []
+        _throttle("DuckDuckGo")
         form = {"q": query, "s": str(offset), "dc": str(offset + 1)}
         try:
             if _requests_available():
@@ -1010,6 +1441,7 @@ class WebSearchTool:
             blocked, _ = is_private_url(endpoint)
             if blocked:
                 continue
+            _throttle("Bing")
             params = {"q": query, "first": str(offset + 1)}
             try:
                 if _requests_available():
@@ -1044,6 +1476,7 @@ class WebSearchTool:
         blocked, _ = is_private_url(endpoint)
         if blocked:
             return []
+        _throttle("Baidu")
         params = {"wd": query, "pn": str(offset)}
         try:
             if _requests_available():
@@ -1055,6 +1488,9 @@ class WebSearchTool:
                     timeout=timeout, allow_redirects=True)
                 if resp.status_code != 200:
                     return []
+                if _looks_blocked(resp.text):
+                    _mark_engine_down("Baidu")
+                    return []
                 return self._parse_baidu(resp.text)
             from urllib.parse import urlencode
             from urllib.request import Request, urlopen
@@ -1062,8 +1498,11 @@ class WebSearchTool:
                           headers={"User-Agent": _USER_AGENT,
                                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
             resp = urlopen(req, timeout=timeout)
-            return self._parse_baidu(
-                resp.read(3 * 1024 * 1024).decode("utf-8", errors="replace"))
+            body = resp.read(3 * 1024 * 1024).decode("utf-8", errors="replace")
+            if _looks_blocked(body):
+                _mark_engine_down("Baidu")
+                return []
+            return self._parse_baidu(body)
         except Exception:  # noqa: BLE001
             return []
 

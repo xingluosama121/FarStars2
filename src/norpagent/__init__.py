@@ -233,7 +233,7 @@ from norpagent import farstars_app  # noqa: E402,F401
 #   - 前端修复：ask_user 模态 Enter 发送 + Markdown 渲染；思考过程块可自由滚动；
 #   - 索引存储合并：workspace_index.db / context_index.db 合并为 unified_index.py
 #     单库单连接 + 统一维护，workspace_index.py / context_index.py 降为兼容转发层。
-__version__ = "2.2.4"
+__version__ = "2.3.1"
 __brand_cn__ = "远星"
 __brand_en__ = "FarStars"
 __display_name__ = "FarStars（远星）· norpagent"

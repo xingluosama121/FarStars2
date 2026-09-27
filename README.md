@@ -2,8 +2,9 @@
 
 A pluggable, brick-style Agent framework — *the module is the entry point*. Build an Agent the way you build with LEGO: swap any part by filling in an "address", with zero changes to the core code — and swap parts while the process is still running (hot mount), with no restart required.
 
-> **Version**: 2.2.1 (2026-09-12) ｜ **Brand**: FarStars（远星）— the official public name since v2.0.0; the package, imports and PyPI name stay `norpagent` ｜ **License**: Copyright (c) 2026 xingluosama121, MIT Licensed
+> **Version**: 2.2.2 (2026-09-13) ｜ **Brand**: FarStars（远星）— the official public name since v2.0.0; the package, imports and PyPI name stay `norpagent` ｜ **License**: Copyright (c) 2026 xingluosama121, MIT Licensed
 > **Dependencies**: the core package has **zero third-party dependencies** — a plain Python standard library is enough to run it; optional capabilities are installed on demand
+> **Repository**: https://github.com/xingluosama121/farstars2 ｜ **PyPI**: https://pypi.org/project/norpagent/
 
 ---
 

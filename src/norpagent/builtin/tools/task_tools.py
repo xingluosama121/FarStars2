@@ -1,5 +1,5 @@
 # Copyright (c) 2026 xingluosama121, MIT Licensed
-"""Long-run task cooperation tools: task_submit / task_list / task_status / task_cancel.
+"""Long-run task cooperation tools: task_submit / task_list / task_status / task_cancel / task_done.
 
 In long-run tasks the Agent can submit subtasks to the scheduler queue
 (task_submit), executed by the host application / background drain loop, enabling:
@@ -7,7 +7,10 @@ In long-run tasks the Agent can submit subtasks to the scheduler queue
 - task decomposition: big tasks split into subtasks, queued and executed by priority;
 - multi-agent orchestration: subtasks can specify a different preset (task_submit's
   preset parameter) and be executed by the corresponding mode's Agent;
-- checkpoint resume: with the persistent scheduler, tasks survive process restarts.
+- checkpoint resume: with the persistent scheduler, tasks survive process restarts;
+- checkpoint boundary: task_done lets the model declare a completed milestone, which
+  advances the render floor so that milestone and everything before it are compacted
+  away, while every step taken after it is still rendered verbatim.
 
 Tools access the scheduler via ``ctx.scheduler``; the query tools (list/status/cancel)
 require the scheduler to provide same-named methods (all supported by the persistent
@@ -250,3 +253,140 @@ class TaskCancelTool:
                 error="not_cancellable",
             )
         return ToolResult(output=f"task {task_id} cancelled.")
+
+
+# ══════════════════════════════════════════════════════════════
+#  Milestone checkpoint (2026-09-26)
+# ══════════════════════════════════════════════════════════════
+#  task_done is a *boundary*, not a terminal action: calling it does not finish
+#  the task. It records one completed milestone and advances the point from which
+#  history is compacted, so the finished work above it stops being replayed while
+#  the steps after it stay verbatim. The boundary is stored as a message index in
+#  the summary store, because that is the one place the request assembly already
+#  consults when deciding where the rendered history starts (a tool result cannot
+#  carry it: tool results are never sent back to the model).
+
+
+def _history_count(ctx: Any, session_id: str) -> int:
+    """Non-system message count of the session; -1 when it cannot be read.
+
+    The count must use the same basis as the request assembly, which renders the
+    transcript with system messages excluded -- a boundary recorded on a
+    different basis would point at the wrong message.
+    """
+    manager = getattr(ctx, "session_manager", None)
+    if manager is None or not session_id:
+        return -1
+    try:
+        history = manager.history(session_id)
+    except Exception:  # noqa: BLE001
+        return -1
+    count = 0
+    for message in history or []:
+        if str(getattr(message, "role", "") or "") != "system":
+            count += 1
+    return count
+
+
+class TaskDoneTool:
+    name = "task_done"
+
+    def schema(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": (
+                    "Marks one subgoal or milestone of the current task as complete: it records "
+                    "the outcome and moves the history boundary, so the finished work above it "
+                    "can be compacted away while every step taken after it stays available "
+                    "verbatim. It does NOT finish the task -- keep working afterwards. Call it "
+                    "once per milestone, after that milestone has actually been verified, and "
+                    "state in the summary what was done and what is needed to continue."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": (
+                                "What was completed: the outcome, the files or paths touched, "
+                                "and the facts needed to continue. Archived in the searchable "
+                                "context store."
+                            ),
+                        },
+                        "code_path": {
+                            "type": "string",
+                            "description": "Main code path or directory this milestone affects (optional)",
+                        },
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def run(self, args: Dict[str, Any], ctx: Any) -> ToolResult:
+        summary = str(args.get("summary") or "").strip()
+        if not summary:
+            return ToolResult(
+                output="summary parameter is empty.", success=False,
+                error="empty_summary",
+            )
+        code_path = str(args.get("code_path") or "").strip()
+        session_id = str(getattr(ctx, "session_id", "") or "")
+        if not session_id:
+            return ToolResult(
+                output=(
+                    "This mode has no session assembled, so no milestone boundary can be "
+                    "recorded. Use a preset that declares a session (e.g. session=\"sqlite\")."
+                ),
+                success=False,
+                error="session not assembled",
+            )
+
+        notes: List[str] = []
+
+        store = getattr(ctx, "context_store", None)
+        if store is None:
+            notes.append("no context store assembled, so the outcome was not archived")
+        else:
+            body = summary
+            if code_path:
+                body = "%s\ncode_path: %s" % (summary, code_path)
+            try:
+                store.add(
+                    text=body,
+                    source="checkpoint",
+                    title=summary[:60],
+                    metadata={
+                        "task_id": str(getattr(ctx, "task_id", "") or ""),
+                        "session_id": session_id,
+                        "preset": str(getattr(ctx, "preset_name", "") or ""),
+                        "code_path": code_path,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                notes.append("context store write failed: %s" % exc)
+
+        try:
+            from norpagent.kernel.render import shared_store
+
+            count = _history_count(ctx, session_id)
+            if count < 0:
+                notes.append(
+                    "the session did not expose its history, so the boundary was not moved")
+            else:
+                shared_store().set_checkpoint(session_id, count)
+                notes.append("boundary moved to message %d" % count)
+        except Exception as exc:  # noqa: BLE001
+            notes.append("boundary write failed: %s" % exc)
+
+        return ToolResult(
+            output=(
+                "milestone recorded (%s). History before this point is compacted from "
+                "later requests; the steps after it stay verbatim. The task is still "
+                "running -- continue with the next step."
+                % "; ".join(notes)
+            )
+        )

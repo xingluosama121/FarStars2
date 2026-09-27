@@ -10,9 +10,13 @@ library's Sandbox protocol:
   runaway model from saturating the machine;
 - **timeout force-kill**: on command timeout the **whole process tree** is killed
   (Windows: taskkill /T, POSIX: process-group SIGKILL), eliminating orphan
-  processes — force-killed instances are never reused;
+  processes; a command runs as a fresh child process whose pipes are closed on
+  return, so no resident state survives the kill and the instance keeps serving
+  later commands. When the child cannot be reaped, the instance is re-initialized
+  on the next call instead of staying unusable;
 - **cwd / env memory**: each instance remembers its last working directory, so
-  consecutive commands behave like operating in the same terminal.
+  consecutive commands behave like operating in the same terminal; a remembered
+  directory that no longer exists falls back to the pool default.
 
 Registration: ``registry.register_sandbox("pooled", PooledSandboxProvider(...).create)``.
 """
@@ -31,6 +35,42 @@ from norpagent.loops.cancel import cancel_requested
 from norpagent.protocols.sandbox import SandboxResult
 
 _IS_WINDOWS = platform.system() == "Windows"
+
+# Windows Error Reporting bits (WinBase.h), used with kernel32!SetErrorMode.
+_SEM_FAILCRITICALERRORS = 0x0001
+_SEM_NOGPFAULTERRORBOX = 0x0002
+_SEM_NOOPENFILEERRORBOX = 0x8000
+_error_mode_configured = False
+
+
+def _suppress_windows_error_dialogs() -> None:
+    """Keep Windows from showing a crash dialog for commands run as children.
+
+    A child that dies from an access violation (a native codegen bug, say) would
+    otherwise pop the Windows Error Reporting "program has stopped working"
+    dialog and wait for a human to click it: the process never exits, so the
+    command looks hung until the sandbox timeout force-kills it -- which made one
+    crashing command look like a dead sandbox.
+
+    Error mode is a process-wide setting and is inherited by child processes, so
+    configuring it once covers every later Popen (including the subprocess
+    sandbox runner). No-op off Windows; failures are swallowed, because this only
+    improves diagnosability and must never fail a command.
+    """
+    global _error_mode_configured
+    if _error_mode_configured or not _IS_WINDOWS:
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetErrorMode(
+            _SEM_FAILCRITICALERRORS
+            | _SEM_NOGPFAULTERRORBOX
+            | _SEM_NOOPENFILEERRORBOX
+        )
+    except Exception:  # noqa: BLE001 -- never break a command over this
+        pass
+    _error_mode_configured = True
 
 
 def _robust_decode(data: bytes) -> str:
@@ -63,6 +103,24 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
             pass
 
 
+def _terminate_process_tree(proc: subprocess.Popen) -> bool:
+    """Kill the process tree and reap the child process.
+
+    Returns True when the child is confirmed dead (the instance can keep running
+    commands). False means a process of the tree may still be alive, so the
+    instance is treated as one that must not be trusted for the next command.
+    """
+    _kill_process_tree(proc)
+    try:
+        proc.wait(3)
+    except Exception:
+        pass
+    try:
+        return proc.poll() is not None
+    except Exception:
+        return False
+
+
 def _stream_reader(stream: Any, buf: List[bytes], done: threading.Event) -> None:
     """Read child-process output in the background into a byte list (prevents deadlock from a full pipe buffer)."""
     try:
@@ -80,6 +138,12 @@ def _stream_reader(stream: Any, buf: List[bytes], done: threading.Event) -> None
 class PooledSandbox:
     """A single sandbox instance in the pool.
 
+    An instance owns no resident resource between commands: every command is a
+    fresh child process whose pipes are closed before the call returns. It is
+    therefore never permanently unusable — a force-killed command leaves nothing
+    behind, and an instance that could not be reaped is re-initialized when it is
+    used again.
+
     ``close()`` semantics = return to the pool (a broken instance is destroyed instead).
     """
 
@@ -91,6 +155,8 @@ class PooledSandbox:
         self.owner_task_id = ""
         self.cwd: str = provider.workspace_root or os.getcwd()
         self.env: Optional[Dict[str, str]] = None
+        # set when the last force-killed command could not be reaped; cleared by
+        # _reinitialize() on the next run_shell call
         self._broken = False
 
     # ── Sandbox protocol ─────────────────────────────────
@@ -104,32 +170,28 @@ class PooledSandbox:
     ) -> SandboxResult:
         with self._lock:
             if self._broken:
-                return SandboxResult(
-                    stderr="sandbox instance is broken (last command was force-killed on timeout); not reusable",
-                    exit_code=-1,
-                )
+                # the previous command could not be reaped: reset the instance
+                # (no state survives a command here) and serve this call
+                self._reinitialize()
             if cwd:
                 self.cwd = cwd
             if env:
                 self.env = env
 
-            creationflags = 0
-            if _IS_WINDOWS:
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000
             try:
-                proc = subprocess.Popen(
-                    command,
-                    shell=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    cwd=self.cwd,
-                    env=self.env,
-                    creationflags=creationflags,
-                    start_new_session=not _IS_WINDOWS,
-                )
+                proc = self._spawn(command)
             except OSError as exc:
-                return SandboxResult(stderr=f"failed to start command: {exc}", exit_code=-1)
+                # the remembered working directory may have been removed after the
+                # previous command: fall back to the pool default instead of failing
+                # every later command on the same instance
+                fallback = self._provider.workspace_root or os.getcwd()
+                if self.cwd == fallback:
+                    return SandboxResult(stderr=f"failed to start command: {exc}", exit_code=-1)
+                self.cwd = fallback
+                try:
+                    proc = self._spawn(command)
+                except OSError as exc2:
+                    return SandboxResult(stderr=f"failed to start command: {exc2}", exit_code=-1)
 
             out_buf: List[bytes] = []
             err_buf: List[bytes] = []
@@ -159,21 +221,18 @@ class PooledSandbox:
                 started = time.monotonic()
                 while True:
                     if cancel_requested():
-                        _kill_process_tree(proc)
-                        self._broken = True
+                        # cancellation: the same force-kill + reap policy as timeout
+                        self._broken = not _terminate_process_tree(proc)
                         cancelled = True
                         exit_code = -1
                         break
                     remaining = timeout - (time.monotonic() - started)
                     if remaining <= 0:
                         timed_out = True
-                        # ★ timeout: force-kill the whole process tree; mark the instance broken so it is never reused
-                        _kill_process_tree(proc)
-                        self._broken = True
-                        try:
-                            proc.wait(3)
-                        except Exception:
-                            pass
+                        # timeout: force-kill the whole process tree and reap it; the
+                        # instance keeps serving commands unless the child could not
+                        # be reaped (then it is re-initialized on the next call)
+                        self._broken = not _terminate_process_tree(proc)
                         exit_code = -1
                         break
                     try:
@@ -206,6 +265,37 @@ class PooledSandbox:
                 exit_code=exit_code, timed_out=timed_out,
             )
 
+    def _spawn(self, command: str) -> subprocess.Popen:
+        """Start one command as a fresh child process in the instance's cwd/env."""
+        _suppress_windows_error_dialogs()
+        creationflags = 0
+        if _IS_WINDOWS:
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000
+        return subprocess.Popen(
+            command,
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.cwd,
+            env=self.env,
+            creationflags=creationflags,
+            start_new_session=not _IS_WINDOWS,
+        )
+
+    def _reinitialize(self) -> None:
+        """Reset instance state after a command that could not be reaped.
+
+        A command leaves no resident state behind, so resetting the instance is
+        equivalent to a brand-new one: it returns to the pool defaults and serves
+        the next command. The sandbox id is renewed so the replacement is visible
+        in logs and pool statistics.
+        """
+        self._broken = False
+        self.sandbox_id = f"sb_{uuid.uuid4().hex[:8]}"
+        self.cwd = self._provider.workspace_root or os.getcwd()
+        self.env = None
+
     def run_python(
         self,
         code: str,
@@ -232,8 +322,7 @@ class PooledSandbox:
         self._provider.release(self)
 
     def destroy(self) -> None:
-        """Destroy immediately (used when the pool is closed)."""
-        self._broken = True
+        """Remove the instance from the pool (it owns no resident resource to release)."""
         self._provider.discard(self)
 
 

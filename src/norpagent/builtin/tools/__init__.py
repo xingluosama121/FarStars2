@@ -9,7 +9,8 @@ P2: file_read / file_write / file_list / file_delete (workspace safety constrain
     (SSRF protection + usable with zero dependencies).
 P3: context_add / context_search / context_list / context_delete (context management),
     project_status (project management),
-    task_submit / task_list / task_status / task_cancel (long-running task cooperation).
+    task_submit / task_list / task_status / task_cancel / task_done
+    (long-running task cooperation + milestone checkpoints).
 """
 
 from norpagent.builtin.tools.echo import EchoTool
@@ -43,6 +44,7 @@ from norpagent.builtin.tools.task_tools import (
     TaskListTool,
     TaskStatusTool,
     TaskCancelTool,
+    TaskDoneTool,
 )
 
 __all__ = [
@@ -70,4 +72,5 @@ __all__ = [
     "TaskListTool",
     "TaskStatusTool",
     "TaskCancelTool",
+    "TaskDoneTool",
 ]

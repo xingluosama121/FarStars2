@@ -35,8 +35,8 @@ from norpagent.hooks.core import HookVeto
 from norpagent.kernel.context import (
     MessageCopyError,
     RunContext,
-    clamp_history,
-    fold_history,
+#     clamp_history,          # 2026-09-18 停用（见 kernel/render.py）
+#     fold_history,           # 2026-09-18 停用（见 kernel/render.py）
     estimate_text_tokens,
     estimate_tokens,
     repair_tool_pairs,
@@ -75,7 +75,10 @@ def _usage_is_empty(usage: Any) -> bool:
     )
     return total <= 0
 
-# Boundary marker injected before the first message of the *current* turn when
+# ──────────────────────────────────────────────────────────────
+#  [2026-09-18] RETIRED but kept on purpose (rollback convenience).
+#
+#  Boundary marker injected before the first message of the *current* turn when
 # the session already contains completed earlier turns (2026-09-13). It tells
 # the model that everything above is finished history kept only as background
 # context, so the model never confuses the historical transcript with this
@@ -83,6 +86,10 @@ def _usage_is_empty(usage: Any) -> bool:
 # one requested by the product owner); this string is model-facing prompt
 # content and is never shown in the UI. The marker is a synthetic message: it
 # is added when assembling the request and is never persisted to the session.
+#  [2026-09-18] 该标记不再注入：边界由 kernel/render.py 渲染的
+#  <history> / <current_content> 外壳表达。定义保留，因为
+#  test_round13_suite 仍对其断言。
+#
 HISTORY_BOUNDARY_MARKER = (
     "[Completed historical messages — not input for the current turn] "
     "All messages above this boundary are finished history, provided only as "
@@ -1252,50 +1259,59 @@ class AgentRuntime:
         elif isinstance(modified, dict) and isinstance(modified.get("system_prompt"), str):
             system_prompt = modified["system_prompt"]
 
-        history = list((session_manager or self.session_manager).history(session_id))
-        # 折叠旧历史为 <history> 文本块，只保留最近 N 轮完整。
-        # 目的：终止「每步全量重放思维链 + 完整工具载荷」导致的百万级输入。
+        # ── 2026-09-18: 旧压缩/折叠/截断链路整体停用（原文注释保留，便于回滚）──
+        # 折叠与截断以「轮」为粒度，而主循环每个任务只追加一条 user 消息，长任务恒为
+        # 1 轮 —— 两者在主力场景下完全空转；分级压缩还会把记账标记写进回传体。现改为
+        # 「渲染式历史」，实现见 norpagent/kernel/render.py。
+        #
+        # history = list((session_manager or self.session_manager).history(session_id))
+        # # R-056（2026-09-15）：折叠旧历史为 <history> 文本块，只保留最近 N 轮完整。
+        # try:
+        #     _fold_n = int((getattr(self, "params", {}) or {}).get("history_fold_turns", 3) or 0)
+        # except (TypeError, ValueError):
+        #     _fold_n = 3
+        # if _fold_n > 0:
+        #     history = fold_history(history, keep_recent_turns=_fold_n)
+        # # 2026-09-15：压缩无条件执行（预算 0 = 不设上限，但仍做安全级压缩）。
+        # if True:
+        #     from norpagent.kernel.context import (
+        #         compress_history,
+        #         estimate_tokens as _est_tokens,
+        #     )
+        #     history, _cstats = compress_history(history, int(token_budget))
+        #     if _est_tokens(history) > int(token_budget):
+        #         history = clamp_history(history, int(token_budget))
+        # # 2026-09-13 round 19: repair dangling tool_call pairs (request-only).
+        # history = repair_tool_pairs(history)
+        # messages = (
+        #     [ChatMessage(role="system", content=system_prompt)] + history
+        #     if system_prompt else history
+        # )
+        # # 2026-09-13: label completed history so the model never confuses the
+        # # historical transcript with this turn's input. Synthetic, request-only.
+        # messages = _inject_history_boundary(messages)
+
+        # ── 2026-09-18: rendered request assembly ─────────────────────
+        # history -> <history>/<current_content>; over budget -> <summary>.
+        # Chain-of-thought, tool calls and tool results are never sent, so assistant /
+        # tool pairing cannot break and no bookkeeping marker reaches the payload. The
+        # session store is untouched (the UI still shows the full conversation).
+        raw_history = list((session_manager or self.session_manager).history(session_id))
         try:
-            _fold_n = int((getattr(self, "params", {}) or {}).get("history_fold_turns", 3) or 0)
-        except (TypeError, ValueError):
-            _fold_n = 3
-        if _fold_n > 0:
-            try:
-                history = fold_history(history, keep_recent_turns=_fold_n)
-            except MessageCopyError:
-                # 折叠是纯优化：拿不到安全副本就放弃折叠，绝不动会话原文。
-                pass
-        # 2026-09-13: optional context-budget clamp. Drops the oldest whole turns
-        # (never splitting tool_call / tool_call_id pairs); 0 disables it.
-        # 2026-09-15：压缩无条件执行（预算 0 = 不设上限，但仍做安全级压缩）。
-        if True:
-            # 2026-09-15: 先压缩，压缩后仍超预算才截断（截断是最后退路）。
-            from norpagent.kernel.context import (
-                compress_history,
-                estimate_tokens as _est_tokens,
+            from norpagent.kernel.render import build_request_messages as _render_request
+
+            messages = _render_request(
+                raw_history,
+                system_prompt or "",
+                session_id=str(session_id or ""),
+                token_budget=int(token_budget or 0),
+                provider=self._summary_provider(),
             )
-            try:
-                history, _cstats = compress_history(history, int(token_budget))
-            except MessageCopyError:
-                # 压缩是纯优化：拿不到安全副本就放弃压缩，绝不动会话原文。
-                _cstats = {"skipped": "message_copy_failed"}
-            if _est_tokens(history) > int(token_budget):
-                history = clamp_history(history, int(token_budget))
-        # 2026-09-13 round 19: an interrupted run can leave an assistant
-        # tool-call message without its tool results (process killed mid-tool,
-        # a hook dropped the result, ...). Compatible endpoints reject such a
-        # request with HTTP 400 ("a tool_calls message must be followed by tool
-        # messages"), which then fails EVERY later request to that session —
-        # the failure mode behind "regenerate returns 400". Repair the request
-        # payload only; the persisted transcript is untouched.
-        history = repair_tool_pairs(history)
-        messages = (
-            [ChatMessage(role="system", content=system_prompt)] + history
-            if system_prompt else history
-        )
-        # 2026-09-13: label completed history so the model never confuses the
-        # historical transcript with this turn's input. Synthetic, request-only.
-        messages = _inject_history_boundary(messages)
+        except Exception:  # noqa: BLE001 — assembly must never fail a task
+            messages = (
+                [ChatMessage(role="system", content=system_prompt)] + raw_history
+                if system_prompt else list(raw_history)
+            )
         try:
             modified2 = self.hooks.after_build_messages.intercept(
                 messages=messages, system_prompt=system_prompt,
@@ -1726,14 +1742,26 @@ class AgentRuntime:
         # renders reject/approve buttons instead of a free-text box (which users
         # mistype, e.g. "1", and get silently denied). The "[y/n]" hint is no longer
         # part of the text: the console adapter adds it, the web UI shows buttons.
-        answer = ctx.ask_user(
+        raw = ctx.ask_user(
             f"tool {spec.name} call requires human approval (level {level.value}); continue?"
             f"\nargs: {spec.arguments}",
-            default="n",
             kind="approval",
-        ).strip().lower()
+        )
+        # Fail closed: an unanswered prompt (timeout, no UI, EOF) is NOT consent.
+        # A security gate must never be opened by the absence of a human.
+        answer = (raw or "").strip().lower()
         if answer in ("y", "yes", "ok"):
             return None
+        if raw is None:
+            return ToolResult(
+                output=(
+                    f"the approval request for tool {spec.name} got no answer "
+                    "(no interactive UI, or nobody replied before the timeout); "
+                    "the call was cancelled. Ask the user to approve it explicitly."
+                ),
+                success=False,
+                error="approval_unanswered",
+            )
         return ToolResult(
             output=f"the user denied the approval request for tool {spec.name}; the call was cancelled.",
             success=False,
@@ -1821,6 +1849,48 @@ class AgentRuntime:
     def task_runner(self) -> Any:
         """Return a callback suitable for ``scheduler.drain`` (this runtime as the executor)."""
         return self.run_task
+
+    # ── rolling history summary (2026-09-18) ─────────────────
+
+    def _summary_provider(self) -> Any:
+        """Provider for the rolling history summary (a separate one-off call).
+
+        Resolution order: the optional ``summary_model`` task parameter, then
+        ``title_model`` (the existing one-off-summary setting), then the
+        session's own model. Returns None when nothing resolves — the caller
+        then keeps the un-summarized history instead of failing the task.
+        """
+        reg = getattr(self, "registry", None)
+        if reg is None:
+            return None
+        params = getattr(self, "params", {}) or {}
+        name = str(params.get("summary_model")
+                   or params.get("title_model") or "").strip()
+        if name:
+            try:
+                if name in reg.list_models():
+                    return reg.resolve_model(name)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from norpagent.builtin.models.openai_compat import (
+                    OpenAICompatProvider,
+                )
+
+                return OpenAICompatProvider(
+                    model_name=name,
+                    base_url=str(params.get("api_base") or "") or None,
+                    api_key=str(params.get("api_key") or "") or None,
+                )
+            except Exception:  # noqa: BLE001
+                return None
+        current = str(getattr(getattr(self, "preset", None), "model", "") or "")
+        if current:
+            try:
+                return reg.resolve_model(current)
+            except Exception:  # noqa: BLE001
+                return None
+        return None
 
     # ── compat aliases (P1/P2 private method names; legacy signature compat) ──
 

@@ -24,8 +24,15 @@ class UIAdapter(Protocol):
         """Receive and render an AgentEvent."""
         ...
 
-    def ask_user(self, question: str, default: str = "", kind: str = "") -> str:
-        """Ask the user a question and return the answer (used for human approval, clarification, etc.).
+    def ask_user(self, question: str, kind: str = "") -> "str | None":
+        """Ask the user a question and return their answer.
+
+        Returns ``None`` when no answer was actually obtained — no interactive UI is
+        attached, the user did not reply before the timeout, or input was EOF. There
+        is deliberately no "default answer" parameter: silently substituting one
+        would put words in the user's mouth, and the caller would then act on a
+        decision nobody ever made. A ``None`` return must propagate so the caller
+        can fail, re-ask, or explicitly label its own fallback as its own.
 
         ``kind`` lets the adapter choose the right control instead of guessing from
         the text: ``"approval"`` is a binary approve/reject decision (no free-text

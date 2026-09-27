@@ -61,6 +61,7 @@ from norpagent.builtin.tools import (
     TaskListTool,
     TaskStatusTool,
     TaskCancelTool,
+    TaskDoneTool,
 )
 from norpagent.builtin.sessions.memory import MemorySessionManager
 from norpagent.builtin.sandboxes.subprocess import SubprocessSandboxProvider
@@ -166,6 +167,7 @@ def install_defaults(registry: Any) -> Any:
     registry.register_tool("task_list", TaskListTool())
     registry.register_tool("task_status", TaskStatusTool())
     registry.register_tool("task_cancel", TaskCancelTool())
+    registry.register_tool("task_done", TaskDoneTool())
     # sessions
     registry.register_session("memory", MemorySessionManager)
     registry.register_session("sqlite", SQLiteSessionManager)
@@ -261,6 +263,7 @@ __all__ = [
     "TaskListTool",
     "TaskStatusTool",
     "TaskCancelTool",
+    "TaskDoneTool",
     "FTS5ContextStore",
     "BasicProjectManager",
     "MemorySessionManager",

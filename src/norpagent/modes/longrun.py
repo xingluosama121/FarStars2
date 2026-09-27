@@ -17,6 +17,9 @@ _SYSTEM_PROMPT = (
     "For complex tasks, first decompose them into clear phases and milestones, then execute step by step. "
     "Write intermediate conclusions of each phase into the context store (context_add) for later retrieval, "
     "and submit independent subtasks to the queue (task_submit) to advance in parallel. "
+    "Call task_done at the end of every milestone, with a summary of what was done "
+    "and what is needed to continue: it moves the history boundary so the finished "
+    "work stops being replayed while the steps after it stay verbatim. "
     "Report progress periodically during long executions; when blocked, record the state first and then continue. "
     "All file operations are strictly confined to the workspace root; use relative paths."
 )
@@ -55,6 +58,8 @@ def build_longrun_preset(model: str = "openai_compat") -> Preset:
             "task_list",
             "task_status",
             "task_cancel",
+            # milestone boundary: lets the model mark completed work
+            "task_done",
         ],
         session="sqlite",
         sandbox="pooled",

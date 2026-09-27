@@ -76,7 +76,7 @@ from .tree import (  # noqa: E402,F401
 
 # v1.0.7 起 CNB 并入内核：版本跟随 norpagent（publish_pypi.ps1 校验一致）。
 # 与 norpagent/__init__.py 的 __version__ 保持同步。
-__version__ = "2.2.4"
+__version__ = "2.3.1"
 
 __all__ = [
     "__version__",

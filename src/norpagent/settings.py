@@ -118,7 +118,7 @@ KERNEL_SCHEMA: List[Dict[str, Any]] = [
        config_key="title_model"),
     _s("model.context_token_budget", "Context token budget", "model", type="number",
        default=32000, minimum=0,
-       description="Request budget (estimated tokens). Over budget the oldest history is compressed first (chain-of-thought and oversized tool results are folded away); only if it still exceeds the budget are the oldest whole turns dropped (tool_call / tool_call_id pairs are never split). 0 = unlimited (compression and truncation both off)",
+       description="Request budget (estimated tokens); only the rendered <history> text is counted. When it exceeds the budget the history is replaced by a rolling model summary (<summary>) that later steps reuse, so the summary call happens once per crossing. The full conversation stays in the session store and is still shown in the UI; only the request payload shrinks. 0 = off (the rendered history is sent as it is)",
        config_key="context_token_budget"),
     _s("runtime.session_isolation", "Session isolation", "runtime", type="enum",
        default="per_session",

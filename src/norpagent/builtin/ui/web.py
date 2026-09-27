@@ -44,6 +44,7 @@ automatically subscribes ui.on_event to the event bus.
 from __future__ import annotations
 
 import base64
+import contextvars
 import errno
 import json
 import logging
@@ -770,6 +771,21 @@ def _encode_sse_frame(item: dict) -> bytes:
     )
 
 
+# ── current session of the running task (per execution context) ──
+
+# A task body does NOT run on the thread that called ``WebUI.submit()``: the loop
+# runtime copies the caller's context and runs the body on a pool worker
+# (``norpagent.loops.nasyncio.submit``). A thread-local set inside ``submit()``
+# is therefore invisible inside the agent, and ``ask_user`` / ``notify`` /
+# ``on_event`` are all called from the agent's own thread -- which is why they
+# used to fall back to guessing the owner. A ContextVar set before the submit IS
+# carried across (the loop hands ``contextvars.copy_context()`` to the worker),
+# so the session id survives the hop and every question can be tagged with its
+# real owner instead of a heuristic.
+_CURRENT_SESSION: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "norpagent_ui_session", default="")
+
+
 class _SSESubscriber:
     """Event buffer of one SSE connection: bounded deque + condition-variable wakeup.
 
@@ -785,16 +801,23 @@ class _SSESubscriber:
     The buffer cap ``maxsize`` (0 = unlimited) and the policy can both be
     hot-changed at runtime via ``WebUI.set_sse_queue()`` (taking effect
     immediately on existing connections).
+
+    A subscriber may also be pinned to a single session (``sid``; see
+    ``/events?sid=``): it then receives that session's events plus the
+    session-agnostic ones, and nothing else. An empty ``sid`` keeps the classic
+    global stream, which is what the browser frontend uses.
     """
 
-    __slots__ = ("buffer", "cond", "maxsize", "policy", "dropped")
+    __slots__ = ("buffer", "cond", "maxsize", "policy", "dropped", "sid")
 
-    def __init__(self, maxsize: int, policy: str) -> None:
+    def __init__(self, maxsize: int, policy: str, sid: str = "") -> None:
         self.buffer: deque = deque()
         self.cond = threading.Condition()
         self.maxsize = max(0, int(maxsize))
         self.policy = policy if policy in _SSE_POLICIES else _DEFAULT_SSE_POLICY
         self.dropped = 0  # events dropped by backpressure (monitoring metric)
+        # "" = global stream (every event); otherwise one session id only
+        self.sid = str(sid or "")
 
     def push(self, item: dict) -> None:
         """Push one event (thread-safe). Wakes the reader once on an empty→non-empty
@@ -955,7 +978,7 @@ class WebUI:
         self._subscribers: List[_SSESubscriber] = []
         self._history: List[dict] = []
         self._questions: Dict[str, Any] = {}
-        self._question_sessions: Dict[str, str] = {}
+        self._question_sessions: Dict[str, List[str]] = {}
         self._tasks: Dict[str, Dict[str, Any]] = {}
         self._task_session: Dict[str, str] = {}
         self._running_sessions: Dict[str, str] = {}
@@ -1260,7 +1283,7 @@ class WebUI:
                     self.end_headers()
                     self.wfile.write(body)
                 elif path == "/events":
-                    self._handle_sse()
+                    self._handle_sse(str(query.get("sid", [""])[0] or ""))
                 elif path == "/api/status":
                     self._json(200, ui.stats())
                 elif path == "/api/cnb/health":
@@ -1405,12 +1428,16 @@ class WebUI:
                     })
                 elif path == "/answer":
                     data = self._read_json()
-                    ui.answer(
+                    ok = ui.answer(
                         str(data.get("question_id") or ""),
                         str(data.get("answer") or ""),
                         str(data.get("session_id") or "") or None,
                     )
-                    self._json(200, {"ok": True})
+                    self._json(200 if ok else 409, {
+                        "ok": bool(ok),
+                        "error": "" if ok else (
+                            "unknown question, or not owned by this session"),
+                    })
                 elif path == "/stop":
                     data = self._read_json()
                     ui.stop_task(str(data.get("session_id") or "") or None)
@@ -1721,7 +1748,7 @@ class WebUI:
                             return
                 self._json(404, {"error": "not found"})
 
-            def _handle_sse(self) -> None:
+            def _handle_sse(self, sid: str = "") -> None:
                 """SSE long connection: batched frame writes + bounded backpressure + fast disconnect reclamation.
 
                 - batched frame writes: one write + flush once ``_sse_batch``
@@ -1741,6 +1768,11 @@ class WebUI:
                   buffer within ≤1s after a disconnect (prevents thread
                   accumulation under extreme concurrency); the heartbeat comment
                   still runs every 15s, adding no network burden.
+                - session scoping: ``sid`` (from ``/events?sid=``) pins this
+                  connection to one session -- it gets that session's events plus
+                  the session-agnostic ones, and the replay is filtered the same
+                  way. Empty ``sid`` = the global stream (every event), which is
+                  what the browser frontend and the phone proxy keep using.
                 """
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1750,7 +1782,7 @@ class WebUI:
                 # otherwise SSE gets delayed in batches
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
-                sub = ui._new_subscriber()
+                sub = ui._new_subscriber(str(sid or ""))
                 batch = ui._sse_batch
                 interval = ui._sse_batch_interval
                 pending: List[bytes] = []
@@ -1773,7 +1805,7 @@ class WebUI:
 
                 try:
                     # first replay recent history (one batched write)
-                    recent = ui._recent_history()
+                    recent = ui._recent_history(str(sid or ""))
                     if recent:
                         self.wfile.write(b"".join(
                             _encode_sse_frame(item) for item in recent))
@@ -2062,6 +2094,11 @@ class WebUI:
 
         def worker() -> None:
             self._tlocal.session_id = sid
+            # The task body runs in the loop's worker pool: a thread-local does
+            # not survive that hop, a ContextVar does (loops.nasyncio copies the
+            # context into the pool). Without this, ask_user / notify / on_event
+            # fall back to guessing the owner -- the cross-session mix-up.
+            _CURRENT_SESSION.set(str(sid or ""))
             try:
                 active = self._active_chat_flow()
                 if active is not None:
@@ -2127,6 +2164,7 @@ class WebUI:
                 })
             finally:
                 self._tlocal.session_id = None
+                _CURRENT_SESSION.set("")
                 with self._lock:
                     self._task_session.pop(task_id, None)
                     if sid:
@@ -2503,29 +2541,50 @@ class WebUI:
         self._sec_thr_cache = (now, threshold)
         return threshold
 
-    def ask_user(self, question: str, default: str = "", kind: str = "") -> str:
-        """Ask the user (human approval / clarification). Waits for the user to
-        answer on the page; on timeout returns default, so automation scenarios
-        never hang.
+    def _current_sid(self) -> str:
+        """Session id owning the task body running right now, or "".
+
+        The ContextVar wins: it is set on the task thread and carried into the
+        loop's worker pool by ``copy_context()``, where the thread-local below
+        is invisible. The thread-local remains the fallback for callers that
+        already run on the task thread.
+        """
+        sid = _CURRENT_SESSION.get("")
+        if sid:
+            return str(sid)
+        return str(getattr(self._tlocal, "session_id", None) or "")
+
+    def ask_user(self, question: str, kind: str = "") -> "str | None":
+        """Ask the user (human approval / clarification); waits for the answer.
+
+        Returns ``None`` on timeout: the page did not answer, so no user decision
+        exists. Substituting a default here would fabricate a decision the user
+        never made — the caller gets ``None`` and must fail, re-ask, or own its
+        fallback explicitly.
 
         ``kind`` is forwarded to the frontend so the modal can switch controls:
         ``"approval"`` hides the free-text box and shows only reject/approve,
         while a clarification keeps the text box.
         """
         question_id = uuid.uuid4().hex[:12]
-        box = {"answer": None, "event": threading.Event()}
-        sid = getattr(self._tlocal, "session_id", None) or ""
+        # Owner resolution: the live execution context first (see _current_sid),
+        # then -- only when exactly ONE session is running -- that session. The
+        # old "assume the only running session" guess is kept for a lost context
+        # only, where it is unambiguous; with several tasks in flight a wrong
+        # owner is worse than a question that has to be re-asked.
+        sid = self._current_sid()
         if not sid:
-            # fallback: outside a task thread (or lost thread context), the only
-            # running session is the owner
             with self._lock:
                 running = list(self._running_sessions.keys())
-                if len(running) == 1:
-                    sid = running[0]
+            if len(running) == 1:
+                sid = running[0]
+        box = {"answer": None, "event": threading.Event(), "sid": sid}
         with self._lock:
             self._questions[question_id] = box
             if sid:
-                self._question_sessions[sid] = question_id
+                # multi-valued: two sessions (or two asks in one session) no
+                # longer overwrite each other's pending question
+                self._question_sessions.setdefault(sid, []).append(question_id)
         self._publish({
             "type": "question", "question": question,
             "kind": kind or "clarify",
@@ -2536,28 +2595,54 @@ class WebUI:
         with self._lock:
             self._questions.pop(question_id, None)
             if sid:
-                self._question_sessions.pop(sid, None)
+                queue = [q for q in self._question_sessions.get(sid, [])
+                         if q != question_id]
+                if queue:
+                    self._question_sessions[sid] = queue
+                else:
+                    self._question_sessions.pop(sid, None)
         answer = box["answer"]
         if answer is None:
-            return default
+            return None
         return str(answer)
 
     def answer(self, question_id: str, answer: str,
-               session_id: Optional[str] = None) -> None:
+               session_id: Optional[str] = None) -> bool:
+        """Deliver one answer; ``False`` when the question is unknown or not ours.
+
+        Ownership is checked so a client cannot answer a question that belongs
+        to another session. ``question_id`` alone is already proof of
+        involvement (it is an unguessable per-question token); the check bites
+        on the legacy path, where the caller only sends its own session id and
+        the server has to find the pending question itself.
+        """
         with self._lock:
             box = self._questions.get(question_id)
+            owner = str((box or {}).get("sid") or "") if box else ""
             if box is None and session_id:
-                qid = self._question_sessions.get(session_id)
-                box = self._questions.get(qid) if qid else None
-        if box is not None:
-            box["answer"] = answer
-            box["event"].set()
+                # legacy client that only knows its session id: take that
+                # session's newest pending question (the registry is
+                # multi-valued, so concurrent asks no longer overwrite)
+                for qid in reversed(list(
+                        self._question_sessions.get(session_id) or [])):
+                    box = self._questions.get(qid)
+                    if box is not None:
+                        owner = session_id
+                        break
+        if box is None:
+            return False
+        if session_id and owner and session_id != owner:
+            # a client that is not the question's owner must not answer it
+            return False
+        box["answer"] = answer
+        box["event"].set()
+        return True
 
     def notify(self, message: str, level: str = "info") -> None:
         self._publish({
             "type": "notify", "message": message,
             "level": level, "ts": time.time(),
-            "sid": getattr(self._tlocal, "session_id", None),
+            "sid": self._current_sid() or None,
         })
 
     # ── session REST ─────────────────────────────────────
@@ -5541,21 +5626,32 @@ class WebUI:
         "bounded deque append + one notify on empty→non-empty", amortized O(1) —
         under extreme-concurrency pushes, lock contention does not scale with the
         subscriber count.
+
+        A connection created with a ``sid`` receives only that session's events
+        (plus the session-agnostic ones); the empty ``sid`` of the browser
+        frontend keeps receiving everything.
         """
         with self._lock:
             self._history.append(item)
             if len(self._history) > self.history_limit:
                 self._history = self._history[-self.history_limit:]
             subscribers = self._subscribers
+        ev_sid = item.get("sid")
         for sub in subscribers:
+            if sub.sid and ev_sid and ev_sid != sub.sid:
+                continue  # this connection is scoped to another session
             sub.push(item)
 
-    def _new_subscriber(self) -> _SSESubscriber:
-        """Create a bounded-buffer subscriber for one SSE connection (current backpressure config)."""
+    def _new_subscriber(self, sid: str = "") -> _SSESubscriber:
+        """Create a bounded-buffer subscriber for one SSE connection (current backpressure config).
+
+        ``sid`` scopes the connection to one session (``/events?sid=``); empty
+        keeps the global stream.
+        """
         with self._lock:
             size = self._sse_queue_size
             policy = self._sse_queue_policy
-        sub = _SSESubscriber(size, policy)
+        sub = _SSESubscriber(size, policy, sid)
         with self._lock:
             self._subscribers = self._subscribers + [sub]
         return sub
@@ -5565,9 +5661,15 @@ class WebUI:
         with self._lock:
             self._subscribers = [s for s in self._subscribers if s is not sub]
 
-    def _recent_history(self) -> List[dict]:
+    def _recent_history(self, sid: str = "") -> List[dict]:
+        """Most recent events, for replay on connect; scoped to ``sid`` when given."""
         with self._lock:
-            return list(self._history[-200:])
+            recent = list(self._history[-200:])
+        if not sid:
+            return recent
+        # a session-scoped connection must not be handed another session's backlog
+        return [it for it in recent
+                if not it.get("sid") or it.get("sid") == sid]
 
     # ── SSE backpressure (extreme-concurrency ops: startup config + runtime hot change) ──
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "norpagent"
-version = "2.2.2"
+version = "2.3.1"
 # FarStars（远星）是 norpagent 自 v2.0.0 起的正式宣传名：调用方式与内核
 # 名称不变（import norpagent / PyPI 包名 norpagent 保持不变），远星 FarStars
 # 为对外品牌冠名。
@@ -81,4 +81,4 @@ norpagent-rescue = "norpagent.rescue:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-norpagent = ["py.typed", "builtin/ui/assets/*.html"]
+norpagent = ["py.typed", "builtin/ui/assets/*.html", "builtin/ui/assets/*.js"]

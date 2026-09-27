@@ -71,17 +71,21 @@ class ConsoleUI:
                 f"[usage] in={p.get('input')} out={p.get('output')} total={p.get('total')}"
             )
 
-    def ask_user(self, question: str, default: str = "", kind: str = "") -> str:
-        suffix = f" [{default}]" if default else ""
+    def ask_user(self, question: str, kind: str = "") -> "str | None":
+        """Ask the user; returns ``None`` when nothing was actually entered.
+
+        EOF (or an empty line) means the user did not answer — it is NOT an
+        implicit consent, so it must not be turned into a fabricated answer.
+        """
         # Approval is a binary decision: prompt with an explicit (y/n) hint so the
         # console user knows exactly what to type (the web UI shows buttons instead).
         hint = " (y/n)" if kind == "approval" else ""
-        self._write(f"{question}{suffix}{hint}: ", end="")
+        self._write(f"{question}{hint}: ", end="")
         try:
             answer = input().strip()
         except EOFError:
-            return default
-        return answer or default
+            return None
+        return answer or None
 
     def notify(self, message: str, level: str = "info") -> None:
         prefix = {"error": "[error]", "warn": "[warning]"}.get(level, "[info]")
